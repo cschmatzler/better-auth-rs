@@ -169,20 +169,30 @@ impl<S: AuthSchema> AuthBuilder<S> {
 
         // Authentication and every producer use the same initialized token
         // name; related-cookie overrides remain independently configured.
-        if self.config.advanced.cookies.contains_key("session_token")
-            || self
+        // Retain the unprefixed legacy name before storing the resolved name.
+        // This keeps name resolution stable across producers and request clones.
+        if !self
+            .config
+            .advanced
+            .cookie_prefix
+            .as_ref()
+            .is_some_and(|p| !p.is_empty())
+        {
+            let entry = self
                 .config
                 .advanced
-                .cookie_prefix
-                .as_ref()
-                .is_some_and(|prefix| !prefix.is_empty())
-        {
-            self.config.session.cookie_name =
-                better_auth_core::utils::cookie_utils::related_cookie_name(
-                    &self.config,
-                    "session_token",
-                );
+                .cookies
+                .entry("session_token".into())
+                .or_default();
+            if entry.name.as_ref().is_none_or(|name| name.is_empty()) {
+                entry.name = Some(self.config.session.cookie_name.clone());
+            }
         }
+        self.config.session.cookie_name =
+            better_auth_core::utils::cookie_utils::related_cookie_name(
+                &self.config,
+                "session_token",
+            );
 
         // Core modules exist on every instance. Explicit modules keep their own
         // configuration and priority; defaults never enable credential login.

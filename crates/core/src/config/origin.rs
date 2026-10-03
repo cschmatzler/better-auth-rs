@@ -104,6 +104,13 @@ impl AuthConfig {
                 fallback.clone()
             };
             config.session.cookie_secure = config.base_url.starts_with("https://");
+            if self.advanced.cross_sub_domain_cookies.is_some()
+                && self.advanced.use_secure_cookies.is_none()
+            {
+                config.advanced.use_secure_cookies = Some(config.session.cookie_secure);
+            }
+            config.session.cookie_name =
+                crate::utils::cookie_utils::related_cookie_name(&config, "session_token");
             for host in &dynamic.allowed_hosts {
                 if host.contains("://") {
                     config.trusted_origins.push(host.clone());

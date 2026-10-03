@@ -159,39 +159,69 @@ pub fn create_clear_cookie(name: &str, config: &AuthConfig) -> String {
 /// `better-auth.session_data`.
 #[must_use]
 pub fn related_cookie_name(config: &AuthConfig, suffix: &str) -> String {
-    if let Some(name) = config
+    let token_name = config
+        .advanced
+        .cookies
+        .get("session_token")
+        .and_then(|entry| entry.name.as_deref())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&config.session.cookie_name);
+    let name = config
         .advanced
         .cookies
         .get(suffix)
         .and_then(|entry| entry.name.as_ref())
         .filter(|name| !name.is_empty())
-    {
-        return name.clone();
+        .cloned()
+        .unwrap_or_else(|| {
+            if let Some(prefix) = config
+                .advanced
+                .cookie_prefix
+                .as_ref()
+                .filter(|p| !p.is_empty())
+            {
+                format!("{prefix}.{suffix}")
+            } else if suffix == "session_token" {
+                token_name.to_owned()
+            } else {
+                token_name.strip_suffix("session_token").map_or_else(
+                    || format!("better-auth.{suffix}"),
+                    |prefix| format!("{prefix}{suffix}"),
+                )
+            }
+        });
+    if secure_cookie_policy(config) {
+        format!("__Secure-{name}")
+    } else {
+        name
     }
-    if let Some(prefix) = config
-        .advanced
-        .cookie_prefix
-        .as_ref()
-        .filter(|p| !p.is_empty())
-    {
-        return format!("{prefix}.{suffix}");
-    }
-    if suffix == "session_token" {
-        return config.session.cookie_name.clone();
-    }
-    config
-        .session
-        .cookie_name
-        .strip_suffix("session_token")
-        .map_or_else(
-            || format!("better-auth.{suffix}"),
-            |prefix| format!("{prefix}{suffix}"),
-        )
+}
+
+// This is createCookieGetter's initial selection, not the final attributes.
+// Dynamic URLs retain that selection unless cross-subdomain request resolution
+// rebuilds cookies using the resolved origin (as in the published context).
+fn secure_cookie_policy(config: &AuthConfig) -> bool {
+    config.advanced.use_secure_cookies.unwrap_or_else(|| {
+        if let Some(dynamic) = &config.dynamic_base_url {
+            match dynamic.protocol {
+                Some(crate::config::BaseUrlProtocol::Https) => true,
+                Some(crate::config::BaseUrlProtocol::Http) => false,
+                _ => std::env::var("NODE_ENV").is_ok_and(|env| env == "production"),
+            }
+        } else {
+            config.base_url.starts_with("https://")
+        }
+    })
 }
 
 fn cookie_attributes(name: &str, config: &AuthConfig) -> CookieAttributes {
     let mut attributes = CookieAttributes {
-        secure: Some(config.session.cookie_secure),
+        secure: Some(
+            config
+                .advanced
+                .use_secure_cookies
+                .unwrap_or_else(|| secure_cookie_policy(config) || config.session.cookie_secure),
+        ),
         http_only: Some(config.session.cookie_http_only),
         same_site: Some(config.session.cookie_same_site.clone()),
         path: Some("/".into()),

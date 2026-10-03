@@ -595,6 +595,11 @@ pub struct AdvancedConfig {
     /// Admit trailing slashes while resolving the original registered endpoint.
     pub skip_trailing_slashes: bool,
 
+    /// Select the secure cookie name prefix and initial Secure attribute.
+    /// None uses the configured base URL protocol. Attribute overrides do not
+    /// change this choice; the serializer enforces Secure for reserved prefixes.
+    pub use_secure_cookies: Option<bool>,
+
     /// Cross-subdomain cookie sharing configuration.
     pub cross_sub_domain_cookies: Option<CrossSubDomainConfig>,
 
