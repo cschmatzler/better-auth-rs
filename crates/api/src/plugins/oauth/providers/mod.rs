@@ -543,6 +543,14 @@ pub struct OAuthAuthorizationPolicy {
     pub authorization_code_client_key: Option<String>,
     /// Trusted provider headers applied to authorization-code grants only.
     pub authorization_code_headers: Vec<(String, String)>,
+    /// Trusted additional code-grant form fields (`tokenUrlParams`). Fields
+    /// already supplied by the grant, including PKCE, are preserved. Token
+    /// authentication is applied afterwards and retains credential authority.
+    pub authorization_code_params: std::collections::BTreeMap<String, String>,
+    /// Trusted static refresh form fields (`refreshTokenParams`). Ordinary
+    /// fields replace defaults; grant type and refresh token cannot be replaced.
+    /// Validate tenant, scope, and audience entitlements before configuring them.
+    pub refresh_token_params: std::collections::BTreeMap<String, String>,
     /// Required by private_key_jwt; invoked afresh for each real token grant.
     pub client_assertion: Option<OAuthClientAssertion>,
     /// Exact configured refresh scope, including an explicitly empty value.
@@ -600,6 +608,8 @@ impl Default for OAuthAuthorizationPolicy {
             fixed_authorization_params: Vec::new(),
             authorization_code_client_key: None,
             authorization_code_headers: Vec::new(),
+            authorization_code_params: std::collections::BTreeMap::new(),
+            refresh_token_params: std::collections::BTreeMap::new(),
             client_assertion: None,
             refresh_scope: None,
             response_type: "code".into(),

@@ -513,6 +513,24 @@ async fn provider_token_request(
         .iter()
         .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
         .collect();
+    if let Some(policy) = &provider.authorization {
+        let additions = if grant_type == OAuthTokenGrant::RefreshToken {
+            &policy.refresh_token_params
+        } else {
+            &policy.authorization_code_params
+        };
+        for (key, value) in additions {
+            if grant_type == OAuthTokenGrant::RefreshToken {
+                if matches!(key.as_str(), "grant_type" | "refresh_token" | "__proto__" | "constructor" | "prototype") {
+                    continue;
+                }
+                form.retain(|(existing, _)| existing != key);
+            } else if form.iter().any(|(existing, _)| existing == key) {
+                continue;
+            }
+            form.push((key.clone(), value.clone()));
+        }
+    }
     let request = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -536,7 +554,7 @@ async fn provider_token_request(
         }
         request = request.headers(headers);
     }
-    let request = match provider.authorization.as_ref().and_then(|policy| {
+    let authentication = provider.authorization.as_ref().and_then(|policy| {
         if grant_type == OAuthTokenGrant::RefreshToken {
             policy
                 .refresh_token_endpoint_auth
@@ -544,8 +562,27 @@ async fn provider_token_request(
         } else {
             policy.token_endpoint_auth
         }
-    }) {
+    });
+    let has_field = |name: &str| form.iter().any(|(key, _)| key == name);
+    if has_field("client_assertion") != has_field("client_assertion_type") {
+        return Err(AuthError::config("client_assertion and client_assertion_type must both be provided"));
+    }
+    if has_field("client_assertion") {
+        if authentication.is_some() {
+            return Err(AuthError::config("client_assertion body parameters cannot be combined with tokenEndpointAuth"));
+        }
+        if !provider.client_secret.is_empty() || has_field("client_secret") {
+            return Err(AuthError::config("private_key_jwt token endpoint authentication cannot be combined with clientSecret"));
+        }
+        if !provider.client_id.is_empty() {
+            form.retain(|(key, _)| key != "client_id");
+            form.push(("client_id".into(), provider.client_id.clone()));
+        }
+        return Ok(request.form(&form));
+    }
+    let request = match authentication {
         None => {
+            form.retain(|(key, _)| key != "client_id" && key != "client_secret");
             form.extend([
                 ("client_id".into(), provider.client_id.clone()),
                 ("client_secret".into(), provider.client_secret.clone()),
@@ -553,16 +590,17 @@ async fn provider_token_request(
             request
         }
         Some(OAuthTokenEndpointAuth::None) => {
-            if provider.client_id.is_empty() || !provider.client_secret.is_empty() {
+            if provider.client_id.is_empty() || !provider.client_secret.is_empty() || has_field("client_secret") {
                 return Err(AuthError::config(
                     "Public token authentication requires client ID and no secret",
                 ));
             }
+            form.retain(|(key, _)| key != "client_id");
             form.push(("client_id".into(), provider.client_id.clone()));
             request
         }
         Some(OAuthTokenEndpointAuth::PrivateKeyJwt) => {
-            if provider.client_id.is_empty() || !provider.client_secret.is_empty() {
+            if provider.client_id.is_empty() || !provider.client_secret.is_empty() || has_field("client_secret") {
                 return Err(AuthError::config(
                     "Client assertion requires client ID and no secret",
                 ));
@@ -580,6 +618,7 @@ async fn provider_token_request(
                 })
                 .await
                 .map_err(AuthError::internal)?;
+            form.retain(|(key, _)| key != "client_id");
             form.extend([
                 ("client_id".into(), provider.client_id.clone()),
                 ("client_assertion".into(), assertion),
@@ -591,7 +630,7 @@ async fn provider_token_request(
             request
         }
         Some(OAuthTokenEndpointAuth::ClientKeyPost) => {
-            form.retain(|(key, _)| key != "client_key");
+            form.retain(|(key, _)| key != "client_key" && key != "client_secret");
             form.extend([
                 ("client_key".into(), provider.client_id.clone()),
                 ("client_secret".into(), provider.client_secret.clone()),
@@ -605,6 +644,9 @@ async fn provider_token_request(
                 ));
             }
             if method == OAuthTokenEndpointAuth::ClientSecretBasic {
+                if has_field("client_secret") {
+                    return Err(AuthError::config("client_secret_basic token endpoint authentication cannot be combined with client_secret body parameters"));
+                }
                 let encode = |value: &str| {
                     url::form_urlencoded::Serializer::new(String::new())
                         .append_key_only(value)
@@ -615,6 +657,7 @@ async fn provider_token_request(
                     Some(encode(&provider.client_secret)),
                 )
             } else {
+                form.retain(|(key, _)| key != "client_id" && key != "client_secret");
                 form.extend([
                     ("client_id".into(), provider.client_id.clone()),
                     ("client_secret".into(), provider.client_secret.clone()),
