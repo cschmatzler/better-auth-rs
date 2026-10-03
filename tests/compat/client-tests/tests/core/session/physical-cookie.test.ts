@@ -103,6 +103,13 @@ for (const mode of [
   "short",
   "legacy",
   "legacy-alias",
+  "secure-prefix",
+  "https-default",
+  "https-disabled",
+  "secure-custom",
+  "dynamic-https",
+  "dynamic-http",
+  "dynamic-auto",
 ] as const) {
   compatScenario(
     `physical session ${mode} preserves full signed token preference bytes through signup signin restore corruption rotation and logout`,
@@ -131,16 +138,30 @@ for (const mode of [
       const signupCookies = cookieBytes(issuedHeaders!, first.token);
       expect(signupCookies).toHaveLength(1);
 
+      const prefixed = [
+        "secure-prefix",
+        "https-default",
+        "secure-custom",
+        "dynamic-https",
+      ].includes(mode);
       const expectedTokenName =
-        mode === "attributes"
-          ? "physical_session"
-          : mode === "legacy"
-            ? "customsession"
-            : mode === "legacy-alias"
-              ? "some.alias"
-              : "better-auth.session_token";
+        mode === "secure-custom"
+          ? "__Secure-configured_session"
+          : prefixed
+            ? "__Secure-better-auth.session_token"
+            : mode === "attributes"
+              ? "physical_session"
+              : mode === "legacy"
+                ? "customsession"
+                : mode === "legacy-alias"
+                  ? "some.alias"
+                  : "better-auth.session_token";
       const expectedPreferenceName =
-        mode === "attributes" ? "physical_preference" : "better-auth.dont_remember";
+        mode === "attributes"
+          ? "physical_preference"
+          : mode === "secure-custom"
+            ? "__Secure-policy.dont_remember"
+            : `${prefixed ? "__Secure-" : ""}better-auth.dont_remember`;
       expect(signupCookies[0]!.name).toBe(expectedTokenName);
 
       const other = await foreign.signUp.email({
@@ -166,10 +187,12 @@ for (const mode of [
 
       const signupCookie = Cookie.parse(issuedHeaders!.getSetCookie()[0]!)!;
       expect(signupCookie.maxAge).toBe(mode === "short" ? 60 : 604800);
-      expect(signupCookie.path).toBe(mode === "attributes" ? path : "/");
+      expect(signupCookie.path).toBe(
+        mode === "attributes" || mode === "secure-custom" ? path : "/",
+      );
       expect(signupCookie.domain).toBe(mode === "attributes" ? "localhost" : null);
       expect(signupCookie.httpOnly).toBe(mode !== "attributes");
-      expect(signupCookie.secure).toBe(mode === "secure");
+      expect(signupCookie.secure).toBe(mode === "secure" || prefixed);
       expect(signupCookie.sameSite).toBe(
         mode === "attributes" ? "strict" : mode === "none" ? "none" : "lax",
       );

@@ -26,9 +26,36 @@ pub(crate) async fn router(base: &AuthConfig, database: DatabaseConnection) -> A
         "short",
         "legacy",
         "legacy-alias",
+        "secure-prefix",
+        "https-default",
+        "https-disabled",
+        "secure-custom",
+        "dynamic-https",
+        "dynamic-http",
+        "dynamic-auto",
     ] {
         let path = format!("/__test/profiles/physical-cookie-{mode}/api/auth");
         let mut config = base.clone().base_path(&path);
+        config.advanced.use_secure_cookies = match mode {
+            "https-default" | "dynamic-https" | "dynamic-http" | "dynamic-auto" => None,
+            "secure-prefix" | "secure-custom" => Some(true),
+            _ => Some(false),
+        };
+        if mode.starts_with("https-") {
+            config = config.base_url("https://localhost");
+        }
+        if mode.starts_with("dynamic-") {
+            config = config.dynamic_base_url(better_auth_core::config::DynamicBaseUrl {
+                allowed_hosts: vec!["localhost:*".into(), "127.0.0.1:*".into()],
+                protocol: Some(match mode {
+                    "dynamic-https" => better_auth_core::config::BaseUrlProtocol::Https,
+                    "dynamic-http" => better_auth_core::config::BaseUrlProtocol::Http,
+                    _ => better_auth_core::config::BaseUrlProtocol::Auto,
+                }),
+                fallback: None,
+            });
+        }
+        config.trusted_origins.push("https://localhost".into());
         config.session.expires_in = Duration::seconds(if mode == "short" { 60 } else { 604_800 });
         if mode == "legacy" || mode == "legacy-alias" {
             config.session.cookie_name = if mode == "legacy" {
@@ -57,6 +84,31 @@ pub(crate) async fn router(base: &AuthConfig, database: DatabaseConnection) -> A
             },
             _ => CookieAttributes::default(),
         };
+        if mode == "secure-custom" {
+            config.advanced.cookie_prefix = Some("policy".into());
+            config.advanced.default_cookie_attributes = CookieAttributes {
+                secure: Some(false),
+                path: Some("/discarded".into()),
+                same_site: Some(SameSite::Strict),
+                http_only: Some(false),
+                ..Default::default()
+            };
+            for logical in ["session_token", "dont_remember"] {
+                config.advanced.cookies.insert(
+                    logical.into(),
+                    CookieOverride {
+                        name: (logical == "session_token").then(|| "configured_session".into()),
+                        attributes: CookieAttributes {
+                            path: Some(path.clone()),
+                            http_only: Some(true),
+                            same_site: Some(SameSite::Lax),
+                            secure: Some(false),
+                            ..Default::default()
+                        },
+                    },
+                );
+            }
+        }
         if mode == "attributes" {
             drop(config.advanced.cookies.insert(
                 "session_token".into(),
