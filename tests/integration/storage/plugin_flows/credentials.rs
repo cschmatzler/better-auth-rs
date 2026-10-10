@@ -8,7 +8,11 @@ backend_tests!(
     profile_update_publishes_accepted_fields_and_preserves_rejected_identity,
     password_change_verification_and_session_revocation_are_owner_scoped,
     email_otp_verification_reset_and_email_change_bind_owner_and_scope,
-    password_length_limits_apply_to_every_new_password_endpoint
+    password_length_limits_apply_to_every_new_password_endpoint,
+    duplicate_canonical_credentials_keep_first_physical_row_authoritative,
+    cookie_emission_failure_preserves_endpoint_commit_stage,
+    username_unicode_identity_admission,
+    username_readonly_registration_admission
 );
 postgres_tests!(
     username_signup_lookup_and_denials_share_normalized_identity,
@@ -734,5 +738,318 @@ async fn password_length_limits_apply_to_every_new_password_endpoint<B: Backend>
     )
     .await;
     drop(auth);
+    B::close(connection).await
+}
+
+async fn duplicate_canonical_credentials_keep_first_physical_row_authoritative<B: Backend>(
+    db: Db,
+) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(alibi::plugins::AccountManagementPlugin::new())
+        .plugin(alibi::plugins::UserManagementPlugin::new().delete_user_enabled(true))
+        .build()
+        .await?;
+    let owner = signup(&auth, "duplicate-owner@example.test").await;
+    let foreign = signup(&auth, "duplicate-foreign@example.test").await;
+    let owner_id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+    let original = db
+        .text("SELECT id FROM accounts WHERE user_id=$1", &[&owner_id])
+        .await?
+        .unwrap();
+    _ = db.execute("INSERT INTO accounts (id,user_id,account_id,provider_id,password,created_at,updated_at) SELECT 'later-credential',user_id,account_id,provider_id,password,created_at,updated_at FROM accounts WHERE id=$1", &[&original]).await?;
+    db.set_timestamp(
+        "accounts",
+        "created_at",
+        ("id", "later-credential"),
+        chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")?.with_timezone(&chrono::Utc),
+    )
+    .await?;
+    _ = db
+        .execute(
+            "UPDATE accounts SET password=NULL WHERE id=$1",
+            &[&original],
+        )
+        .await?;
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    let listed = body(
+        &call(
+            &auth,
+            request("/list-accounts", None, &cookies(&owner)),
+            200,
+        )
+        .await,
+    );
+    assert_eq!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(original), json!("later-credential")]
+    );
+    let denied = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"duplicate-owner@example.test","password":PASSWORD})),
+            "",
+        ),
+        401,
+    )
+    .await;
+    assert_eq!(body(&denied)["code"], "INVALID_EMAIL_OR_PASSWORD");
+    assert!(cookies(&denied).is_empty());
+    let denied = call(
+        &auth,
+        request(
+            "/delete-user",
+            Some(json!({"password":PASSWORD})),
+            &cookies(&owner),
+        ),
+        400,
+    )
+    .await;
+    assert_eq!(body(&denied)["code"], "CREDENTIAL_ACCOUNT_NOT_FOUND");
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    let foreign_id = body(&foreign)["user"]["id"].as_str().unwrap().to_owned();
+    let foreign_account = db
+        .text("SELECT id FROM accounts WHERE user_id=$1", &[&foreign_id])
+        .await?
+        .unwrap();
+    let rejected = call(
+        &auth,
+        request(
+            "/unlink-account",
+            Some(json!({"accountId":foreign_account})),
+            &cookies(&owner),
+        ),
+        400,
+    )
+    .await;
+    assert_eq!(body(&rejected)["code"], "ACCOUNT_NOT_FOUND");
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    assert_eq!(
+        body(
+            &call(
+                &auth,
+                request(
+                    "/unlink-account",
+                    Some(json!({"accountId":original})),
+                    &cookies(&owner)
+                ),
+                200
+            )
+            .await
+        )["status"],
+        true
+    );
+    let accepted = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"duplicate-owner@example.test","password":PASSWORD})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&accepted)["user"]["id"], owner_id);
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM accounts WHERE user_id=$1",
+            &[&owner_id]
+        )
+        .await?,
+        1
+    );
+    assert_eq!(
+        db.text("SELECT id FROM accounts WHERE user_id=$1", &[&owner_id])
+            .await?
+            .as_deref(),
+        Some("later-credential")
+    );
+    authenticated(&auth, &cookies(&foreign), "duplicate-foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn cookie_emission_failure_preserves_endpoint_commit_stage<B: Backend>(db: Db) -> TestResult {
+    use alibi::config::{CookieAttributes, CookieOverride};
+    for mode in ["age", "expiry", "cache"] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let normal = super::auth_probe::fast_builder::<B>(&connection)
+            .build()
+            .await?;
+        let owner = signup(&normal, "emission-owner@example.test").await;
+        let foreign = signup(&normal, "emission-foreign@example.test").await;
+        let principals = db.tables(&["users", "accounts"]).await?;
+        let sessions = db.count("sessions").await?;
+        let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        match mode {
+            "age" => config.session.expires_in = chrono::Duration::seconds(34_560_001),
+            "expiry" => {
+                _ = config.advanced.cookies.insert(
+                    "session_token".into(),
+                    CookieOverride {
+                        name: None,
+                        attributes: CookieAttributes {
+                            expires: Some(chrono::Utc::now() + chrono::Duration::days(401)),
+                            ..Default::default()
+                        },
+                    },
+                );
+            }
+            _ => {
+                config.session.cookie_cache = Some(alibi::CookieCacheConfig {
+                    enabled: true,
+                    max_age: f64::INFINITY,
+                    ..Default::default()
+                })
+            }
+        }
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .build()
+            .await?;
+        for signin in [false, true] {
+            let failed=call(&auth,request(if signin{"/sign-in/email"}else{"/sign-up/email"},Some(json!({"email":if signin{"emission-owner@example.test"}else{"emission-new@example.test"},"password":PASSWORD,"name":"Incoming"})),""),500).await;
+            assert!(failed.body.is_empty());
+            assert!(!failed.headers.contains_key("set-cookie"));
+            assert_eq!(db.tables(&["users", "accounts"]).await?, principals);
+            assert_eq!(
+                db.count("sessions").await?,
+                sessions + if signin { 1 } else { 0 }
+            );
+            assert_eq!(
+                db.count_where(
+                    "SELECT COUNT(*) FROM users WHERE email=$1",
+                    &["emission-new@example.test"]
+                )
+                .await?,
+                0
+            );
+        }
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM sessions WHERE user_id=$1",
+                &[body(&owner)["user"]["id"].as_str().unwrap()]
+            )
+            .await?,
+            2
+        );
+        authenticated(&normal, &cookies(&owner), "emission-owner@example.test").await;
+        authenticated(&normal, &cookies(&foreign), "emission-foreign@example.test").await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn username_unicode_identity_admission<B: Backend>(db: Db) -> TestResult {
+    use alibi::utils::username::UsernameConfig;
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let receipt = observed.clone();
+    let policy = UsernameConfig {
+        min_length: 2,
+        max_length: 4,
+        validator: Some(Arc::new(move |v: String| {
+            receipt.lock().unwrap().push(v.clone());
+            async move { Ok(v.chars().all(|c| c.is_alphabetic() || c == '😀')) }
+        })),
+        ..Default::default()
+    };
+    let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(
+            super::auth_probe::fast_password()
+                .enable_username(true)
+                .username_config(policy),
+        )
+        .plugin(SessionManagementPlugin::new())
+        .build()
+        .await?;
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    let rejected=call(&auth,request("/sign-up/email",Some(json!({"email":"unicode-rejected@example.test","password":PASSWORD,"name":"Rejected","username":"😀😀😀"})),""),400).await;
+    assert_eq!(body(&rejected)["code"], "USERNAME_TOO_LONG");
+    assert!(!rejected.headers.contains_key("set-cookie"));
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    let owner=call(&auth,request("/sign-up/email",Some(json!({"email":"unicode-owner@example.test","password":PASSWORD,"name":"Unicode owner","username":"😀😀"})),""),200).await;
+    assert_eq!(body(&owner)["user"]["username"], "😀😀");
+    assert!(observed.lock().unwrap().iter().any(|v| v == "😀😀"));
+    authenticated(&auth, &cookies(&owner), "unicode-owner@example.test").await;
+    let accounts = db.table("accounts").await?;
+    _ = call(
+        &auth,
+        request(
+            "/update-user",
+            Some(json!({"username":"ΟΣ"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(
+        db.text(
+            "SELECT username FROM users WHERE id=$1",
+            &[body(&owner)["user"]["id"].as_str().unwrap()]
+        )
+        .await?
+        .as_deref(),
+        Some("ος")
+    );
+    let signed = call(
+        &auth,
+        request(
+            "/sign-in/username",
+            Some(json!({"username":"ΟΣ","password":PASSWORD})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&signed)["user"]["id"], body(&owner)["user"]["id"]);
+    assert_eq!(db.table("accounts").await?, accounts);
+    authenticated(&auth, &cookies(&signed), "unicode-owner@example.test").await;
+    B::close(connection).await
+}
+
+async fn username_readonly_registration_admission<B: Backend>(db: Db) -> TestResult {
+    use alibi::utils::username::UsernameConfig;
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(
+            super::auth_probe::fast_password()
+                .enable_username(true)
+                .username_config(UsernameConfig {
+                    input: false,
+                    ..Default::default()
+                }),
+        )
+        .plugin(SessionManagementPlugin::new())
+        .build()
+        .await?;
+    let foreign = signup(&auth, "readonly-foreign@example.test").await;
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    let rejected=call(&auth,request("/sign-up/email",Some(json!({"email":"readonly-owner@example.test","password":PASSWORD,"name":"Owner","username":"owner_name"})),""),400).await;
+    assert_eq!(body(&rejected)["code"], "FIELD_NOT_ALLOWED");
+    assert!(!rejected.headers.contains_key("set-cookie"));
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    authenticated(&auth, &cookies(&foreign), "readonly-foreign@example.test").await;
+    let owner = signup(&auth, "readonly-owner@example.test").await;
+    assert_eq!(db.count("users").await?, 2);
+    assert_eq!(db.count("accounts").await?, 2);
+    assert_eq!(db.count("sessions").await?, 2);
+    assert_eq!(body(&owner)["user"]["username"], Value::Null);
+    authenticated(&auth, &cookies(&owner), "readonly-owner@example.test").await;
     B::close(connection).await
 }
