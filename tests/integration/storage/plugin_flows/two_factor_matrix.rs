@@ -14,7 +14,8 @@ backend_tests!(
     two_factor_forged_trust_proofs,
     two_factor_otp_budget_and_session_choices,
     two_factor_numeric_options_and_damaged_factor,
-    two_factor_otp_resends_are_consumed_once_across_real_requests
+    two_factor_otp_resends_are_consumed_once_across_real_requests,
+    two_factor_account_lock_pending_only_scope
 );
 
 #[derive(Default)]
@@ -756,5 +757,145 @@ async fn two_factor_otp_resends_are_consumed_once_across_real_requests<B: Backen
     );
     authenticated(&auth, &cookie, "owner@example.test").await;
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn two_factor_account_lock_pending_only_scope<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(TwoFactorPlugin::new())
+        .build()
+        .await?;
+    let signed = signup(&auth, "locked@example.test").await;
+    let id = body(&signed)["user"]["id"].as_str().unwrap().to_owned();
+    let (totp, enrollment, _) = enroll(&auth, &cookies(&signed)).await;
+    let active = call(
+        &auth,
+        request(
+            "/two-factor/verify-totp",
+            Some(json!({"code":totp.generate_current().to_string()})),
+            &cookies(&signed),
+        ),
+        200,
+    )
+    .await;
+    let foreign = signup(&auth, "unlocked@example.test").await;
+    let (other, _, _) = enroll(&auth, &cookies(&foreign)).await;
+    let _ = call(
+        &auth,
+        request(
+            "/two-factor/verify-totp",
+            Some(json!({"code":other.generate_current().to_string()})),
+            &cookies(&foreign),
+        ),
+        200,
+    )
+    .await;
+    let pending = sign_in(&auth, "locked@example.test", json!({}), "").await;
+    _ = db
+        .execute(
+            "UPDATE two_factor SET failed_verification_count = 10 WHERE user_id = $1",
+            &[&id],
+        )
+        .await?;
+    let factor = auth.store().get_two_factor_by_user_id(&id).await?.unwrap();
+    _ = auth
+        .store()
+        .set_two_factor_lock_if_count_at_least(
+            &factor.id,
+            10.0,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .await?;
+    let before = db
+        .tables(&[
+            "two_factor",
+            "verifications",
+            "sessions",
+            "users",
+            "accounts",
+        ])
+        .await?;
+    for (path, code) in [
+        (
+            "/two-factor/verify-totp",
+            json!(totp.generate_current().to_string()),
+        ),
+        (
+            "/two-factor/verify-backup-code",
+            enrollment["backupCodes"][0].clone(),
+        ),
+    ] {
+        let denied = call(
+            &auth,
+            request(path, Some(json!({"code":code})), &cookies(&pending)),
+            429,
+        )
+        .await;
+        assert_eq!(body(&denied)["code"], "ACCOUNT_TEMPORARILY_LOCKED");
+        assert_eq!(
+            db.tables(&[
+                "two_factor",
+                "verifications",
+                "sessions",
+                "users",
+                "accounts"
+            ])
+            .await?,
+            before
+        );
+    }
+    let confirmed = call(
+        &auth,
+        request(
+            "/two-factor/verify-totp",
+            Some(json!({"code":totp.generate_current().to_string()})),
+            &cookies(&active),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(
+        body(&confirmed)["token"],
+        body(&call(&auth, request("/get-session", None, &cookies(&active)), 200).await)["session"]
+            ["token"]
+    );
+    assert_eq!(
+        db.tables(&[
+            "two_factor",
+            "verifications",
+            "sessions",
+            "users",
+            "accounts"
+        ])
+        .await?,
+        before
+    );
+    let independent = sign_in(&auth, "unlocked@example.test", json!({}), "").await;
+    let completed = call(
+        &auth,
+        request(
+            "/two-factor/verify-totp",
+            Some(json!({"code":other.generate_current().to_string()})),
+            &cookies(&independent),
+        ),
+        200,
+    )
+    .await;
+    authenticated(&auth, &cookies(&completed), "unlocked@example.test").await;
+    assert_eq!(db.table("two_factor").await?, *before.first().unwrap());
+    // The foreign completion cannot spend the locked owner's pending proof.
+    let denied = call(
+        &auth,
+        request(
+            "/two-factor/verify-totp",
+            Some(json!({"code":totp.generate_current().to_string()})),
+            &cookies(&pending),
+        ),
+        429,
+    )
+    .await;
+    assert_eq!(body(&denied)["code"], "ACCOUNT_TEMPORARILY_LOCKED");
+    authenticated(&auth, &cookies(&active), "locked@example.test").await;
     B::close(connection).await
 }
