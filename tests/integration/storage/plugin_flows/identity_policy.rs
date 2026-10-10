@@ -14,6 +14,8 @@ backend_tests!(
     identity_policy_admits_mutations_and_isolates_concurrent_requests,
     provider_admission_distinguishes_creation_returning_and_linking,
     verification_identifier_policy_preserves_logical_access_and_failure_atomicity,
+    verification_trusted_create_cache_key,
+    verification_expired_transformed_fallback,
     verification_cache_before_veto
 );
 postgres_tests!(
@@ -466,6 +468,259 @@ async fn provider_admission_distinguishes_creation_returning_and_linking<B: Back
         ]
     );
     B::close(connection).await
+}
+
+async fn verification_trusted_create_cache_key<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{
+        CacheAdapter, DatabaseHookContext, DatabaseHooks, HookBackend, HookControl,
+        MemoryCacheAdapter,
+    };
+    use alibi::verification::{VerificationCreation, VerificationSnapshot};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest, Sha256};
+    struct Mutation {
+        events: Arc<Mutex<Vec<Value>>>,
+        cache: Arc<MemoryCacheAdapter>,
+        key: String,
+    }
+    #[async_trait]
+    impl<S: AuthSchema, H: HookBackend> DatabaseHooks<S, H> for Mutation {
+        async fn before_create_verification_record(
+            &self,
+            v: &mut VerificationCreation,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<HookControl> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(v.snapshot().data())?);
+            v.id = Some("trusted-storage-primary".into());
+            v.identifier = "trusted-stored-identifier".into();
+            v.value = "trusted-proof".into();
+            v.created_at = chrono::DateTime::parse_from_rfc3339("2010-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            v.updated_at = chrono::DateTime::parse_from_rfc3339("2011-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            Ok(HookControl::Continue)
+        }
+        async fn after_create_verification_record(
+            &self,
+            v: &VerificationSnapshot,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<()> {
+            let actual = serde_json::to_value(v.data())?;
+            let published: Value =
+                serde_json::from_str(&self.cache.get(&self.key).await?.unwrap())?;
+            assert_eq!(published, actual);
+            self.events.lock().unwrap().push(actual);
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let cache = Arc::new(MemoryCacheAdapter::new());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let key = format!(
+        "verification:{}",
+        URL_SAFE_NO_PAD.encode(Sha256::digest(b"original-logical-identifier"))
+    );
+    let mut config = AuthConfig::new(SECRET);
+    config.verification.secondary_storage = Some(cache.clone());
+    config.verification.store_in_database = true;
+    config.verification.store_identifier.default = VerificationIdentifierStrategy::Hashed;
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::hook(
+            B::store(Arc::new(config), &connection),
+            Mutation {
+                events: events.clone(),
+                cache: cache.clone(),
+                key: key.clone(),
+            },
+        ))
+        .build()
+        .await?;
+    let created = auth
+        .context()
+        .verifications()
+        .create(VerificationCreation {
+            id: None,
+            identifier: "original-logical-identifier".into(),
+            value: "original-proof".into(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+            created_at: chrono::DateTime::parse_from_rfc3339("2020-01-02T03:04:05Z")?
+                .with_timezone(&chrono::Utc),
+            updated_at: chrono::DateTime::parse_from_rfc3339("2021-02-03T04:05:06Z")?
+                .with_timezone(&chrono::Utc),
+        })
+        .await?
+        .unwrap();
+    let actual = serde_json::to_value(created.data())?;
+    assert_eq!(actual["id"], "trusted-storage-primary");
+    assert_eq!(actual["identifier"], "trusted-stored-identifier");
+    assert_eq!(actual["value"], "trusted-proof");
+    assert_eq!(actual["createdAt"], "2010-01-01T00:00:00.000Z");
+    assert_eq!(actual["updatedAt"], "2011-01-01T00:00:00.000Z");
+    assert_eq!(
+        db.text(
+            "SELECT identifier FROM verifications WHERE id=$1",
+            &["trusted-storage-primary"]
+        )
+        .await?
+        .as_deref(),
+        Some("trusted-stored-identifier")
+    );
+    assert_eq!(
+        db.text(
+            "SELECT value FROM verifications WHERE id=$1",
+            &["trusted-storage-primary"]
+        )
+        .await?
+        .as_deref(),
+        Some("trusted-proof")
+    );
+    assert_eq!(db.count("verifications").await?, 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&cache.get(&key).await?.unwrap())?,
+        actual
+    );
+    assert!(
+        cache
+            .get("verification:trusted-stored-identifier")
+            .await?
+            .is_none()
+    );
+    let found = auth
+        .context()
+        .verifications()
+        .find("original-logical-identifier")
+        .await?
+        .unwrap();
+    assert_eq!(serde_json::to_value(found.data())?, actual);
+    let receipts = events.lock().unwrap().clone();
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[0]["value"], "original-proof");
+    assert_eq!(receipts[0]["createdAt"], "2020-01-02T03:04:05.000Z");
+    assert_eq!(
+        receipts[0]["identifier"],
+        key.strip_prefix("verification:").unwrap()
+    );
+    assert_eq!(receipts[1], actual);
+    B::close(connection).await
+}
+
+async fn verification_expired_transformed_fallback<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{CacheAdapter, MemoryCacheAdapter};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest, Sha256};
+    for mode in [0, 1, 2] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let cache = Arc::new(MemoryCacheAdapter::new());
+        let mut config = AuthConfig::new(SECRET);
+        config.verification.store_identifier.default = VerificationIdentifierStrategy::Hashed;
+        if mode > 0 {
+            config.verification.secondary_storage = Some(cache.clone());
+        }
+        config.verification.store_in_database = mode == 1;
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .build()
+            .await?;
+        let transformed = URL_SAFE_NO_PAD.encode(Sha256::digest(b"fallback-owner"));
+        let foreign = auth
+            .store()
+            .create_verification(CreateVerification {
+                identifier: "foreign-proof".into(),
+                value: "unchanged".into(),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
+            })
+            .await?;
+        use alibi::AuthVerification;
+        let foreign_id = foreign.id().into_owned();
+        for (identifier, value, expired) in [
+            (transformed.as_str(), "expired-transformed", true),
+            ("fallback-owner", "live-plain", false),
+        ] {
+            let expiry = if expired {
+                "2000-01-01T00:00:00Z"
+            } else {
+                "2100-01-01T00:00:00Z"
+            };
+            if mode == 2 {
+                cache
+                    .set(
+                        &format!("verification:{identifier}"),
+                        &json!({"identifier":identifier,"value":value,"expiresAt":expiry})
+                            .to_string(),
+                        chrono::Duration::minutes(5),
+                    )
+                    .await?;
+            } else {
+                _ = auth
+                    .store()
+                    .create_verification(CreateVerification {
+                        identifier: identifier.into(),
+                        value: value.into(),
+                        expires_at: chrono::DateTime::parse_from_rfc3339(expiry)?
+                            .with_timezone(&chrono::Utc),
+                    })
+                    .await?;
+            }
+        }
+        assert!(
+            auth.context()
+                .verifications()
+                .consume("fallback-owner")
+                .await?
+                .is_none()
+        );
+        assert_eq!(
+            db.count("verifications").await?,
+            if mode == 2 { 1 } else { 2 }
+        );
+        if mode == 2 {
+            assert!(cache.get("verification:fallback-owner").await?.is_none());
+            assert!(
+                cache
+                    .get(&format!("verification:{transformed}"))
+                    .await?
+                    .is_none()
+            );
+        } else {
+            assert_eq!(
+                db.text(
+                    "SELECT value FROM verifications WHERE identifier=$1",
+                    &["fallback-owner"]
+                )
+                .await?
+                .as_deref(),
+                Some("live-plain")
+            );
+        }
+        let next = auth
+            .context()
+            .verifications()
+            .consume("fallback-owner")
+            .await?;
+        if mode == 2 {
+            assert!(next.is_none());
+        } else {
+            assert_eq!(next.unwrap().value()?, "live-plain");
+        }
+        assert_eq!(db.count("verifications").await?, 1);
+        assert_eq!(
+            db.text(
+                "SELECT value FROM verifications WHERE id=$1",
+                &[&foreign_id]
+            )
+            .await?
+            .as_deref(),
+            Some("unchanged")
+        );
+        B::close(connection).await?;
+    }
+    Ok(())
 }
 
 async fn verification_cache_before_veto<B: Backend>(db: Db) -> TestResult {
