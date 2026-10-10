@@ -18,6 +18,8 @@ backend_tests!(
     id_token_sign_in_outcomes,
     callback_protocol_outcomes,
     sign_in_policies,
+    valid_form_post_preserves_issued_state_and_escaped_query_until_get,
+    different_email_opt_in_links_unlinks_and_relinks_original_owner
 );
 
 #[derive(Clone)]
@@ -587,5 +589,225 @@ async fn sign_in_policies<B: Backend>(db: Db) -> TestResult {
         &callback(&implicit, &[("code", "grant"), ("state", &state)], &cookies).await,
     );
     trace.assert("social/sign-in-policies");
+    B::close(connection).await
+}
+
+async fn valid_form_post_preserves_issued_state_and_escaped_query_until_get<B: Backend>(
+    db: Db,
+) -> TestResult {
+    for mode in ["valid", "query-overrides", "missing-state", "wrong-state"] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let social = Social::start().await;
+        let auth = social
+            .auth::<B>(&connection, AccountConfig::default(), |_| {})
+            .await?;
+        let (state, cookie) = authorize(
+            &auth,
+            "/sign-in/social",
+            json!({"provider":"google","callbackURL":"/dashboard"}),
+            "",
+        )
+        .await;
+        let before = db
+            .tables(&["users", "accounts", "sessions", "verifications"])
+            .await?;
+        let code = "form :+&=/%é";
+        let user = json!({"name":{"firstName":"Élodie &","lastName":"Form <Owner>"},"email":"social@example.com"}).to_string();
+        let mut form = url::form_urlencoded::Serializer::new(String::new());
+        _ = form.append_pair("code", code).append_pair("user", &user);
+        if mode != "missing-state" {
+            _ = form.append_pair(
+                "state",
+                if mode == "valid" {
+                    &state
+                } else {
+                    "unissued-state"
+                },
+            );
+        }
+        let mut posted = request("/callback/google", None, &cookie);
+        posted.method = HttpMethod::Post;
+        posted.body = Some(form.finish().into_bytes());
+        _ = posted.headers.insert(
+            "content-type".into(),
+            "application/x-www-form-urlencoded".into(),
+        );
+        if mode == "query-overrides" {
+            posted.set_query_pairs([("code", "query-code"), ("state", &state)]);
+        }
+        let redirect = call(&auth, posted, 302).await;
+        let location = url::Url::parse(redirect.headers.get("location").unwrap())?;
+        assert_eq!(location.path(), "/api/auth/callback/google");
+        let fields: std::collections::BTreeMap<_, _> =
+            location.query_pairs().into_owned().collect();
+        assert_eq!(fields.get("user"), Some(&user));
+        let expected_code = if mode == "query-overrides" {
+            "query-code"
+        } else {
+            code
+        };
+        assert_eq!(fields.get("code").map(String::as_str), Some(expected_code));
+        assert_eq!(
+            fields.get("state").map(String::as_str),
+            match mode {
+                "missing-state" => None,
+                "wrong-state" => Some("unissued-state"),
+                _ => Some(state.as_str()),
+            }
+        );
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+        assert!(social.provider.take().is_empty());
+        let mut followed = request("/callback/google", None, &cookie);
+        followed.set_query_pairs(location.query_pairs());
+        let completed = call(&auth, followed, 302).await;
+        let negative = matches!(mode, "missing-state" | "wrong-state");
+        let accepted = if negative {
+            let error = url::Url::parse(completed.headers.get("location").unwrap())?;
+            assert_eq!(
+                error
+                    .query_pairs()
+                    .find(|(key, _)| key == "error")
+                    .unwrap()
+                    .1,
+                if mode == "missing-state" {
+                    "state_not_found"
+                } else {
+                    "state_mismatch"
+                }
+            );
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions", "verifications"])
+                    .await?,
+                before
+            );
+            assert!(social.provider.take().is_empty());
+            callback(
+                &auth,
+                &[("code", "recovered-code"), ("state", &state)],
+                &cookie,
+            )
+            .await
+        } else {
+            completed
+        };
+        assert_eq!(
+            accepted.headers.get("location").map(String::as_str),
+            Some("/dashboard")
+        );
+        authenticated(&auth, &cookies(&accepted), "social@example.com").await;
+        for table in ["users", "accounts", "sessions"] {
+            assert_eq!(db.count(table).await?, 1, "{mode}: {table}");
+        }
+        assert_eq!(db.count("verifications").await?, 0);
+        let receipts = social.provider.take();
+        assert_eq!(receipts.len(), 1);
+        let grant: std::collections::BTreeMap<_, _> =
+            url::form_urlencoded::parse(&receipts[0].body).collect();
+        assert_eq!(
+            grant.get("code").map(|value| value.as_ref()),
+            Some(if negative {
+                "recovered-code"
+            } else {
+                expected_code
+            })
+        );
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn different_email_opt_in_links_unlinks_and_relinks_original_owner<B: Backend>(
+    db: Db,
+) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let social = Social::start().await;
+    let mut provider = OAuthProvider::google("google-client", "google-secret");
+    provider.token_url = social.provider.url.join("token").unwrap().into();
+    provider.get_user_info = Some(Arc::new(social.profile.clone()));
+    let config = AuthConfig::new(SECRET)
+        .base_url(ORIGIN)
+        .account(linking(|policy| policy.allow_different_emails = true));
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(AccountManagementPlugin::new())
+        .plugin(OAuthPlugin::new().add_provider("google", provider))
+        .build()
+        .await?;
+    let owner = signup(&auth, "local-link-owner@example.test").await;
+    let foreign = signup(&auth, "local-link-foreign@example.test").await;
+    let owner_id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+    _ = db.execute("INSERT INTO accounts (id,user_id,account_id,provider_id,created_at,updated_at) SELECT 'github-backup',user_id,'local-github','github',created_at,updated_at FROM accounts WHERE user_id=$1", &[&owner_id]).await?;
+    let before = db.tables(&["users", "sessions"]).await?;
+    let before_accounts: Vec<Value> = serde_json::from_str(&db.table("accounts").await?)?;
+    social
+        .profile
+        .set("different-email-sub", "provider-link@example.test", true);
+    for destination in ["/linked", "/relinked"] {
+        let (state, cookie) = authorize(
+            &auth,
+            "/link-social",
+            json!({"provider":"google","callbackURL":destination}),
+            &cookies(&owner),
+        )
+        .await;
+        let completed = callback(&auth, &[("code", "grant"), ("state", &state)], &cookie).await;
+        assert_eq!(completed.status, 302);
+        assert_eq!(
+            completed.headers.get("location").map(String::as_str),
+            Some(destination)
+        );
+        let current =
+            body(&call(&auth, request("/get-session", None, &cookies(&owner)), 200).await);
+        assert_eq!(current["user"]["id"], owner_id);
+        assert_eq!(current["user"]["email"], "local-link-owner@example.test");
+        assert_eq!(
+            accounts(&auth, &cookies(&owner)).await,
+            json!(["credential", "github", "google"])
+        );
+        let all: Vec<Value> = serde_json::from_str(&db.table("accounts").await?)?;
+        assert_eq!(all.len(), before_accounts.len() + 1);
+        assert!(before_accounts.iter().all(|row| all.contains(row)));
+        let google = all
+            .iter()
+            .find(|row| row["provider_id"] == "google")
+            .unwrap();
+        assert_eq!(google["user_id"], owner_id);
+        assert_eq!(google["account_id"], "different-email-sub");
+        if destination == "/linked" {
+            assert_eq!(
+                body(
+                    &call(
+                        &auth,
+                        request(
+                            "/unlink-account",
+                            Some(json!({"accountId":google["id"]})),
+                            &cookies(&owner)
+                        ),
+                        200
+                    )
+                    .await
+                )["status"],
+                true
+            );
+            assert_eq!(
+                accounts(&auth, &cookies(&owner)).await,
+                json!(["credential", "github"])
+            );
+            assert_eq!(
+                serde_json::from_str::<Vec<Value>>(&db.table("accounts").await?)?,
+                before_accounts
+            );
+        }
+        assert_eq!(db.tables(&["users", "sessions"]).await?, before);
+    }
+    authenticated(&auth, &cookies(&foreign), "local-link-foreign@example.test").await;
     B::close(connection).await
 }
