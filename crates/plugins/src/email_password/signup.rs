@@ -61,7 +61,12 @@ pub(super) fn synthetic_response(
     let input = SyntheticUserContext {
         core_fields,
         additional_fields: Map::new(),
-        id: uuid::Uuid::new_v4().simple().to_string(),
+        id: context
+            .config
+            .advanced
+            .database
+            .generated_id("user")?
+            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string()),
     };
     let mut candidate = if let Some(customize) = &config.custom_synthetic_user {
         customize(input)?

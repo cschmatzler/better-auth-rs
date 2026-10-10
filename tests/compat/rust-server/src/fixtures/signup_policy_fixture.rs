@@ -199,6 +199,8 @@ pub(crate) async fn router(base: &AuthConfig, database: DatabaseConnection) -> A
         "signup-no-auto",
         "signup-required",
         "signup-custom",
+        "signup-synthetic-id",
+        "signup-synthetic-id-custom",
         "signup-policy",
         "signup-zero-policy",
         "signup-username",
@@ -220,6 +222,16 @@ pub(crate) async fn router(base: &AuthConfig, database: DatabaseConnection) -> A
     ] {
         let path = format!("/__test/profiles/{name}/api/auth");
         let mut config = base.clone().base_path(&path);
+        if name.starts_with("signup-synthetic-id") {
+            let app = app.clone();
+            config.advanced.database.generate_id = Some(alibi::config::DatabaseIdStrategy::Custom(
+                Arc::new(move |model: &str, size: Option<usize>| {
+                    app.event(json!({"stage":"id-generation","model":model,"size":size}));
+                    app.fail("id")?;
+                    Ok(Some("synthetic_application_1".into()))
+                }),
+            ));
+        }
         if name == "signup-background" {
             config.background_tasks = Some(app.clone());
         }
@@ -247,7 +259,7 @@ pub(crate) async fn router(base: &AuthConfig, database: DatabaseConnection) -> A
                 enable_signup: name != "signup-disabled",
                 enable_username: name.starts_with("signup-username"),
                 username: username_policy(name, &app),
-                auto_sign_in: !["signup-no-auto", "signup-custom", "signup-username", "signup-background"].contains(&name),
+                auto_sign_in: !["signup-no-auto", "signup-custom", "signup-synthetic-id", "signup-synthetic-id-custom", "signup-username", "signup-background"].contains(&name),
                 require_email_verification: ["signup-required", "signup-otp", "signup-username-required"].contains(&name),
                 password_min_length: if name == "signup-zero-policy" {0} else if name == "signup-policy" {10} else {8},
                 password_max_length: if name == "signup-zero-policy" {0} else if name == "signup-policy" {20} else {128},
@@ -261,12 +273,16 @@ pub(crate) async fn router(base: &AuthConfig, database: DatabaseConnection) -> A
                         Ok(())
                     })
                 })}),
-                custom_synthetic_user: (name == "signup-custom").then(|| {
+                custom_synthetic_user: (["signup-custom", "signup-synthetic-id-custom"].contains(&name)).then(|| {
                     let app=app.clone(); Arc::new(move |input: alibi::plugins::email_password::SyntheticUserContext| {
                         app.event(json!({"stage":"synthetic-user","coreFields":input.core_fields,
                             "additionalFields":input.additional_fields,"id":input.id}));
                         app.fail("synthetic")?;
                         let mut fields=input.core_fields;
+                        if name == "signup-synthetic-id-custom" {
+                            _ = fields.insert("id".into(),json!(input.id));
+                            return Ok(fields);
+                        }
                         let requested=fields.get("name").and_then(Value::as_str).unwrap_or_default();
                         let name=format!("Synthetic {requested}");
                         drop(fields.insert("name".into(),json!(name)));

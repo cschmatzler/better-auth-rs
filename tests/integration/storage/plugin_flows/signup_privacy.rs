@@ -4,7 +4,10 @@ use super::*;
 use alibi::plugins::phone_number::{PhoneNumberConfig, PhoneNumberPlugin};
 use alibi::plugins::{AdminPlugin, AnonymousPlugin, LastLoginMethodPlugin, TwoFactorPlugin};
 
-backend_tests!(duplicate_signup_preserves_identity_and_filters_synthetic_output);
+backend_tests!(
+    duplicate_signup_preserves_identity_and_filters_synthetic_output,
+    synthetic_duplicate_identity_uses_application_id_policy
+);
 postgres_tests!(duplicate_signup_preserves_identity_and_filters_synthetic_output);
 
 async fn duplicate_signup_preserves_identity_and_filters_synthetic_output<B: Backend>(
@@ -162,5 +165,105 @@ async fn duplicate_signup_preserves_identity_and_filters_synthetic_output<B: Bac
         }
     }
     authenticated(&original_auth, &cookies(&owner), "duplicate@example.test").await;
+    B::close(connection).await
+}
+
+async fn synthetic_duplicate_identity_uses_application_id_policy<B: Backend>(db: Db) -> TestResult {
+    use alibi::config::DatabaseIdStrategy;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let setup = super::auth_probe::fast_builder::<B>(&connection)
+        .build()
+        .await?;
+    let owner = signup(&setup, "synthetic-id-owner@example.test").await;
+    let foreign = signup(&setup, "synthetic-id-foreign@example.test").await;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "verifications"])
+        .await?;
+    for custom in [false, true] {
+        let fail = Arc::new(AtomicBool::new(false));
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let observed = events.clone();
+        let rejected = fail.clone();
+        let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        config.advanced.database.generate_id = Some(DatabaseIdStrategy::Custom(Arc::new(
+            move |model: &str, size: Option<usize>| {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push(json!({"stage":"id-generation", "model":model,"size":size}));
+                if rejected.load(Ordering::SeqCst) {
+                    return Err(alibi::AuthError::internal("application ID failed"));
+                }
+                Ok(Some("synthetic_application_1".into()))
+            },
+        )));
+        let mut plugin = super::auth_probe::fast_password().auto_sign_in(false);
+        if custom {
+            let observed = events.clone();
+            plugin = plugin.custom_synthetic_user(Arc::new(move |input| {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push(json!({"stage":"synthetic-user", "id":input.id}));
+                assert_eq!(input.id, "synthetic_application_1");
+                let mut fields = input.core_fields;
+                _ = fields.insert("id".into(), json!(input.id));
+                Ok(fields)
+            }));
+        }
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .plugin(plugin)
+            .build()
+            .await?;
+        let input = json!({"email":"synthetic-id-owner@example.test","name":"Submitted name","password":PASSWORD});
+        let response = call(
+            &auth,
+            request("/sign-up/email", Some(input.clone()), &cookies(&foreign)),
+            200,
+        )
+        .await;
+        assert_eq!(body(&response)["user"]["id"], "synthetic_application_1");
+        assert_ne!(body(&response)["user"]["id"], body(&owner)["user"]["id"]);
+        assert_eq!(body(&response)["user"]["name"], "Submitted name");
+        assert!(body(&response)["token"].is_null());
+        assert!(cookies(&response).is_empty());
+        let mut expected = vec![json!({"stage":"id-generation","model":"user","size":null})];
+        if custom {
+            expected.push(json!({"stage":"synthetic-user","id":"synthetic_application_1"}));
+        }
+        assert_eq!(*events.lock().unwrap(), expected);
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+        events.lock().unwrap().clear();
+        fail.store(true, Ordering::SeqCst);
+        let rejected = call(
+            &auth,
+            request("/sign-up/email", Some(input), &cookies(&foreign)),
+            500,
+        )
+        .await;
+        assert!(cookies(&rejected).is_empty());
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![json!({"stage":"id-generation","model":"user","size":null})]
+        );
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+    }
+    authenticated(&setup, &cookies(&owner), "synthetic-id-owner@example.test").await;
+    authenticated(
+        &setup,
+        &cookies(&foreign),
+        "synthetic-id-foreign@example.test",
+    )
+    .await;
     B::close(connection).await
 }
