@@ -20,7 +20,8 @@ backend_tests!(
     jwt_application_keyring_concurrent_initial_discovery_retains_both_signing_keys,
     jwt_configured_expiration_precision,
     jwt_compact_revoked_principal_signing,
-    jwt_server_claim_override_replacement
+    jwt_server_claim_override_replacement,
+    jwt_remote_signer_selection_options
 );
 
 #[derive(Default)]
@@ -1258,5 +1259,92 @@ async fn jwt_server_claim_override_replacement<B: Backend>(db: Db) -> TestResult
         assert_eq!(db.table("jwks").await?, before);
     }
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    B::close(connection).await
+}
+
+async fn jwt_remote_signer_selection_options<B: Backend>(db: Db) -> TestResult {
+    struct Signer(Mutex<Vec<JwtSignOptions>>);
+    #[async_trait::async_trait]
+    impl SignRemoteJwt for Signer {
+        async fn sign(&self, p: &RemoteJwtPayload, o: &JwtSignOptions) -> AuthResult<String> {
+            self.0.lock().unwrap().push(o.clone());
+            let header = jsonwebtoken::Header {
+                alg: jsonwebtoken::Algorithm::HS256,
+                kid: Some("application-key".into()),
+                typ: Some("APP".into()),
+                ..Default::default()
+            };
+            jsonwebtoken::encode(
+                &header,
+                &capture(p.raw_claims()),
+                &jsonwebtoken::EncodingKey::from_secret(b"application-hmac-authority"),
+            )
+            .map_err(|e| AuthError::internal(e.to_string()))
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let signer = Arc::new(Signer(Mutex::new(Vec::new())));
+    let jwt = JwtPlugin::with_config(JwtPluginConfig {
+        remote_url: Some("https://application.example.test/jwks".into()),
+        remote_signer: Some(signer.clone()),
+        ..Default::default()
+    });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(jwt.clone())
+        .build()
+        .await?;
+    for header in [
+        None,
+        Some(Map::new()),
+        Some(
+            json!({"typ":"application/custom","custom":{"literal":true},"kid":"caller-header"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ),
+    ] {
+        let options = JwtSignOptions {
+            header: header.clone(),
+            signing_key_id: Some("application-only-selection".into()),
+            signing_algorithm: Some(alibi::plugins::jwt::JwtAlgorithm::Es256),
+            ..Default::default()
+        };
+        let token = jwt
+            .sign_jwt_json(
+                &parse_value(
+                    r#"{"sub":"remote-owner","custom":{"nested":[true,null,"literal"]}}"#,
+                )?,
+                &options,
+                None,
+                auth.context(),
+            )
+            .await?;
+        let seen = signer.0.lock().unwrap().last().unwrap().clone();
+        assert_eq!(seen.header, header);
+        assert_eq!(
+            seen.signing_key_id.as_deref(),
+            Some("application-only-selection")
+        );
+        assert_eq!(
+            seen.signing_algorithm,
+            Some(alibi::plugins::jwt::JwtAlgorithm::Es256)
+        );
+        let actual = jsonwebtoken::decode_header(&token)?;
+        assert_eq!(actual.alg, jsonwebtoken::Algorithm::HS256);
+        assert_eq!(actual.kid.as_deref(), Some("application-key"));
+        assert_eq!(actual.typ.as_deref(), Some("APP"));
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+        validation.validate_aud = false;
+        let claims = jsonwebtoken::decode::<Value>(
+            &token,
+            &jsonwebtoken::DecodingKey::from_secret(b"application-hmac-authority"),
+            &validation,
+        )?
+        .claims;
+        assert_eq!(claims["sub"], "remote-owner");
+        assert_eq!(claims["custom"], json!({"nested":[true,null,"literal"]}));
+        assert_eq!(db.count("jwks").await?, 0);
+    }
+    assert_eq!(signer.0.lock().unwrap().len(), 3);
     B::close(connection).await
 }
