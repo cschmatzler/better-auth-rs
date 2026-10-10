@@ -16,7 +16,18 @@ backend_tests!(
     organization_invitation_policy,
     organization_anonymous_and_failures,
     organization_invitation_stamps,
-    processed_invitation_cancellation_keeps_members_and_original_callback_status
+    processed_invitation_cancellation_keeps_members_and_original_callback_status,
+    organization_invitation_raw_quota,
+    organization_invitation_raw_expiry,
+    organization_invitation_delivery_await_policy,
+    organization_invitation_page_before_expiry,
+    organization_invitation_first_reinvite_cancellation,
+    organization_invitation_limit_callback_error,
+    organization_invitation_existing_member_acceptance,
+    organization_invitation_concurrent_admission,
+    organization_invitation_replacement_team,
+    organization_invitation_reset_write_failure,
+    organization_invitation_after_error_owned_cookies
 );
 
 #[derive(Debug, Default)]
@@ -710,6 +721,1927 @@ async fn processed_invitation_cancellation_keeps_members_and_original_callback_s
         );
         assert_eq!(db.count("member").await?, if accepted { 2 } else { 1 });
         authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn organization_invitation_raw_quota<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        InvitationLimit, OrganizationInvitationLimitContext, OrganizationInvitationLimitResolver,
+    };
+    #[derive(Debug)]
+    struct Policy(f64, Mutex<Vec<Value>>);
+    #[async_trait::async_trait]
+    impl OrganizationInvitationLimitResolver for Policy {
+        async fn invitation_limit(
+            &self,
+            c: &OrganizationInvitationLimitContext,
+            callback: &alibi::CallbackContext,
+        ) -> AuthResult<f64> {
+            let request = callback.request.as_ref().expect("physical invite request");
+            assert_eq!(request.path(), "/api/auth/organization/invite-member");
+            assert_eq!(c.user.id, c.member.user_id);
+            assert_eq!(c.member_user.id, c.user.id);
+            assert_eq!(c.member.organization_id, c.organization.id);
+            self.1
+                .lock()
+                .unwrap()
+                .push(json!({"user":c.user.id,"organization":c.organization.id}));
+            Ok(self.0)
+        }
+    }
+    for limit in [
+        Some(0.0),
+        Some(-0.5),
+        Some(1.5),
+        Some(f64::NAN),
+        Some(f64::INFINITY),
+        None,
+    ] {
+        for resolved in [false, true] {
+            if resolved && limit.is_none() {
+                continue;
+            }
+            let db = db.fresh().await?;
+            let policy = Arc::new(Policy(limit.unwrap_or(100.0), Mutex::new(Vec::new())));
+            let organization = OrganizationConfig {
+                invitation_limit: limit.map(|n| {
+                    if resolved {
+                        InvitationLimit::Resolver(policy.clone())
+                    } else {
+                        InvitationLimit::Fixed(n)
+                    }
+                }),
+                ..Default::default()
+            };
+
+            let (connection, _) = db.migrated::<B>(SECRET).await?;
+            let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+            let auth = AuthBuilder::new(config.clone())
+                .store(B::store(Arc::new(config), &connection))
+                .plugin(super::auth_probe::fast_password())
+                .plugin(SessionManagementPlugin::new())
+                .plugin(OrganizationPlugin::with_config(organization))
+                .build()
+                .await?;
+            let owner = signup(&auth, "invitation-life-owner@example.test").await;
+            let foreign = signup(&auth, "invitation-life-foreign@example.test").await;
+            let target = signup(&auth, "invitation-life-target@example.test").await;
+            let created = call(
+                &auth,
+                request(
+                    "/organization/create",
+                    Some(json!({"name":"Life","slug":"invitation-life"})),
+                    &cookies(&owner),
+                ),
+                200,
+            )
+            .await;
+            let org = body(&created)["id"].as_str().unwrap().to_owned();
+            let jar = merge(&cookies(&owner), &cookies(&created));
+
+            if limit.is_none() {
+                for index in 0..100 {
+                    drop(
+                        auth.store()
+                            .create_invitation(alibi::CreateInvitation::new(
+                                &org,
+                                format!("quota-seed-{index}@example.test"),
+                                "member",
+                                body(&owner)["user"]["id"].as_str().unwrap(),
+                                chrono::Utc::now() + chrono::Duration::days(1),
+                            ))
+                            .await?,
+                    );
+                }
+            }
+            let before = db
+                .tables(&[
+                    "users",
+                    "accounts",
+                    "sessions",
+                    "member",
+                    "organization",
+                    "team",
+                    "team_member",
+                ])
+                .await?;
+            let (expected, allowed) = match limit {
+                None => (100, 0),
+                Some(n) if n <= 0.0 => (0, 0),
+                Some(1.5) => (2, 2),
+                _ => (3, 3),
+            };
+            for index in 0..3 {
+                let response=call(&auth,request("/organization/invite-member",Some(json!({"organizationId":org,"email":format!("quota-{index}@example.test"),"role":"member"})),&jar),if index<allowed {200} else {403}).await;
+                if index >= allowed {
+                    assert_eq!(body(&response)["code"], "INVITATION_LIMIT_REACHED");
+                }
+                assert!(cookies(&response).is_empty());
+            }
+            assert_eq!(
+                db.count_where(
+                    "SELECT COUNT(*) FROM invitation WHERE organization_id=$1",
+                    &[&org]
+                )
+                .await?,
+                expected
+            );
+            assert_eq!(policy.1.lock().unwrap().len(), if resolved { 3 } else { 0 });
+            assert_eq!(
+                db.tables(&[
+                    "users",
+                    "accounts",
+                    "sessions",
+                    "member",
+                    "organization",
+                    "team",
+                    "team_member"
+                ])
+                .await?,
+                before
+            );
+            authenticated(
+                &auth,
+                &cookies(&foreign),
+                "invitation-life-foreign@example.test",
+            )
+            .await;
+            authenticated(
+                &auth,
+                &cookies(&target),
+                "invitation-life-target@example.test",
+            )
+            .await;
+            B::close(connection).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn organization_invitation_raw_expiry<B: Backend>(db: Db) -> TestResult {
+    for (seconds, span) in [
+        (0.0, 172800000_i64),
+        (-0.5, -500),
+        (0.125, 125),
+        (f64::NAN, 172800000),
+    ] {
+        let db = db.fresh().await?;
+        let organization = OrganizationConfig {
+            invitation_expires_in: Some(seconds),
+            ..Default::default()
+        };
+
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(OrganizationPlugin::with_config(organization))
+            .build()
+            .await?;
+        let owner = signup(&auth, "invitation-life-owner@example.test").await;
+        let foreign = signup(&auth, "invitation-life-foreign@example.test").await;
+        let target = signup(&auth, "invitation-life-target@example.test").await;
+        let created = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Life","slug":"invitation-life"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+        let org = body(&created)["id"].as_str().unwrap().to_owned();
+        let jar = merge(&cookies(&owner), &cookies(&created));
+
+        let before = db
+            .tables(&[
+                "users",
+                "accounts",
+                "sessions",
+                "member",
+                "team",
+                "team_member",
+            ])
+            .await?;
+        let start = chrono::Utc::now().timestamp_millis();
+        let response=call(&auth,request("/organization/invite-member",Some(json!({"organizationId":org,"email":"invitation-life-target@example.test","role":"member"})),&jar),200).await;
+        let end = chrono::Utc::now().timestamp_millis();
+        let returned = body(&response);
+        let expiry = chrono::DateTime::parse_from_rfc3339(returned["expiresAt"].as_str().unwrap())?
+            .timestamp_millis();
+        assert!((start + span..=end + span).contains(&expiry));
+        let physical = auth
+            .store()
+            .get_invitation_by_id(returned["id"].as_str().unwrap())
+            .await?
+            .unwrap();
+        assert_eq!(physical.expires_at.timestamp_millis(), expiry);
+        if seconds < 0.0 {
+            let rejected = call(
+                &auth,
+                request(
+                    "/organization/accept-invitation",
+                    Some(json!({"invitationId":physical.id})),
+                    &cookies(&target),
+                ),
+                400,
+            )
+            .await;
+            assert_eq!(body(&rejected)["code"], "INVITATION_NOT_FOUND");
+            assert_eq!(
+                auth.store()
+                    .get_invitation_by_id(&physical.id)
+                    .await?
+                    .unwrap(),
+                physical
+            );
+        }
+        assert_eq!(
+            db.tables(&[
+                "users",
+                "accounts",
+                "sessions",
+                "member",
+                "team",
+                "team_member"
+            ])
+            .await?,
+            before
+        );
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "invitation-life-foreign@example.test",
+        )
+        .await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn organization_invitation_delivery_await_policy<B: Backend>(db: Db) -> TestResult {
+    #[derive(Debug, Default)]
+    struct Delivery {
+        events: Mutex<Vec<&'static str>>,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        done: tokio::sync::Notify,
+        observer_error: bool,
+        delivery_error: bool,
+    }
+    impl alibi::BackgroundTaskHandler for Delivery {
+        fn handle(&self, completion: alibi::BackgroundTaskCompletion) -> AuthResult<()> {
+            self.events.lock().unwrap().push("observer");
+            drop(completion);
+            if self.observer_error {
+                Err(alibi::AuthError::internal("observer failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl OrganizationInvitationEmailSender for Delivery {
+        async fn send_invitation_email(
+            &self,
+            c: &OrganizationInvitationDelivery,
+            callback: &alibi::CallbackContext,
+        ) -> AuthResult<()> {
+            assert_eq!(c.invitation.organization_id, c.organization.id);
+            assert_eq!(c.inviter.user_id, c.user.id);
+            assert_eq!(
+                callback.request.as_ref().unwrap().path(),
+                "/api/auth/organization/invite-member"
+            );
+            self.events.lock().unwrap().push("delivery-start");
+            self.started.notify_one();
+            self.release.notified().await;
+            self.events.lock().unwrap().push("delivery-end");
+            self.done.notify_one();
+            if self.delivery_error {
+                Err(alibi::AuthError::internal("delivery failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl OrganizationInvitationHooks for Delivery {
+        async fn before_create_invitation(
+            &self,
+            _: &OrganizationInvitationCreationContext,
+        ) -> AuthResult<Option<OrganizationInvitationCreatePatch>> {
+            self.events.lock().unwrap().push("before");
+            Ok(None)
+        }
+        async fn after_create_invitation(
+            &self,
+            _: &alibi::plugins::organization::OrganizationInvitationContext,
+        ) -> AuthResult<()> {
+            self.events.lock().unwrap().push("after");
+            Ok(())
+        }
+    }
+    for (background, observer_error, delivery_error) in [
+        (false, false, false),
+        (false, false, true),
+        (true, false, false),
+        (true, true, true),
+    ] {
+        let db = db.fresh().await?;
+        let delivery = Arc::new(Delivery {
+            observer_error,
+            delivery_error,
+            ..Default::default()
+        });
+        let organization = OrganizationConfig {
+            invitation_hooks: Some(delivery.clone()),
+            send_invitation_email: Some(delivery.clone()),
+            ..Default::default()
+        };
+
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let config = {
+            let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+            if background {
+                config.background_tasks = Some(delivery.clone());
+            }
+            config
+        };
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(OrganizationPlugin::with_config(organization))
+            .build()
+            .await?;
+        let owner = signup(&auth, "invitation-life-owner@example.test").await;
+        let foreign = signup(&auth, "invitation-life-foreign@example.test").await;
+        let target = signup(&auth, "invitation-life-target@example.test").await;
+        let created = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Life","slug":"invitation-life"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+        let org = body(&created)["id"].as_str().unwrap().to_owned();
+        let jar = merge(&cookies(&owner), &cookies(&created));
+
+        let before = db
+            .tables(&[
+                "users",
+                "accounts",
+                "sessions",
+                "member",
+                "team",
+                "team_member",
+            ])
+            .await?;
+        let auth = Arc::new(auth);
+        let running = auth.clone();
+        let invitation_org = org.clone();
+        let mut pending = tokio::spawn(async move {
+            call(&running,request("/organization/invite-member",Some(json!({"organizationId":invitation_org,"email":"delivery-recipient@example.test","role":"member"})),&jar),200).await
+        });
+        tokio::select! {
+            biased;
+            () = delivery.started.notified() => {},
+            result = &mut pending => {
+                _ = result?;
+                panic!("invitation completed before sender entry");
+            }
+        }
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM invitation WHERE organization_id=$1",
+                &[&org]
+            )
+            .await?,
+            1
+        );
+        if background {
+            let response = pending.await?;
+            assert_eq!(body(&response)["email"], "delivery-recipient@example.test");
+            assert_eq!(
+                *delivery.events.lock().unwrap(),
+                vec!["before", "delivery-start", "observer", "after"]
+            );
+            delivery.release.notify_one();
+            delivery.done.notified().await;
+            assert_eq!(
+                *delivery.events.lock().unwrap(),
+                vec![
+                    "before",
+                    "delivery-start",
+                    "observer",
+                    "after",
+                    "delivery-end"
+                ]
+            );
+        } else {
+            assert!(!pending.is_finished());
+            assert_eq!(
+                *delivery.events.lock().unwrap(),
+                vec!["before", "delivery-start"]
+            );
+            delivery.release.notify_one();
+            _ = pending.await?;
+            delivery.done.notified().await;
+            assert_eq!(
+                *delivery.events.lock().unwrap(),
+                vec!["before", "delivery-start", "delivery-end", "after"]
+            );
+        }
+        assert_eq!(
+            db.tables(&[
+                "users",
+                "accounts",
+                "sessions",
+                "member",
+                "team",
+                "team_member"
+            ])
+            .await?,
+            before
+        );
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "invitation-life-foreign@example.test",
+        )
+        .await;
+        authenticated(
+            &auth,
+            &cookies(&target),
+            "invitation-life-target@example.test",
+        )
+        .await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn organization_invitation_page_before_expiry<B: Backend>(db: Db) -> TestResult {
+    let organization = OrganizationConfig::default();
+
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let config = {
+        let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        config.advanced.database.default_find_many_limit = 1;
+        config
+    };
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(OrganizationPlugin::with_config(organization))
+        .build()
+        .await?;
+    let owner = signup(&auth, "invitation-life-owner@example.test").await;
+    let foreign = signup(&auth, "invitation-life-foreign@example.test").await;
+    let target = signup(&auth, "invitation-life-target@example.test").await;
+    let created = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Life","slug":"invitation-life"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let org = body(&created)["id"].as_str().unwrap().to_owned();
+    let jar = merge(&cookies(&owner), &cookies(&created));
+
+    let expired = auth
+        .store()
+        .create_invitation(alibi::CreateInvitation::new(
+            &org,
+            "page-recipient@example.test",
+            "member",
+            body(&owner)["user"]["id"].as_str().unwrap(),
+            chrono::Utc::now() - chrono::Duration::days(1),
+        ))
+        .await?;
+    let before = db
+        .tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "team",
+            "team_member",
+        ])
+        .await?;
+    let mut ids = vec![expired.id.clone()];
+    for _ in 0..2 {
+        let response=call(&auth,request("/organization/invite-member",Some(json!({"organizationId":org,"email":"page-recipient@example.test","role":"member"})),&jar),200).await;
+        let id = body(&response)["id"].as_str().unwrap().to_owned();
+        assert!(!ids.contains(&id));
+        ids.push(id);
+    }
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM invitation WHERE organization_id=$1 AND status='pending'",
+            &[&org]
+        )
+        .await?,
+        3
+    );
+    assert_eq!(
+        auth.store()
+            .get_invitation_by_id(&expired.id)
+            .await?
+            .unwrap(),
+        expired
+    );
+    let mut query = request("/organization/list-invitations", None, &jar);
+    _ = query.query.insert("organizationId".into(), org.clone());
+    let listed = call(&auth, query, 200).await;
+    assert_eq!(body(&listed).as_array().unwrap().len(), 1);
+    assert_eq!(body(&listed)[0]["id"], expired.id);
+    assert_eq!(
+        db.tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "team",
+            "team_member"
+        ])
+        .await?,
+        before
+    );
+    authenticated(
+        &auth,
+        &cookies(&foreign),
+        "invitation-life-foreign@example.test",
+    )
+    .await;
+    authenticated(
+        &auth,
+        &cookies(&target),
+        "invitation-life-target@example.test",
+    )
+    .await;
+    B::close(connection).await
+}
+
+async fn organization_invitation_first_reinvite_cancellation<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::InvitationLimit;
+    let organization = OrganizationConfig {
+        invitation_limit: Some(InvitationLimit::Fixed(1.0)),
+        cancel_pending_invitations_on_reinvite: true,
+        ..Default::default()
+    };
+
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(OrganizationPlugin::with_config(organization))
+        .build()
+        .await?;
+    let owner = signup(&auth, "invitation-life-owner@example.test").await;
+    let foreign = signup(&auth, "invitation-life-foreign@example.test").await;
+    let target = signup(&auth, "invitation-life-target@example.test").await;
+    let created = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Life","slug":"invitation-life"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let org = body(&created)["id"].as_str().unwrap().to_owned();
+    let jar = merge(&cookies(&owner), &cookies(&created));
+
+    let mut seeded = Vec::new();
+    for expired in [true, false, false] {
+        seeded.push(
+            auth.store()
+                .create_invitation(alibi::CreateInvitation::new(
+                    &org,
+                    "reinvite-recipient@example.test",
+                    "member",
+                    body(&owner)["user"]["id"].as_str().unwrap(),
+                    chrono::Utc::now() + chrono::Duration::days(if expired { -1 } else { 1 }),
+                ))
+                .await?,
+        );
+    }
+    let before = db
+        .tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "organization",
+            "team",
+            "team_member",
+        ])
+        .await?;
+    let input =
+        json!({"organizationId":org,"email":"reinvite-recipient@example.test","role":"member"});
+    let denied = call(
+        &auth,
+        request("/organization/invite-member", Some(input.clone()), &jar),
+        403,
+    )
+    .await;
+    assert_eq!(body(&denied)["code"], "INVITATION_LIMIT_REACHED");
+    assert_eq!(db.count("invitation").await?, 3);
+    assert_eq!(
+        auth.store()
+            .get_invitation_by_id(&seeded[0].id)
+            .await?
+            .unwrap(),
+        seeded[0]
+    );
+    assert_eq!(
+        auth.store()
+            .get_invitation_by_id(&seeded[2].id)
+            .await?
+            .unwrap(),
+        seeded[2]
+    );
+    let first = auth
+        .store()
+        .get_invitation_by_id(&seeded[1].id)
+        .await?
+        .unwrap();
+    assert_eq!(first.status, alibi::InvitationStatus::Canceled);
+    let mut expected = seeded[1].clone();
+    expected.status = alibi::InvitationStatus::Canceled;
+    assert_eq!(first, expected);
+    let retry = call(
+        &auth,
+        request("/organization/invite-member", Some(input), &jar),
+        200,
+    )
+    .await;
+    assert!(
+        seeded
+            .iter()
+            .all(|r| r.id != body(&retry)["id"].as_str().unwrap())
+    );
+    assert_eq!(db.count("invitation").await?, 4);
+    assert_eq!(
+        auth.store()
+            .get_invitation_by_id(&seeded[0].id)
+            .await?
+            .unwrap(),
+        seeded[0]
+    );
+    assert_eq!(
+        auth.store()
+            .get_invitation_by_id(&seeded[1].id)
+            .await?
+            .unwrap(),
+        expected
+    );
+    expected = seeded[2].clone();
+    expected.status = alibi::InvitationStatus::Canceled;
+    assert_eq!(
+        auth.store()
+            .get_invitation_by_id(&seeded[2].id)
+            .await?
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        db.tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "organization",
+            "team",
+            "team_member"
+        ])
+        .await?,
+        before
+    );
+    authenticated(
+        &auth,
+        &cookies(&foreign),
+        "invitation-life-foreign@example.test",
+    )
+    .await;
+    authenticated(
+        &auth,
+        &cookies(&target),
+        "invitation-life-target@example.test",
+    )
+    .await;
+    B::close(connection).await
+}
+
+async fn organization_invitation_limit_callback_error<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        InvitationLimit, OrganizationInvitationContext, OrganizationInvitationLimitContext,
+        OrganizationInvitationLimitResolver,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    #[derive(Debug)]
+    struct Policy {
+        reject: AtomicBool,
+        events: Mutex<Vec<&'static str>>,
+    }
+    #[async_trait::async_trait]
+    impl OrganizationInvitationLimitResolver for Policy {
+        async fn invitation_limit(
+            &self,
+            c: &OrganizationInvitationLimitContext,
+            callback: &alibi::CallbackContext,
+        ) -> AuthResult<f64> {
+            assert_eq!(c.user.id, c.member.user_id);
+            assert_eq!(c.member_user.id, c.user.id);
+            assert_eq!(c.member.organization_id, c.organization.id);
+            assert_eq!(
+                callback.request.as_ref().unwrap().headers["x-invitation-marker"],
+                "original-marker"
+            );
+            self.events.lock().unwrap().push("limit");
+            if self.reject.load(Ordering::SeqCst) {
+                Err(alibi::AuthError::Upstream {
+                    status: 403,
+                    code: "INVITATION_APPLICATION_REJECTED",
+                    message: "application invitation policy rejected",
+                })
+            } else {
+                Ok(100.0)
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl OrganizationInvitationHooks for Policy {
+        async fn before_create_invitation(
+            &self,
+            _: &OrganizationInvitationCreationContext,
+        ) -> AuthResult<Option<OrganizationInvitationCreatePatch>> {
+            self.events.lock().unwrap().push("before");
+            Ok(None)
+        }
+        async fn after_create_invitation(
+            &self,
+            _: &OrganizationInvitationContext,
+        ) -> AuthResult<()> {
+            self.events.lock().unwrap().push("after");
+            Ok(())
+        }
+    }
+    #[async_trait::async_trait]
+    impl OrganizationInvitationEmailSender for Policy {
+        async fn send_invitation_email(
+            &self,
+            _: &OrganizationInvitationDelivery,
+            _: &alibi::CallbackContext,
+        ) -> AuthResult<()> {
+            self.events.lock().unwrap().push("send");
+            Ok(())
+        }
+    }
+    let policy = Arc::new(Policy {
+        reject: AtomicBool::new(true),
+        events: Mutex::new(Vec::new()),
+    });
+    let organization = OrganizationConfig {
+        invitation_limit: Some(InvitationLimit::Resolver(policy.clone())),
+        invitation_hooks: Some(policy.clone()),
+        send_invitation_email: Some(policy.clone()),
+        ..Default::default()
+    };
+
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(OrganizationPlugin::with_config(organization))
+        .build()
+        .await?;
+    let owner = signup(&auth, "invitation-life-owner@example.test").await;
+    let foreign = signup(&auth, "invitation-life-foreign@example.test").await;
+    let target = signup(&auth, "invitation-life-target@example.test").await;
+    let created = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Life","slug":"invitation-life"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let org = body(&created)["id"].as_str().unwrap().to_owned();
+    let jar = merge(&cookies(&owner), &cookies(&created));
+
+    let before = db
+        .tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "organization",
+            "team",
+            "team_member",
+            "invitation",
+        ])
+        .await?;
+    let input =
+        json!({"organizationId":org,"email":"policy-recipient@example.test","role":"member"});
+    let mut rejected = request("/organization/invite-member", Some(input.clone()), &jar);
+    _ = rejected
+        .headers
+        .insert("x-invitation-marker".into(), "original-marker".into());
+    let response = call(&auth, rejected, 403).await;
+    assert_eq!(body(&response)["code"], "INVITATION_APPLICATION_REJECTED");
+    assert!(cookies(&response).is_empty());
+    assert_eq!(*policy.events.lock().unwrap(), vec!["limit"]);
+    assert_eq!(
+        db.tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "organization",
+            "team",
+            "team_member",
+            "invitation"
+        ])
+        .await?,
+        before
+    );
+    policy.events.lock().unwrap().clear();
+    policy.reject.store(false, Ordering::SeqCst);
+    let mut retry = request("/organization/invite-member", Some(input), &jar);
+    _ = retry
+        .headers
+        .insert("x-invitation-marker".into(), "original-marker".into());
+    _ = call(&auth, retry, 200).await;
+    assert_eq!(
+        *policy.events.lock().unwrap(),
+        vec!["limit", "before", "send", "after"]
+    );
+    assert_eq!(db.count("invitation").await?, 1);
+    assert_eq!(
+        db.tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "organization",
+            "team",
+            "team_member"
+        ])
+        .await?,
+        before[..7]
+    );
+    authenticated(
+        &auth,
+        &cookies(&foreign),
+        "invitation-life-foreign@example.test",
+    )
+    .await;
+    authenticated(
+        &auth,
+        &cookies(&target),
+        "invitation-life-target@example.test",
+    )
+    .await;
+    B::close(connection).await
+}
+
+async fn organization_invitation_existing_member_acceptance<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        OrganizationInvitationAcceptanceHooks, OrganizationInvitationAcceptedContext,
+    };
+    #[derive(Debug, Default)]
+    struct Receipt(Mutex<Vec<Value>>);
+    #[async_trait::async_trait]
+    impl OrganizationInvitationAcceptanceHooks for Receipt {
+        async fn after_accept_invitation(
+            &self,
+            c: &OrganizationInvitationAcceptedContext,
+        ) -> AuthResult<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(json!({"member":c.member,"invitation":c.invitation}));
+            Ok(())
+        }
+    }
+    for teams in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let receipt = Arc::new(Receipt::default());
+        let organization = OrganizationConfig {
+            invitation_acceptance_hooks: Some(receipt.clone()),
+            teams: TeamsConfig {
+                enabled: teams,
+                create_default_team: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(OrganizationPlugin::with_config(organization))
+            .build()
+            .await?;
+        let owner = signup(&auth, "staged-invitation-owner@example.test").await;
+        let target = signup(&auth, "staged-invitation-target@example.test").await;
+        let foreign = signup(&auth, "staged-invitation-foreign@example.test").await;
+        let sibling = call(
+            &auth,
+            request(
+                "/sign-in/email",
+                Some(json!({"email":"staged-invitation-target@example.test","password":PASSWORD})),
+                "",
+            ),
+            200,
+        )
+        .await;
+        let created = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Stage","slug":"invitation-stage"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+        let org = body(&created)["id"].as_str().unwrap().to_owned();
+        let jar = merge(&cookies(&owner), &cookies(&created));
+        let target_id = body(&target)["user"]["id"].as_str().unwrap().to_owned();
+
+        let team = if teams {
+            Some(
+                body(
+                    &call(
+                        &auth,
+                        request(
+                            "/organization/create-team",
+                            Some(json!({"organizationId":org,"name":"Invited team"})),
+                            &jar,
+                        ),
+                        200,
+                    )
+                    .await,
+                )["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+        let mut invite_input = json!({"organizationId":org,"email":"staged-invitation-target@example.test","role":"member"});
+        if let Some(team) = &team {
+            invite_input["teamId"] = json!(team);
+        }
+        let invited = call(
+            &auth,
+            request("/organization/invite-member", Some(invite_input), &jar),
+            200,
+        )
+        .await;
+        let invitation = body(&invited)["id"].as_str().unwrap().to_owned();
+        let original = auth
+            .store()
+            .create_member(alibi::CreateMember {
+                organization_id: org.clone(),
+                user_id: target_id.clone(),
+                role: "admin".into(),
+            })
+            .await?;
+        let before = db.tables(&["users", "accounts", "sessions"]).await?;
+        let accepted = call(
+            &auth,
+            request(
+                "/organization/accept-invitation",
+                Some(json!({"invitationId":invitation})),
+                &cookies(&target),
+            ),
+            200,
+        )
+        .await;
+        let result = body(&accepted);
+        let new_member = result["member"]["id"].as_str().unwrap();
+        assert_ne!(new_member, original.id);
+        assert_eq!(result["member"]["role"], "member");
+        assert_eq!(
+            auth.store().get_member(&org, &target_id).await?.unwrap(),
+            original
+        );
+        assert_eq!(
+            db.text("SELECT role FROM member WHERE id=$1", &[new_member])
+                .await?
+                .as_deref(),
+            Some("member")
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM member WHERE organization_id=$1 AND user_id=$2",
+                &[&org, &target_id]
+            )
+            .await?,
+            2
+        );
+        assert_eq!(
+            receipt.0.lock().unwrap().as_slice(),
+            [json!({"member":result["member"],"invitation":result["invitation"]})]
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM team_member WHERE user_id=$1",
+                &[&target_id]
+            )
+            .await?,
+            if teams { 1 } else { 0 }
+        );
+        let current = call(&auth, request("/get-session", None, &cookies(&target)), 200).await;
+        assert_eq!(body(&current)["session"]["activeOrganizationId"], org);
+        assert_eq!(body(&current)["session"]["activeTeamId"], json!(team));
+        let sibling_current = call(
+            &auth,
+            request("/get-session", None, &cookies(&sibling)),
+            200,
+        )
+        .await;
+        assert!(body(&sibling_current)["session"]["activeOrganizationId"].is_null());
+        assert!(body(&sibling_current)["session"]["activeTeamId"].is_null());
+        assert_eq!(db.tables(&["users", "accounts"]).await?, before[..2]);
+        let committed = db
+            .tables(&["invitation", "member", "team", "team_member", "sessions"])
+            .await?;
+        let replay = call(
+            &auth,
+            request(
+                "/organization/accept-invitation",
+                Some(json!({"invitationId":invitation})),
+                &cookies(&target),
+            ),
+            400,
+        )
+        .await;
+        assert_eq!(body(&replay)["code"], "INVITATION_NOT_FOUND");
+        assert_eq!(receipt.0.lock().unwrap().len(), 1);
+        assert_eq!(
+            db.tables(&["invitation", "member", "team", "team_member", "sessions"])
+                .await?,
+            committed
+        );
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "staged-invitation-foreign@example.test",
+        )
+        .await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn organization_invitation_concurrent_admission<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        MembershipLimit, OrganizationInvitationAcceptanceContext,
+        OrganizationInvitationAcceptanceHooks, OrganizationInvitationAcceptedContext,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Debug, Default)]
+    struct Gate {
+        entered: AtomicUsize,
+        changed: tokio::sync::Notify,
+        release: [tokio::sync::Notify; 2],
+        after: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl OrganizationInvitationAcceptanceHooks for Gate {
+        async fn before_accept_invitation(
+            &self,
+            c: &OrganizationInvitationAcceptanceContext,
+        ) -> AuthResult<()> {
+            assert_eq!(c.invitation.status, alibi::InvitationStatus::Pending);
+            let index = self.entered.fetch_add(1, Ordering::SeqCst);
+            assert!(index < 2);
+            self.changed.notify_one();
+            self.release[index].notified().await;
+            Ok(())
+        }
+        async fn after_accept_invitation(
+            &self,
+            c: &OrganizationInvitationAcceptedContext,
+        ) -> AuthResult<()> {
+            self.after.lock().unwrap().push(c.member.id.clone());
+            Ok(())
+        }
+    }
+    for different in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let gate = Arc::new(Gate::default());
+        let organization = OrganizationConfig {
+            membership_limit: Some(MembershipLimit::Fixed(2.0)),
+            invitation_acceptance_hooks: Some(gate.clone()),
+            ..Default::default()
+        };
+
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(OrganizationPlugin::with_config(organization))
+            .build()
+            .await?;
+        let owner = signup(&auth, "staged-invitation-owner@example.test").await;
+        let target = signup(&auth, "staged-invitation-target@example.test").await;
+        let foreign = signup(&auth, "staged-invitation-foreign@example.test").await;
+        let sibling = call(
+            &auth,
+            request(
+                "/sign-in/email",
+                Some(json!({"email":"staged-invitation-target@example.test","password":PASSWORD})),
+                "",
+            ),
+            200,
+        )
+        .await;
+        let created = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Stage","slug":"invitation-stage"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+        let org = body(&created)["id"].as_str().unwrap().to_owned();
+        let jar = merge(&cookies(&owner), &cookies(&created));
+
+        let second_target = if different {
+            signup(&auth, "staged-invitation-second@example.test").await
+        } else {
+            target.clone()
+        };
+        let first=call(&auth,request("/organization/invite-member",Some(json!({"organizationId":org,"email":"staged-invitation-target@example.test","role":"member"})),&jar),200).await;
+        let second = if different {
+            call(&auth,request("/organization/invite-member",Some(json!({"organizationId":org,"email":"staged-invitation-second@example.test","role":"admin"})),&jar),200).await
+        } else {
+            first.clone()
+        };
+        let before = db.tables(&["users", "accounts"]).await?;
+        let auth = Arc::new(auth);
+        let one = auth.clone();
+        let first_id = body(&first)["id"].clone();
+        let first_jar = cookies(&target);
+        let task_one = tokio::spawn(async move {
+            call(
+                &one,
+                request(
+                    "/organization/accept-invitation",
+                    Some(json!({"invitationId":first_id})),
+                    &first_jar,
+                ),
+                200,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while gate.entered.load(Ordering::SeqCst) < 1 {
+                gate.changed.notified().await;
+            }
+        })
+        .await?;
+        let two = auth.clone();
+        let second_id = body(&second)["id"].clone();
+        let second_jar = cookies(&second_target);
+        let task_two = tokio::spawn(async move {
+            call(
+                &two,
+                request(
+                    "/organization/accept-invitation",
+                    Some(json!({"invitationId":second_id})),
+                    &second_jar,
+                ),
+                if different { 200 } else { 400 },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while gate.entered.load(Ordering::SeqCst) < 2 {
+                gate.changed.notified().await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM member WHERE organization_id=$1",
+                &[&org]
+            )
+            .await?,
+            1
+        );
+        gate.release[0].notify_one();
+        let first_result = task_one.await?;
+        let first_member = body(&first_result)["member"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let first_state = db.tables(&["invitation", "member", "sessions"]).await?;
+        gate.release[1].notify_one();
+        let second_result = task_two.await?;
+        if different {
+            assert_ne!(body(&second_result)["member"]["id"], first_member);
+            assert_eq!(body(&second_result)["member"]["role"], "admin");
+            assert_eq!(
+                db.count_where(
+                    "SELECT COUNT(*) FROM member WHERE organization_id=$1",
+                    &[&org]
+                )
+                .await?,
+                3
+            );
+            assert_eq!(gate.after.lock().unwrap().len(), 2);
+        } else {
+            assert_eq!(body(&second_result)["code"], "INVITATION_NOT_FOUND");
+            assert_eq!(
+                db.tables(&["invitation", "member", "sessions"]).await?,
+                first_state
+            );
+            assert_eq!(*gate.after.lock().unwrap(), vec![first_member]);
+        }
+        assert_eq!(db.tables(&["users", "accounts"]).await?, before);
+        let sibling_current = call(
+            &auth,
+            request("/get-session", None, &cookies(&sibling)),
+            200,
+        )
+        .await;
+        assert!(body(&sibling_current)["session"]["activeOrganizationId"].is_null());
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "staged-invitation-foreign@example.test",
+        )
+        .await;
+        let stable = db.tables(&["invitation", "member", "sessions"]).await?;
+        let replay = call(
+            &auth,
+            request(
+                "/organization/accept-invitation",
+                Some(json!({"invitationId":body(&second)["id"]})),
+                &cookies(&second_target),
+            ),
+            400,
+        )
+        .await;
+        assert_eq!(body(&replay)["code"], "INVITATION_NOT_FOUND");
+        assert_eq!(
+            db.tables(&["invitation", "member", "sessions"]).await?,
+            stable
+        );
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn organization_invitation_replacement_team<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        OrganizationInvitationAcceptanceContext, OrganizationInvitationAcceptanceHooks,
+        OrganizationInvitationAcceptedContext,
+    };
+    struct Replacement {
+        raw: crate::storage::Raw,
+        team: Mutex<String>,
+        receipts: Mutex<Vec<Value>>,
+    }
+    impl std::fmt::Debug for Replacement {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Replacement").finish_non_exhaustive()
+        }
+    }
+    #[async_trait::async_trait]
+    impl OrganizationInvitationAcceptanceHooks for Replacement {
+        async fn before_accept_invitation(
+            &self,
+            c: &OrganizationInvitationAcceptanceContext,
+        ) -> AuthResult<()> {
+            self.receipts
+                .lock()
+                .unwrap()
+                .push(json!({"phase":"before","invitation":c.invitation}));
+            let team = self.team.lock().unwrap().clone();
+            _ = self
+                .raw
+                .execute(
+                    "UPDATE invitation SET team_id=$1 WHERE id=$2",
+                    &[&team, &c.invitation.id],
+                )
+                .await
+                .map_err(|e| alibi::AuthError::internal(e.to_string()))?;
+            Ok(())
+        }
+        async fn after_accept_invitation(
+            &self,
+            c: &OrganizationInvitationAcceptedContext,
+        ) -> AuthResult<()> {
+            self.receipts
+                .lock()
+                .unwrap()
+                .push(json!({"phase":"after","invitation":c.invitation}));
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let replacement = Arc::new(Replacement {
+        raw: db.raw.clone(),
+        team: Mutex::new(String::new()),
+        receipts: Mutex::new(Vec::new()),
+    });
+    let organization = OrganizationConfig {
+        invitation_acceptance_hooks: Some(replacement.clone()),
+        teams: TeamsConfig {
+            enabled: true,
+            create_default_team: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(OrganizationPlugin::with_config(organization))
+        .build()
+        .await?;
+    let owner = signup(&auth, "staged-invitation-owner@example.test").await;
+    let target = signup(&auth, "staged-invitation-target@example.test").await;
+    let foreign = signup(&auth, "staged-invitation-foreign@example.test").await;
+    let sibling = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"staged-invitation-target@example.test","password":PASSWORD})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    let created = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Stage","slug":"invitation-stage"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let org = body(&created)["id"].as_str().unwrap().to_owned();
+    let jar = merge(&cookies(&owner), &cookies(&created));
+    let target_id = body(&target)["user"]["id"].as_str().unwrap().to_owned();
+
+    let created_team = call(
+        &auth,
+        request(
+            "/organization/create-team",
+            Some(json!({"organizationId":org,"name":"Invited team"})),
+            &jar,
+        ),
+        200,
+    )
+    .await;
+    let team = body(&created_team)["id"].as_str().unwrap().to_owned();
+    let invited=call(&auth,request("/organization/invite-member",Some(json!({"organizationId":org,"email":"staged-invitation-target@example.test","role":"member","teamId":team})),&jar),200).await;
+    let invitation = body(&invited)["id"].as_str().unwrap().to_owned();
+
+    let created_replacement = call(
+        &auth,
+        request(
+            "/organization/create-team",
+            Some(json!({"organizationId":org,"name":"Replacement"})),
+            &jar,
+        ),
+        200,
+    )
+    .await;
+    let next_team = body(&created_replacement)["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    *replacement.team.lock().unwrap() = next_team.clone();
+    let before = db.tables(&["users", "accounts"]).await?;
+    let original = auth
+        .store()
+        .get_invitation_by_id(&invitation)
+        .await?
+        .unwrap();
+    let accepted = call(
+        &auth,
+        request(
+            "/organization/accept-invitation",
+            Some(json!({"invitationId":invitation})),
+            &cookies(&target),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&accepted)["invitation"]["teamId"], next_team);
+    let receipts = replacement.receipts.lock().unwrap().clone();
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[0]["invitation"]["teamId"], team);
+    assert_eq!(receipts[0]["invitation"]["status"], "pending");
+    assert_eq!(receipts[1]["invitation"], body(&accepted)["invitation"]);
+    let mut expected = original;
+    expected.team_id = Some(next_team.clone());
+    expected.status = alibi::InvitationStatus::Accepted;
+    assert_eq!(
+        auth.store()
+            .get_invitation_by_id(&invitation)
+            .await?
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        db.text(
+            "SELECT team_id FROM team_member WHERE user_id=$1",
+            &[&target_id]
+        )
+        .await?
+        .as_deref(),
+        Some(next_team.as_str())
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM team_member WHERE team_id=$1",
+            &[&team]
+        )
+        .await?,
+        0
+    );
+    assert_eq!(
+        db.text(
+            "SELECT CAST(member_count AS TEXT) FROM team WHERE id=$1",
+            &[&team]
+        )
+        .await?
+        .as_deref(),
+        Some("0")
+    );
+    assert_eq!(
+        db.text(
+            "SELECT CAST(member_count AS TEXT) FROM team WHERE id=$1",
+            &[&next_team]
+        )
+        .await?
+        .as_deref(),
+        Some("1")
+    );
+    let current = call(&auth, request("/get-session", None, &cookies(&target)), 200).await;
+    assert_eq!(body(&current)["session"]["activeTeamId"], next_team);
+    let sibling_current = call(
+        &auth,
+        request("/get-session", None, &cookies(&sibling)),
+        200,
+    )
+    .await;
+    assert!(body(&sibling_current)["session"]["activeTeamId"].is_null());
+    assert_eq!(db.tables(&["users", "accounts"]).await?, before);
+    authenticated(
+        &auth,
+        &cookies(&foreign),
+        "staged-invitation-foreign@example.test",
+    )
+    .await;
+    B::close(connection).await
+}
+
+async fn organization_invitation_reset_write_failure<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        OrganizationInvitationAcceptanceContext, OrganizationInvitationAcceptanceHooks,
+    };
+    #[derive(Debug, Default)]
+    struct Receipt(Mutex<usize>);
+    #[async_trait::async_trait]
+    impl OrganizationInvitationAcceptanceHooks for Receipt {
+        async fn before_accept_invitation(
+            &self,
+            _: &OrganizationInvitationAcceptanceContext,
+        ) -> AuthResult<()> {
+            *self.0.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let receipt = Arc::new(Receipt::default());
+    let organization = OrganizationConfig {
+        teams: TeamsConfig {
+            enabled: true,
+            create_default_team: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(OrganizationPlugin::with_config(organization))
+        .build()
+        .await?;
+    let owner = signup(&auth, "staged-invitation-owner@example.test").await;
+    let target = signup(&auth, "staged-invitation-target@example.test").await;
+    let foreign = signup(&auth, "staged-invitation-foreign@example.test").await;
+    let sibling = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"staged-invitation-target@example.test","password":PASSWORD})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    let created = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Stage","slug":"invitation-stage"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let org = body(&created)["id"].as_str().unwrap().to_owned();
+    let jar = merge(&cookies(&owner), &cookies(&created));
+
+    let created_team = call(
+        &auth,
+        request(
+            "/organization/create-team",
+            Some(json!({"organizationId":org,"name":"Invited team"})),
+            &jar,
+        ),
+        200,
+    )
+    .await;
+    let team = body(&created_team)["id"].as_str().unwrap().to_owned();
+    let invited=call(&auth,request("/organization/invite-member",Some(json!({"organizationId":org,"email":"staged-invitation-target@example.test","role":"member","teamId":team})),&jar),200).await;
+    let invitation = body(&invited)["id"].as_str().unwrap().to_owned();
+
+    let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            invitation_acceptance_hooks: Some(receipt.clone()),
+            teams: TeamsConfig {
+                enabled: true,
+                create_default_team: false,
+                maximum_members_per_team: Some(0.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    _ = db.execute("CREATE TRIGGER fail_invitation_reset BEFORE UPDATE ON invitation WHEN OLD.status='accepted' AND NEW.status='pending' BEGIN SELECT RAISE(ABORT,'reset denied'); END",&[]).await?;
+    let before = db
+        .tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "team",
+            "team_member",
+        ])
+        .await?;
+    let mut expected = auth
+        .store()
+        .get_invitation_by_id(&invitation)
+        .await?
+        .unwrap();
+    expected.status = alibi::InvitationStatus::Accepted;
+    let rejected = call(
+        &auth,
+        request(
+            "/organization/accept-invitation",
+            Some(json!({"invitationId":invitation})),
+            &cookies(&target),
+        ),
+        500,
+    )
+    .await;
+    assert!(rejected.body.is_empty());
+    assert!(cookies(&rejected).is_empty());
+    assert_eq!(
+        auth.store()
+            .get_invitation_by_id(&invitation)
+            .await?
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        db.tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "team",
+            "team_member"
+        ])
+        .await?,
+        before
+    );
+    assert_eq!(*receipt.0.lock().unwrap(), 1);
+    let replay = call(
+        &auth,
+        request(
+            "/organization/accept-invitation",
+            Some(json!({"invitationId":invitation})),
+            &cookies(&target),
+        ),
+        400,
+    )
+    .await;
+    assert_eq!(body(&replay)["code"], "INVITATION_NOT_FOUND");
+    assert_eq!(*receipt.0.lock().unwrap(), 1);
+    assert_eq!(
+        db.tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "team",
+            "team_member"
+        ])
+        .await?,
+        before
+    );
+    _ = db
+        .execute("DROP TRIGGER fail_invitation_reset", &[])
+        .await?;
+    authenticated(
+        &auth,
+        &cookies(&foreign),
+        "staged-invitation-foreign@example.test",
+    )
+    .await;
+    authenticated(
+        &auth,
+        &cookies(&sibling),
+        "staged-invitation-target@example.test",
+    )
+    .await;
+    B::close(connection).await
+}
+
+async fn organization_invitation_after_error_owned_cookies<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        OrganizationInvitationAcceptanceHooks, OrganizationInvitationAcceptedContext,
+    };
+    #[derive(Debug)]
+    struct Receipt {
+        mode: &'static str,
+        seen: Mutex<Vec<Value>>,
+    }
+    #[async_trait::async_trait]
+    impl OrganizationInvitationAcceptanceHooks for Receipt {
+        async fn after_accept_invitation(
+            &self,
+            c: &OrganizationInvitationAcceptedContext,
+        ) -> AuthResult<()> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(json!({"invitation":c.invitation,"member":c.member}));
+            match self.mode {
+                "ordinary" => Err(alibi::AuthError::internal("after-accept failed")),
+                "public" => Err(alibi::AuthError::Api {
+                    status: 500,
+                    code: Some("PUBLIC_INVITATION_500".into()),
+                    message: "Explicit after-accept error".into(),
+                }),
+                _ => Ok(()),
+            }
+        }
+    }
+    for mode in ["success", "ordinary", "public"] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let receipt = Arc::new(Receipt {
+            mode,
+            seen: Mutex::new(Vec::new()),
+        });
+        let organization = OrganizationConfig {
+            invitation_acceptance_hooks: Some(receipt.clone()),
+            teams: TeamsConfig {
+                enabled: true,
+                create_default_team: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(OrganizationPlugin::with_config(organization))
+            .build()
+            .await?;
+        let owner = signup(&auth, "staged-invitation-owner@example.test").await;
+        let target = signup(&auth, "staged-invitation-target@example.test").await;
+        let foreign = signup(&auth, "staged-invitation-foreign@example.test").await;
+        let sibling = call(
+            &auth,
+            request(
+                "/sign-in/email",
+                Some(json!({"email":"staged-invitation-target@example.test","password":PASSWORD})),
+                "",
+            ),
+            200,
+        )
+        .await;
+        let created = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Stage","slug":"invitation-stage"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+        let org = body(&created)["id"].as_str().unwrap().to_owned();
+        let jar = merge(&cookies(&owner), &cookies(&created));
+        let target_id = body(&target)["user"]["id"].as_str().unwrap().to_owned();
+
+        let created_team = call(
+            &auth,
+            request(
+                "/organization/create-team",
+                Some(json!({"organizationId":org,"name":"Invited team"})),
+                &jar,
+            ),
+            200,
+        )
+        .await;
+        let team = body(&created_team)["id"].as_str().unwrap().to_owned();
+        let invited=call(&auth,request("/organization/invite-member",Some(json!({"organizationId":org,"email":"staged-invitation-target@example.test","role":"member","teamId":team})),&jar),200).await;
+        let invitation = body(&invited)["id"].as_str().unwrap().to_owned();
+
+        let browser=call(&auth,request("/sign-in/email",Some(json!({"email":"staged-invitation-target@example.test","password":PASSWORD,"rememberMe":false})),""),200).await;
+        let token = body(&browser)["token"].as_str().unwrap().to_owned();
+        let before = db.tables(&["users", "accounts"]).await?;
+        let response = call(
+            &auth,
+            request(
+                "/organization/accept-invitation",
+                Some(json!({"invitationId":invitation})),
+                &cookies(&browser),
+            ),
+            if mode == "success" { 200 } else { 500 },
+        )
+        .await;
+        let headers = response.headers.get_all("set-cookie").collect::<Vec<_>>();
+        assert_eq!(headers.len(), if mode == "ordinary" { 0 } else { 2 });
+        if mode == "ordinary" {
+            assert!(response.body.is_empty());
+            assert!(response.headers.get("content-type").is_none());
+        } else {
+            if mode == "public" {
+                assert_eq!(body(&response)["code"], "PUBLIC_INVITATION_500");
+            }
+            let mut principal = false;
+            let mut preference = false;
+            for header in headers {
+                assert!(!header.contains("Max-Age="));
+                let pair = header.split(';').next().unwrap();
+                let (name, value) = pair.split_once('=').unwrap();
+                let signed =
+                    alibi::utils::cookie_utils::verify_cookie_value(value, SECRET).unwrap();
+                if name.ends_with("session_token") {
+                    assert_eq!(signed, token);
+                    principal = true;
+                } else {
+                    assert!(name.ends_with("dont_remember"));
+                    assert_eq!(signed, "true");
+                    preference = true;
+                }
+            }
+            assert!(principal && preference);
+        }
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM member WHERE organization_id=$1 AND user_id=$2",
+                &[&org, &target_id]
+            )
+            .await?,
+            1
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM team_member WHERE team_id=$1 AND user_id=$2",
+                &[&team, &target_id]
+            )
+            .await?,
+            1
+        );
+        assert_eq!(
+            auth.store()
+                .get_invitation_by_id(&invitation)
+                .await?
+                .unwrap()
+                .status,
+            alibi::InvitationStatus::Accepted
+        );
+        let seen = receipt.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["invitation"]["status"], "accepted");
+        assert_eq!(
+            db.text(
+                "SELECT role FROM member WHERE id=$1",
+                &[seen[0]["member"]["id"].as_str().unwrap()]
+            )
+            .await?
+            .as_deref(),
+            Some("member")
+        );
+        let current = call(
+            &auth,
+            request("/get-session", None, &cookies(&browser)),
+            200,
+        )
+        .await;
+        assert_eq!(body(&current)["session"]["token"], token);
+        assert_eq!(body(&current)["session"]["activeOrganizationId"], org);
+        assert_eq!(body(&current)["session"]["activeTeamId"], team);
+        let sibling_current = call(
+            &auth,
+            request("/get-session", None, &cookies(&sibling)),
+            200,
+        )
+        .await;
+        assert!(body(&sibling_current)["session"]["activeOrganizationId"].is_null());
+        assert_eq!(db.tables(&["users", "accounts"]).await?, before);
+        let stable = db
+            .tables(&["invitation", "member", "team", "team_member", "sessions"])
+            .await?;
+        let replay = call(
+            &auth,
+            request(
+                "/organization/accept-invitation",
+                Some(json!({"invitationId":invitation})),
+                &cookies(&browser),
+            ),
+            400,
+        )
+        .await;
+        assert_eq!(body(&replay)["code"], "INVITATION_NOT_FOUND");
+        assert_eq!(receipt.seen.lock().unwrap().len(), 1);
+        assert_eq!(
+            db.tables(&["invitation", "member", "team", "team_member", "sessions"])
+                .await?,
+            stable
+        );
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "staged-invitation-foreign@example.test",
+        )
+        .await;
         B::close(connection).await?;
     }
     Ok(())
