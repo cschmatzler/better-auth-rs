@@ -21,7 +21,8 @@ backend_tests!(
     two_factor_configured_account_lock_policy,
     two_factor_otp_account_budget_coupling,
     two_factor_pending_orphan_owner_proof_retention,
-    two_factor_pending_newest_expired_snapshot
+    two_factor_pending_newest_expired_snapshot,
+    two_factor_backup_view_exact_truthy_projection
 );
 
 #[derive(Default)]
@@ -1586,4 +1587,79 @@ async fn two_factor_pending_newest_expired_snapshot<B: Backend>(db: Db) -> TestR
         B::close(connection).await?;
     }
     Ok(())
+}
+
+async fn two_factor_backup_view_exact_truthy_projection<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(TwoFactorPlugin::with_config(TwoFactorConfig {
+            backup_storage: TwoFactorBackupStorage::Plain,
+            skip_verification_on_enable: true,
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let signed = signup(&auth, "projection@example.test").await;
+    let id = body(&signed)["user"]["id"].as_str().unwrap().to_owned();
+    let _ = enroll(&auth, &cookies(&signed)).await;
+    for (stored, expected) in [
+        (
+            r#"{"nested":["2025-02-30T00:00:00Z",1e400],"__proto__":{"keep":true}}"#,
+            json!({"nested":["2025-03-02T00:00:00.000Z",null],"__proto__":{"keep":true}}),
+        ),
+        ("true", json!(true)),
+        ("42", json!(42.0)),
+        (r#""present""#, json!("present")),
+        ("1e400", Value::Null),
+        ("[]", json!([])),
+    ] {
+        _ = db
+            .execute(
+                "UPDATE two_factor SET backup_codes=$1 WHERE user_id=$2",
+                &[stored, &id],
+            )
+            .await?;
+        let before = db
+            .tables(&["two_factor", "users", "accounts", "sessions"])
+            .await?;
+        let view = auth
+            .dispatch_endpoint(
+                TwoFactorPlugin::view_backup_codes_endpoint(&id),
+                alibi::endpoint::EndpointOptions::default(),
+            )
+            .await?
+            .decode()?;
+        assert!(view.status);
+        assert_eq!(view.backup_codes, expected);
+        assert_eq!(
+            db.tables(&["two_factor", "users", "accounts", "sessions"])
+                .await?,
+            before
+        );
+    }
+    for stored in ["[", "null", "false", "0", "-0", r#""""#] {
+        _ = db
+            .execute(
+                "UPDATE two_factor SET backup_codes=$1 WHERE user_id=$2",
+                &[stored, &id],
+            )
+            .await?;
+        let before = db
+            .tables(&["two_factor", "users", "accounts", "sessions"])
+            .await?;
+        let error = auth
+            .dispatch_endpoint(
+                TwoFactorPlugin::view_backup_codes_endpoint(&id),
+                alibi::endpoint::EndpointOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Invalid backup code"));
+        assert_eq!(
+            db.tables(&["two_factor", "users", "accounts", "sessions"])
+                .await?,
+            before
+        );
+    }
+    B::close(connection).await
 }
