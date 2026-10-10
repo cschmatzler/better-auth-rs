@@ -27,7 +27,8 @@ backend_tests!(
     organization_orphan_delete_selection,
     organization_removal_original_target_snapshots,
     organization_removal_before_await_boundary,
-    organization_removal_callback_500_identity
+    organization_removal_callback_500_identity,
+    organization_deletion_original_row_snapshot
 );
 postgres_tests!(
     organization_lifecycle_callbacks_preserve_patch_authority_and_committed_phases,
@@ -3891,4 +3892,202 @@ async fn organization_removal_callback_500_identity<B: Backend>(db: Db) -> TestR
         }
     }
     Ok(())
+}
+
+async fn organization_deletion_original_row_snapshot<B: Backend>(db: Db) -> TestResult {
+    use alibi::AuthSession;
+    struct Hooks<S: AuthSchema> {
+        store: Arc<dyn alibi::AuthStore<S>>,
+        contexts: Mutex<Vec<OrganizationDeleteContext>>,
+        observed: Mutex<Vec<Option<String>>>,
+    }
+    impl<S: AuthSchema> std::fmt::Debug for Hooks<S> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("DeletionIndependentWrite")
+        }
+    }
+    #[async_trait]
+    impl<S: AuthSchema> OrganizationDeletionHooks for Hooks<S> {
+        async fn before_delete(&self, c: &OrganizationDeleteContext) -> AuthResult<()> {
+            self.contexts.lock().unwrap().push(c.clone());
+            _ = self
+                .store
+                .update_organization(
+                    &c.organization.id,
+                    alibi::UpdateOrganization {
+                        name: Some("Written By Hook".into()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let found = self
+                .store
+                .get_organization_by_id(&c.organization.id)
+                .await?;
+            self.observed.lock().unwrap().push(found.map(|x| x.name));
+            Ok(())
+        }
+        async fn after_delete(&self, c: &OrganizationDeleteContext) -> AuthResult<()> {
+            self.contexts.lock().unwrap().push(c.clone());
+            let found = self
+                .store
+                .get_organization_by_id(&c.organization.id)
+                .await?;
+            self.observed.lock().unwrap().push(found.map(|x| x.name));
+            Ok(())
+        }
+    }
+    let (connection, store) = db.migrated::<B>(SECRET).await?;
+    let hooks = Arc::new(Hooks {
+        store: Arc::new(store),
+        contexts: Mutex::new(Vec::new()),
+        observed: Mutex::new(Vec::new()),
+    });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            deletion_hooks: Some(hooks.clone()),
+            teams: TeamsConfig {
+                enabled: true,
+                create_default_team: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+
+    let owner = signup(&auth, "owner@example.test").await;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let sibling = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"owner@example.test","password":PASSWORD})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    let org=body(&call(&auth,request("/organization/create",Some(json!({"name":"Original Organization","slug":"owned","metadata":{"original":true}})),&cookies(&owner)),200).await);
+    let _ = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Foreign Organization","slug":"foreign"})),
+            &cookies(&foreign),
+        ),
+        200,
+    )
+    .await;
+    let team = body(
+        &call(
+            &auth,
+            request(
+                "/organization/create-team",
+                Some(json!({"organizationId":org["id"],"name":"Selected"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await,
+    );
+    let _=call(&auth,request("/organization/add-team-member",Some(json!({"organizationId":org["id"],"teamId":team["id"],"userId":body(&owner)["user"]["id"]})),&cookies(&owner)),200).await;
+    for browser in [&owner, &sibling] {
+        let _ = call(
+            &auth,
+            request(
+                "/organization/set-active",
+                Some(json!({"organizationId":org["id"]})),
+                &cookies(browser),
+            ),
+            200,
+        )
+        .await;
+        let _ = call(
+            &auth,
+            request(
+                "/organization/set-active-team",
+                Some(json!({"teamId":team["id"]})),
+                &cookies(browser),
+            ),
+            200,
+        )
+        .await;
+    }
+    let _ = call(
+        &auth,
+        request(
+            "/organization/invite-member",
+            Some(
+                json!({"organizationId":org["id"],"email":"pending@example.test","role":"member"}),
+            ),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let token = body(&owner)["token"].as_str().unwrap().to_owned();
+    let sibling_token = body(&sibling)["token"].as_str().unwrap().to_owned();
+    let original_session = auth.store().get_session(&token).await?.unwrap();
+    let sibling_session = auth.store().get_session(&sibling_token).await?.unwrap();
+
+    let stable = db
+        .tables(&["users", "accounts", "team", "team_member"])
+        .await?;
+    let deleted = call(
+        &auth,
+        request(
+            "/organization/delete",
+            Some(json!({"organizationId":org["id"]})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&deleted)["name"], "Original Organization");
+    assert_eq!(
+        *hooks.observed.lock().unwrap(),
+        vec![Some("Written By Hook".into()), None]
+    );
+    assert_eq!(hooks.contexts.lock().unwrap().len(), 2);
+    for c in hooks.contexts.lock().unwrap().iter() {
+        assert_eq!(c.organization.name, "Original Organization");
+        assert_eq!(c.organization.id, org["id"].as_str().unwrap());
+        assert_eq!(c.session.token, token);
+        assert_eq!(
+            c.session.active_organization_id,
+            Some(c.organization.id.clone())
+        );
+        assert!(c.request.is_some());
+    }
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM organization WHERE id=$1",
+            &[org["id"].as_str().unwrap()]
+        )
+        .await?,
+        0
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM invitation WHERE organization_id=$1",
+            &[org["id"].as_str().unwrap()]
+        )
+        .await?,
+        0
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "team", "team_member"])
+            .await?,
+        stable
+    );
+    let current = auth.store().get_session(&token).await?.unwrap();
+    assert_eq!(current.active_organization_id(), None);
+    assert_eq!(current.active_team_id(), original_session.active_team_id());
+    assert_eq!(
+        serde_json::to_value(auth.store().get_session(&sibling_token).await?.unwrap())?,
+        serde_json::to_value(sibling_session)?
+    );
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+    B::close(connection).await
 }
