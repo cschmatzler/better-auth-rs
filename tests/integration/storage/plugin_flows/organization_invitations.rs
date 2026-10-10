@@ -17,6 +17,7 @@ backend_tests!(
     organization_anonymous_and_failures,
     organization_invitation_stamps,
     processed_invitation_cancellation_keeps_members_and_original_callback_status,
+    organization_invitation_raw_quota,
     organization_invitation_raw_expiry
 );
 
@@ -712,6 +713,160 @@ async fn processed_invitation_cancellation_keeps_members_and_original_callback_s
         assert_eq!(db.count("member").await?, if accepted { 2 } else { 1 });
         authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
         B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn organization_invitation_raw_quota<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        InvitationLimit, OrganizationInvitationLimitContext, OrganizationInvitationLimitResolver,
+    };
+    #[derive(Debug)]
+    struct Policy(f64, Mutex<Vec<Value>>);
+    #[async_trait::async_trait]
+    impl OrganizationInvitationLimitResolver for Policy {
+        async fn invitation_limit(
+            &self,
+            c: &OrganizationInvitationLimitContext,
+            callback: &alibi::CallbackContext,
+        ) -> AuthResult<f64> {
+            let request = callback.request.as_ref().expect("physical invite request");
+            assert_eq!(request.path(), "/api/auth/organization/invite-member");
+            assert_eq!(c.user.id, c.member.user_id);
+            assert_eq!(c.member_user.id, c.user.id);
+            assert_eq!(c.member.organization_id, c.organization.id);
+            self.1
+                .lock()
+                .unwrap()
+                .push(json!({"user":c.user.id,"organization":c.organization.id}));
+            Ok(self.0)
+        }
+    }
+    for limit in [
+        Some(0.0),
+        Some(-0.5),
+        Some(1.5),
+        Some(f64::NAN),
+        Some(f64::INFINITY),
+        None,
+    ] {
+        for resolved in [false, true] {
+            if resolved && limit.is_none() {
+                continue;
+            }
+            let db = db.fresh().await?;
+            let policy = Arc::new(Policy(limit.unwrap_or(100.0), Mutex::new(Vec::new())));
+            let organization = OrganizationConfig {
+                invitation_limit: limit.map(|n| {
+                    if resolved {
+                        InvitationLimit::Resolver(policy.clone())
+                    } else {
+                        InvitationLimit::Fixed(n)
+                    }
+                }),
+                ..Default::default()
+            };
+
+            let (connection, _) = db.migrated::<B>(SECRET).await?;
+            let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+            let auth = AuthBuilder::new(config.clone())
+                .store(B::store(Arc::new(config), &connection))
+                .plugin(super::auth_probe::fast_password())
+                .plugin(SessionManagementPlugin::new())
+                .plugin(OrganizationPlugin::with_config(organization))
+                .build()
+                .await?;
+            let owner = signup(&auth, "invitation-life-owner@example.test").await;
+            let foreign = signup(&auth, "invitation-life-foreign@example.test").await;
+            let target = signup(&auth, "invitation-life-target@example.test").await;
+            let created = call(
+                &auth,
+                request(
+                    "/organization/create",
+                    Some(json!({"name":"Life","slug":"invitation-life"})),
+                    &cookies(&owner),
+                ),
+                200,
+            )
+            .await;
+            let org = body(&created)["id"].as_str().unwrap().to_owned();
+            let jar = merge(&cookies(&owner), &cookies(&created));
+
+            if limit.is_none() {
+                for index in 0..100 {
+                    drop(
+                        auth.store()
+                            .create_invitation(alibi::CreateInvitation::new(
+                                &org,
+                                format!("quota-seed-{index}@example.test"),
+                                "member",
+                                body(&owner)["user"]["id"].as_str().unwrap(),
+                                chrono::Utc::now() + chrono::Duration::days(1),
+                            ))
+                            .await?,
+                    );
+                }
+            }
+            let before = db
+                .tables(&[
+                    "users",
+                    "accounts",
+                    "sessions",
+                    "member",
+                    "organization",
+                    "team",
+                    "team_member",
+                ])
+                .await?;
+            let (expected, allowed) = match limit {
+                None => (100, 0),
+                Some(n) if n <= 0.0 => (0, 0),
+                Some(1.5) => (2, 2),
+                _ => (3, 3),
+            };
+            for index in 0..3 {
+                let response=call(&auth,request("/organization/invite-member",Some(json!({"organizationId":org,"email":format!("quota-{index}@example.test"),"role":"member"})),&jar),if index<allowed {200} else {403}).await;
+                if index >= allowed {
+                    assert_eq!(body(&response)["code"], "INVITATION_LIMIT_REACHED");
+                }
+                assert!(cookies(&response).is_empty());
+            }
+            assert_eq!(
+                db.count_where(
+                    "SELECT COUNT(*) FROM invitation WHERE organization_id=$1",
+                    &[&org]
+                )
+                .await?,
+                expected
+            );
+            assert_eq!(policy.1.lock().unwrap().len(), if resolved { 3 } else { 0 });
+            assert_eq!(
+                db.tables(&[
+                    "users",
+                    "accounts",
+                    "sessions",
+                    "member",
+                    "organization",
+                    "team",
+                    "team_member"
+                ])
+                .await?,
+                before
+            );
+            authenticated(
+                &auth,
+                &cookies(&foreign),
+                "invitation-life-foreign@example.test",
+            )
+            .await;
+            authenticated(
+                &auth,
+                &cookies(&target),
+                "invitation-life-target@example.test",
+            )
+            .await;
+            B::close(connection).await?;
+        }
     }
     Ok(())
 }
