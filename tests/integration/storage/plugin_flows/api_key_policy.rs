@@ -30,7 +30,8 @@ backend_tests!(
     api_key_installed_reference_principal,
     api_key_public_callback_500_identity,
     api_key_secondary_index_expiration,
-    api_key_secondary_sdk_delete_index_scope
+    api_key_secondary_sdk_delete_index_scope,
+    api_key_stale_reference_index_authority
 );
 
 fn raw(path: &str, text: &str, cookie: &str) -> AuthRequest {
@@ -2933,6 +2934,165 @@ async fn api_key_secondary_sdk_delete_index_scope<B: Backend>(db: Db) -> TestRes
                 key["id"].as_str().unwrap()
             );
         }
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn api_key_stale_reference_index_authority<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{CacheAdapter, MemoryCacheAdapter};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest as _, Sha256};
+    struct ApplicationStorage {
+        cache: MemoryCacheAdapter,
+        writes: Mutex<Vec<(String, Option<i64>)>>,
+        keys: Mutex<std::collections::BTreeSet<String>>,
+        fail_get: Mutex<Option<String>>,
+    }
+    impl ApplicationStorage {
+        fn new() -> Self {
+            Self {
+                cache: MemoryCacheAdapter::new(),
+                writes: Mutex::new(Vec::new()),
+                keys: Mutex::new(Default::default()),
+                fail_get: Mutex::new(None),
+            }
+        }
+        async fn snapshot(&self) -> AuthResult<std::collections::BTreeMap<String, String>> {
+            let keys = self
+                .keys
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut snapshot = std::collections::BTreeMap::new();
+            for key in keys {
+                if let Some(value) = self.cache.get(&key).await? {
+                    _ = snapshot.insert(key, value);
+                }
+            }
+            Ok(snapshot)
+        }
+    }
+    #[async_trait::async_trait]
+    impl ApiKeyStorage for ApplicationStorage {
+        async fn get(&self, key: &str) -> AuthResult<Option<String>> {
+            if self
+                .fail_get
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|prefix| key.starts_with(prefix))
+            {
+                return Err(AuthError::internal("Application key storage unavailable"));
+            }
+            self.cache.get(key).await
+        }
+        async fn set(
+            &self,
+            key: &str,
+            value: &str,
+            ttl: Option<chrono::Duration>,
+        ) -> AuthResult<()> {
+            _ = self.keys.lock().unwrap().insert(key.into());
+            self.writes
+                .lock()
+                .unwrap()
+                .push((key.into(), ttl.map(|ttl| ttl.num_seconds())));
+            match ttl {
+                Some(ttl) => self.cache.set(key, value, ttl).await,
+                None => self.cache.set_without_expiry(key, value).await,
+            }
+        }
+        async fn delete(&self, key: &str) -> AuthResult<()> {
+            self.cache.delete(key).await
+        }
+    }
+    fn indices(key: &Value) -> [String; 3] {
+        [
+            format!(
+                "api-key:{}",
+                URL_SAFE_NO_PAD.encode(Sha256::digest(key["key"].as_str().unwrap().as_bytes()))
+            ),
+            format!("api-key:by-id:{}", key["id"].as_str().unwrap()),
+            format!("api-key:by-ref:{}", key["referenceId"].as_str().unwrap()),
+        ]
+    }
+
+    for fallback in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let storage = Arc::new(ApplicationStorage::new());
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(ApiKeyPlugin::with_config(ApiKeyConfig {
+                storage: ApiKeyStorageMode::SecondaryStorage,
+                custom_storage: Some(storage.clone()),
+                fallback_to_database: fallback,
+                defer_updates: false,
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let owner = signup(&auth, "stale-index-owner@example.test").await;
+        let foreign = signup(&auth, "stale-index-foreign@example.test").await;
+        let own = body(
+            &call(
+                &auth,
+                request(
+                    "/api-key/create",
+                    Some(json!({"name":"Own"})),
+                    &cookies(&owner),
+                ),
+                200,
+            )
+            .await,
+        );
+        let other = body(
+            &call(
+                &auth,
+                request(
+                    "/api-key/create",
+                    Some(json!({"name":"Foreign"})),
+                    &cookies(&foreign),
+                ),
+                200,
+            )
+            .await,
+        );
+        _ = call(&auth, request("/api-key/list", None, &cookies(&owner)), 200).await;
+        let own_index = indices(&own)[2].clone();
+        storage
+            .cache
+            .set_without_expiry(
+                &own_index,
+                &serde_json::to_string(&vec![other["id"].as_str().unwrap()])?,
+            )
+            .await?;
+        let before = storage.snapshot().await?;
+        let protected = db
+            .tables(&["users", "accounts", "sessions", "api_keys"])
+            .await?;
+        let list = body(&call(&auth, request("/api-key/list", None, &cookies(&owner)), 200).await);
+        assert_eq!(list["apiKeys"], json!([]));
+        assert_eq!(list["total"], 0);
+        assert_eq!(storage.snapshot().await?, before);
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "api_keys"])
+                .await?,
+            protected
+        );
+        let mut get = request("/api-key/get", None, &cookies(&owner));
+        get.set_query_pairs([("id", other["id"].as_str().unwrap())]);
+        assert_eq!(body(&call(&auth, get, 404).await)["code"], "KEY_NOT_FOUND");
+        assert_eq!(storage.snapshot().await?, before);
+        authenticated(&auth, &cookies(&owner), "stale-index-owner@example.test").await;
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "stale-index-foreign@example.test",
+        )
+        .await;
         B::close(connection).await?;
     }
     Ok(())
