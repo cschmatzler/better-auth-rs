@@ -918,6 +918,64 @@ async fn proxy_loose_profile_retains_resolved_account_key_authority<B: Backend>(
     Ok(())
 }
 
+async fn empty_query_code_prevents_body_grant_fallback_and_preserves_pending_state<B: Backend>(
+    db: Db,
+) -> TestResult {
+    let fixture = Fixture::<B>::new(db).await;
+    let (authorization, _) = fixture.issue("/api/auth/sign-in/social", None).await;
+    let query: HashMap<_, _> = authorization.query_pairs().into_owned().collect();
+    let original = rows(&fixture.preview_db).await;
+    let production = rows(&fixture.production_db).await;
+    let code = format!("real-code-{}", fixture.provider.lock().unwrap().code);
+    let mut callback = AuthRequest::new(HttpMethod::Post, "/api/auth/callback/gitlab");
+    _ = callback.headers.insert("origin".into(), PREVIEW.into());
+    _ = callback.headers.insert(
+        "content-type".into(),
+        "application/x-www-form-urlencoded".into(),
+    );
+    _ = callback
+        .query
+        .insert("state".into(), query.get("state").unwrap().clone());
+    _ = callback.query.insert("code".into(), String::new());
+    callback.body = Some(
+        url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("code", &code)
+            .finish()
+            .into_bytes(),
+    );
+    let denied = fixture.production.handle_request(callback.clone()).await?;
+    assert_eq!(denied.status, 302);
+    assert!(location(&denied).as_str().contains("error=no_code"));
+    assert!(fixture.provider.lock().unwrap().receipts.is_empty());
+    assert_eq!(rows(&fixture.preview_db).await, original);
+    assert_eq!(rows(&fixture.production_db).await, production);
+    _ = callback.query.insert("code".into(), code.clone());
+    callback.body = Some(b"code=invalid-body-code".to_vec());
+    let forwarded = fixture.production.handle_request(callback).await?;
+    assert_eq!(forwarded.status, 302);
+    let bridge = location(&forwarded);
+    let done = request(&fixture.preview, &target(&bridge), None, None).await;
+    assert_eq!(location(&done).as_str(), format!("{PREVIEW}/new-owner"));
+    assert_eq!(
+        fixture
+            .provider
+            .lock()
+            .unwrap()
+            .receipts
+            .first()
+            .unwrap()
+            .get("form")
+            .unwrap()
+            .get("code")
+            .unwrap()
+            .as_str(),
+        Some(code.as_str())
+    );
+    assert_eq!(fixture.preview_db.count("sessions").await?, 1);
+    assert_eq!(rows(&fixture.production_db).await, production);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -929,7 +987,8 @@ mod tests {
     cookie_state_expiry_clears_only_authenticated_matching_proof,
     raw_profile_max_age_controls_admission_before_state_consumption,
     proxy_cache_publication_failure_retains_commit_and_discards_all_cookies,
-    proxy_loose_profile_retains_resolved_account_key_authority
+    proxy_loose_profile_retains_resolved_account_key_authority,
+    empty_query_code_prevents_body_grant_fallback_and_preserves_pending_state
 );
     postgres_tests!(production_exchange_preserves_rows_then_preview_consumes_state_and_issues_only_the_actual_owner,completion_rejects_foreign_origin_provider_tampering_and_expired_state_before_any_principal_write);
 
