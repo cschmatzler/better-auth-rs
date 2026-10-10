@@ -20,7 +20,8 @@ backend_tests!(
     organization_plugin_helpers,
     organization_trusted_addition_preserves_literal_role_arrays_and_session_scope,
     fractional_organization_membership_limit_uses_actual_physical_count,
-    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results
+    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results,
+    organization_member_role_js_whitespace
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -891,5 +892,92 @@ async fn organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_r
     );
     assert_eq!(policy.seen.lock().unwrap().len(), count);
     assert_eq!(db.count("member").await?, 2);
+    B::close(connection).await
+}
+
+async fn organization_member_role_js_whitespace<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        OrganizationMemberRoleContext, OrganizationMemberRoleHooks, OrganizationMemberRolePatch,
+        OrganizationMemberRoleUpdatedContext,
+    };
+    #[derive(Debug, Default)]
+    struct Hooks(Mutex<Vec<(bool, String)>>);
+    #[async_trait::async_trait]
+    impl OrganizationMemberRoleHooks for Hooks {
+        async fn before_update(
+            &self,
+            c: &OrganizationMemberRoleContext,
+        ) -> AuthResult<Option<OrganizationMemberRolePatch>> {
+            self.0.lock().unwrap().push((false, c.new_role.clone()));
+            Ok(None)
+        }
+        async fn after_update(&self, c: &OrganizationMemberRoleUpdatedContext) -> AuthResult<()> {
+            self.0.lock().unwrap().push((true, c.member.role.clone()));
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let hooks = Arc::new(Hooks::default());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            member_role_hooks: Some(hooks.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let mut owner = account(&auth, "space-owner@example.test").await;
+    let target = account(&auth, "space-target@example.test").await;
+    let foreign = account(&auth, "space-foreign@example.test").await;
+    let org = organization(&auth, &mut owner, "space-role").await;
+    let member = add(&auth, &org, &target.id, "member").await;
+    let protected = db.tables(&["users", "accounts", "sessions"]).await?;
+    let response=call(&auth,request("/organization/update-member-role",Some(json!({"organizationId":org,"memberId":member["id"],"role":["\u{feff}admin\u{feff}","\u{a0}member\u{3000}"," admin "]})),&owner.cookie),200).await;
+    assert_eq!(body(&response)["role"], "admin,member,admin");
+    assert_eq!(
+        *hooks.0.lock().unwrap(),
+        [
+            (false, "admin,member,admin".into()),
+            (true, "admin,member,admin".into())
+        ]
+    );
+    assert_eq!(
+        db.text(
+            "SELECT role FROM member WHERE id=$1",
+            &[member["id"].as_str().unwrap()]
+        )
+        .await?
+        .as_deref(),
+        Some("admin,member,admin")
+    );
+    hooks.0.lock().unwrap().clear();
+    let before = db.table("member").await?;
+    let whitespace = "\t\n\u{b}\u{c}\r \u{a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\u{feff}";
+    for role in [whitespace, "\u{85}", "\u{85}admin\u{85}"] {
+        let denied = call(
+            &auth,
+            request(
+                "/organization/update-member-role",
+                Some(json!({"organizationId":org,"memberId":member["id"],"role":role})),
+                &owner.cookie,
+            ),
+            400,
+        )
+        .await;
+        if role == whitespace {
+            assert!(denied.body.is_empty());
+        } else {
+            assert_eq!(
+                body(&denied),
+                json!({"code":"ROLE_NOT_FOUND","message":format!("ROLE_NOT_FOUND: {role}")})
+            );
+        }
+        assert!(hooks.0.lock().unwrap().is_empty());
+        assert_eq!(db.table("member").await?, before);
+    }
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        protected
+    );
+    authenticated(&auth, &foreign.cookie, "space-foreign@example.test").await;
     B::close(connection).await
 }
