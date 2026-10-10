@@ -9,6 +9,7 @@ backend_tests!(
     password_change_verification_and_session_revocation_are_owner_scoped,
     email_otp_verification_reset_and_email_change_bind_owner_and_scope,
     password_length_limits_apply_to_every_new_password_endpoint,
+    duplicate_canonical_credentials_keep_first_physical_row_authoritative,
     cookie_emission_failure_preserves_endpoint_commit_stage
 );
 postgres_tests!(
@@ -735,6 +736,139 @@ async fn password_length_limits_apply_to_every_new_password_endpoint<B: Backend>
     )
     .await;
     drop(auth);
+    B::close(connection).await
+}
+
+async fn duplicate_canonical_credentials_keep_first_physical_row_authoritative<B: Backend>(
+    db: Db,
+) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(alibi::plugins::AccountManagementPlugin::new())
+        .plugin(alibi::plugins::UserManagementPlugin::new().delete_user_enabled(true))
+        .build()
+        .await?;
+    let owner = signup(&auth, "duplicate-owner@example.test").await;
+    let foreign = signup(&auth, "duplicate-foreign@example.test").await;
+    let owner_id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+    let original = db
+        .text("SELECT id FROM accounts WHERE user_id=$1", &[&owner_id])
+        .await?
+        .unwrap();
+    _ = db.execute("INSERT INTO accounts (id,user_id,account_id,provider_id,password,created_at,updated_at) SELECT 'later-credential',user_id,account_id,provider_id,password,created_at,updated_at FROM accounts WHERE id=$1", &[&original]).await?;
+    db.set_timestamp(
+        "accounts",
+        "created_at",
+        ("id", "later-credential"),
+        chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")?.with_timezone(&chrono::Utc),
+    )
+    .await?;
+    _ = db
+        .execute(
+            "UPDATE accounts SET password=NULL WHERE id=$1",
+            &[&original],
+        )
+        .await?;
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    let listed = body(
+        &call(
+            &auth,
+            request("/list-accounts", None, &cookies(&owner)),
+            200,
+        )
+        .await,
+    );
+    assert_eq!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(original), json!("later-credential")]
+    );
+    let denied = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"duplicate-owner@example.test","password":PASSWORD})),
+            "",
+        ),
+        401,
+    )
+    .await;
+    assert_eq!(body(&denied)["code"], "INVALID_EMAIL_OR_PASSWORD");
+    assert!(cookies(&denied).is_empty());
+    let denied = call(
+        &auth,
+        request(
+            "/delete-user",
+            Some(json!({"password":PASSWORD})),
+            &cookies(&owner),
+        ),
+        400,
+    )
+    .await;
+    assert_eq!(body(&denied)["code"], "CREDENTIAL_ACCOUNT_NOT_FOUND");
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    let foreign_id = body(&foreign)["user"]["id"].as_str().unwrap().to_owned();
+    let foreign_account = db
+        .text("SELECT id FROM accounts WHERE user_id=$1", &[&foreign_id])
+        .await?
+        .unwrap();
+    let rejected = call(
+        &auth,
+        request(
+            "/unlink-account",
+            Some(json!({"accountId":foreign_account})),
+            &cookies(&owner),
+        ),
+        400,
+    )
+    .await;
+    assert_eq!(body(&rejected)["code"], "ACCOUNT_NOT_FOUND");
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    assert_eq!(
+        body(
+            &call(
+                &auth,
+                request(
+                    "/unlink-account",
+                    Some(json!({"accountId":original})),
+                    &cookies(&owner)
+                ),
+                200
+            )
+            .await
+        )["status"],
+        true
+    );
+    let accepted = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"duplicate-owner@example.test","password":PASSWORD})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&accepted)["user"]["id"], owner_id);
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM accounts WHERE user_id=$1",
+            &[&owner_id]
+        )
+        .await?,
+        1
+    );
+    assert_eq!(
+        db.text("SELECT id FROM accounts WHERE user_id=$1", &[&owner_id])
+            .await?
+            .as_deref(),
+        Some("later-credential")
+    );
+    authenticated(&auth, &cookies(&foreign), "duplicate-foreign@example.test").await;
     B::close(connection).await
 }
 
