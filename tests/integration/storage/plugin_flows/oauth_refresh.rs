@@ -6,7 +6,10 @@ use alibi::plugins::oauth::*;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 
-backend_tests!(dynamic_refresh_preserves_grant_authority_and_callback_precedence);
+backend_tests!(
+    dynamic_refresh_preserves_grant_authority_and_callback_precedence,
+    concurrent_accepted_refreshes_preserve_account_and_browser_authority
+);
 postgres_tests!(dynamic_refresh_preserves_grant_authority_and_callback_precedence);
 
 struct Params(Arc<Mutex<Vec<String>>>);
@@ -253,5 +256,127 @@ async fn dynamic_refresh_preserves_grant_authority_and_callback_precedence<B: Ba
     );
     assert_eq!(*calls.lock().unwrap(), observed);
     assert!(remote.take().is_empty());
+    B::close(connection).await
+}
+
+async fn concurrent_accepted_refreshes_preserve_account_and_browser_authority<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::{AuthAccount as _, CreateAccount};
+    async fn seed<S: AuthSchema>(auth: &Alibi<S>, user: &str) -> alibi::AuthResult<String> {
+        let account = auth
+            .context()
+            .database
+            .create_account(CreateAccount {
+                additional_fields: Default::default(),
+                user_id: user.into(),
+                account_id: "account-subject".into(),
+                provider_id: "generic".into(),
+                access_token: Some("old-access".into()),
+                refresh_token: Some("old-refresh".into()),
+                id_token: Some("old-id".into()),
+                access_token_expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+                refresh_token_expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+                scope: Some("calendar,drive".into()),
+                password: None,
+            })
+            .await?;
+        Ok(account.id().to_string())
+    }
+
+    struct Refresh {
+        barrier: tokio::sync::Barrier,
+        entered: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl OAuthRefreshTokenHandler for Refresh {
+        async fn refresh_access_token(&self, token: &str) -> Result<OAuthTokenSet, String> {
+            assert_eq!(token, "old-refresh");
+            _ = self
+                .entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            _ = self.barrier.wait().await;
+            Ok(OAuthTokenSet {
+                access_token: Some("concurrent-access".into()),
+                refresh_token: Some("concurrent-refresh".into()),
+                id_token: Some("concurrent-id".into()),
+                scopes: vec!["ignored-scope".into()],
+                ..Default::default()
+            })
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let remote = Provider::start("application/json", "{}").await;
+    let mut config = GenericOAuthConfig::new("native-client", "native-secret");
+    config.authorization_url = Some(remote.url.join("authorize")?.into());
+    config.token_url = Some(remote.url.join("token")?.into());
+    config.user_info_url = Some(remote.url.join("profile")?.into());
+    let handler = Arc::new(Refresh {
+        barrier: tokio::sync::Barrier::new(2),
+        entered: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut provider = config.resolve().await?.unwrap().provider;
+    provider.refresh_access_token = Some(handler.clone());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OAuthPlugin::new().add_provider("generic", provider))
+        .build()
+        .await?;
+    let owner = signup(&auth, "concurrent-refresh@example.test").await;
+    let foreign = signup(&auth, "concurrent-foreign@example.test").await;
+    let id = seed(&auth, body(&owner)["user"]["id"].as_str().unwrap()).await?;
+    let protected = db.tables(&["users", "sessions"]).await?;
+    let input = request(
+        "/refresh-token",
+        Some(json!({"accountId":id})),
+        &cookies(&owner),
+    );
+    let (left, right) = tokio::join!(call(&auth, input.clone(), 200), call(&auth, input, 200));
+    for response in [left, right] {
+        assert_eq!(body(&response)["accessToken"], "concurrent-access");
+        assert_eq!(body(&response)["refreshToken"], "concurrent-refresh");
+    }
+    assert_eq!(handler.entered.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(remote.take().is_empty());
+    assert_eq!(
+        db.text("SELECT user_id FROM accounts WHERE id=$1", &[&id])
+            .await?,
+        body(&owner)["user"]["id"].as_str().map(str::to_owned)
+    );
+    assert_eq!(
+        db.text("SELECT account_id FROM accounts WHERE id=$1", &[&id])
+            .await?
+            .as_deref(),
+        Some("account-subject")
+    );
+    assert_eq!(
+        db.text("SELECT provider_id FROM accounts WHERE id=$1", &[&id])
+            .await?
+            .as_deref(),
+        Some("generic")
+    );
+    assert_eq!(
+        db.text("SELECT scope FROM accounts WHERE id=$1", &[&id])
+            .await?
+            .as_deref(),
+        Some("calendar,drive")
+    );
+    for (column, expected) in [
+        ("access_token", "concurrent-access"),
+        ("refresh_token", "concurrent-refresh"),
+        ("id_token", "concurrent-id"),
+    ] {
+        assert_eq!(
+            db.text(
+                &format!("SELECT {column} FROM accounts WHERE id=$1"),
+                &[&id]
+            )
+            .await?
+            .as_deref(),
+            Some(expected)
+        );
+    }
+    assert_eq!(db.count("accounts").await?, 3);
+    assert_eq!(db.tables(&["users", "sessions"]).await?, protected);
+    authenticated(&auth, &cookies(&foreign), "concurrent-foreign@example.test").await;
     B::close(connection).await
 }
