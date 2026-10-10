@@ -29,7 +29,8 @@ backend_tests!(
     organization_removal_before_await_boundary,
     organization_removal_callback_500_identity,
     organization_deletion_original_row_snapshot,
-    organization_deletion_before_await_boundary
+    organization_deletion_before_await_boundary,
+    organization_signed_team_helper_session_scope
 );
 postgres_tests!(
     organization_lifecycle_callbacks_preserve_patch_authority_and_committed_phases,
@@ -4277,5 +4278,185 @@ async fn organization_deletion_before_await_boundary<B: Backend>(db: Db) -> Test
         serde_json::to_value(sibling_session)?
     );
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn organization_signed_team_helper_session_scope<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::extensions::TeamHookContext;
+    #[derive(Debug, Default)]
+    struct Hooks(Mutex<Vec<Option<String>>>);
+    #[async_trait]
+    impl OrganizationTeamHooks for Hooks {
+        async fn before_create(
+            &self,
+            _: &mut alibi::CreateTeam,
+            c: &TeamHookContext,
+        ) -> AuthResult<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(c.user.as_ref().map(|x| x.id.clone()));
+            Ok(())
+        }
+        async fn after_create(&self, _: &alibi::Team, c: &TeamHookContext) -> AuthResult<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(c.user.as_ref().map(|x| x.id.clone()));
+            Ok(())
+        }
+        async fn before_delete(&self, _: &alibi::Team, c: &TeamHookContext) -> AuthResult<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(c.user.as_ref().map(|x| x.id.clone()));
+            Ok(())
+        }
+        async fn after_delete(&self, _: &alibi::Team, c: &TeamHookContext) -> AuthResult<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(c.user.as_ref().map(|x| x.id.clone()));
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let hooks = Arc::new(Hooks::default());
+    let config = OrganizationConfig {
+        teams: TeamsConfig {
+            enabled: true,
+            create_default_team: false,
+            hooks: Some(hooks.clone()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let helper = OrganizationPlugin::with_config(config.clone());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(config))
+        .build()
+        .await?;
+    let owner = signup(&auth, "owner@example.test").await;
+    let id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+    let sibling = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"owner@example.test","password":PASSWORD})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    let org = body(
+        &call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Owned","slug":"owned"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await,
+    );
+    let org_id = org["id"].as_str().unwrap();
+    let headers = std::collections::HashMap::from([("cookie".into(), cookies(&owner))]);
+    let other_headers = std::collections::HashMap::from([("cookie".into(), cookies(&sibling))]);
+    let team = helper
+        .create_team_with_headers(
+            auth.context(),
+            &headers,
+            alibi::CreateTeam {
+                organization_id: org_id.into(),
+                name: "Selected".into(),
+                updated_at: None,
+            },
+        )
+        .await?;
+    let bare = helper
+        .create_team(
+            auth.context(),
+            alibi::CreateTeam {
+                organization_id: org_id.into(),
+                name: "Requestless".into(),
+                updated_at: None,
+            },
+        )
+        .await?;
+    assert_eq!(
+        *hooks.0.lock().unwrap(),
+        vec![Some(id.clone()), Some(id.clone()), None, None]
+    );
+    let _ = call(
+        &auth,
+        request(
+            "/organization/add-team-member",
+            Some(json!({"organizationId":org_id,"teamId":team.id,"userId":id})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let _ = call(
+        &auth,
+        request(
+            "/organization/set-active-team",
+            Some(json!({"teamId":team.id})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    hooks.0.lock().unwrap().clear();
+    let before = db
+        .tables(&[
+            "sessions",
+            "team",
+            "team_member",
+            "member",
+            "users",
+            "accounts",
+        ])
+        .await?;
+    let denied = helper
+        .remove_team_with_headers(auth.context(), &headers, org_id, &team.id)
+        .await
+        .unwrap_err();
+    assert_eq!(denied.status_code(), 403);
+    assert!(hooks.0.lock().unwrap().is_empty());
+    assert_eq!(
+        db.tables(&[
+            "sessions",
+            "team",
+            "team_member",
+            "member",
+            "users",
+            "accounts"
+        ])
+        .await?,
+        before
+    );
+    helper
+        .remove_team_with_headers(auth.context(), &other_headers, org_id, &team.id)
+        .await?;
+    assert_eq!(*hooks.0.lock().unwrap(), vec![Some(id.clone()), Some(id)]);
+    assert_eq!(db.table("sessions").await?, *before.first().unwrap());
+    assert!(
+        auth.store()
+            .get_team(Some(org_id), &team.id)
+            .await?
+            .is_none()
+    );
+    assert!(
+        auth.store()
+            .get_team(Some(org_id), &bare.id)
+            .await?
+            .is_some()
+    );
+    let mut read = request("/organization/list-team-members", None, &cookies(&owner));
+    _ = read.query.insert("teamId".into(), team.id.clone());
+    let stale = call(&auth, read, 400).await;
+    assert_eq!(body(&stale)["code"], "TEAM_NOT_FOUND");
     B::close(connection).await
 }
