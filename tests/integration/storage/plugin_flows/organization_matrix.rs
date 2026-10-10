@@ -9,7 +9,8 @@ backend_tests!(
     organization_route_matrix,
     organization_without_teams_or_deletion,
     organization_mixed_selectors_only_update_current_token_selection,
-    organization_selection_returns_stored_metadata_text_without_rewriting_rows
+    organization_selection_returns_stored_metadata_text_without_rewriting_rows,
+    revoked_cache_identity_retains_physical_organization_membership_checks
 );
 
 fn get(path: &str, query: &[(&str, &str)], cookie: &str) -> AuthRequest {
@@ -584,5 +585,106 @@ async fn organization_selection_returns_stored_metadata_text_without_rewriting_r
         serde_json::from_str::<Value>(selected["metadata"].as_str().unwrap())?,
         json!({"replacement":true})
     );
+    B::close(connection).await
+}
+
+async fn revoked_cache_identity_retains_physical_organization_membership_checks<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::{CookieCacheConfig, CookieCacheStrategy};
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let config = AuthConfig::new(SECRET)
+        .base_url(ORIGIN)
+        .session_cookie_cache(CookieCacheConfig {
+            enabled: true,
+            strategy: CookieCacheStrategy::Compact,
+            ..Default::default()
+        });
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(OrganizationPlugin::new())
+        .build()
+        .await?;
+    let owner = signup(&auth, "retained-org-owner@example.test").await;
+    let foreign = signup(&auth, "retained-org-foreign@example.test").await;
+    let org=call(&auth,request("/organization/create",Some(json!({"name":"Owner","slug":"retained-owner","keepCurrentActiveOrganization":true})),&cookies(&owner)),200).await;
+    let other=call(&auth,request("/organization/create",Some(json!({"name":"Foreign","slug":"retained-foreign","keepCurrentActiveOrganization":true})),&cookies(&foreign)),200).await;
+    let id = body(&org)["id"].as_str().unwrap().to_owned();
+    let other_id = body(&other)["id"].as_str().unwrap().to_owned();
+    _ = db
+        .execute(
+            "DELETE FROM sessions WHERE token=$1",
+            &[body(&owner)["token"].as_str().unwrap()],
+        )
+        .await?;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    let policy = json!({"organizationId":id,"permissions":{"organization":["update"]}});
+    let retained = call(
+        &auth,
+        request(
+            "/organization/has-permission",
+            Some(policy.clone()),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&retained), json!({"success":true,"error":null}));
+    let mut target = policy.clone();
+    target["organizationId"] = json!(other_id);
+    _ = call(
+        &auth,
+        request(
+            "/organization/has-permission",
+            Some(target),
+            &cookies(&owner),
+        ),
+        401,
+    )
+    .await;
+    let mut bypass = request(
+        "/organization/has-permission",
+        Some(policy),
+        &cookies(&owner),
+    );
+    bypass.set_query_pairs([("disableCookieCache", "true")]);
+    _ = call(&auth, bypass, 401).await;
+    for (response, organization_id) in [(&owner, id.as_str()), (&foreign, other_id.as_str())] {
+        let full = call(
+            &auth,
+            get(
+                "/organization/get-full-organization",
+                &[("organizationId", organization_id)],
+                &cookies(response),
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(
+            body(&full)["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["userId"].clone())
+                .collect::<Vec<_>>(),
+            [body(response)["user"]["id"].clone()]
+        );
+    }
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?,
+        before
+    );
+    authenticated(
+        &auth,
+        &cookies(&foreign),
+        "retained-org-foreign@example.test",
+    )
+    .await;
     B::close(connection).await
 }
