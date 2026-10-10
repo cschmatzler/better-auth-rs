@@ -27,7 +27,8 @@ backend_tests!(
     api_key_raw_default_expiration,
     api_key_fractional_policy_bounds,
     api_key_start_bytes_through_update,
-    api_key_installed_reference_principal
+    api_key_installed_reference_principal,
+    api_key_public_callback_500_identity
 );
 
 fn raw(path: &str, text: &str, cookie: &str) -> AuthRequest {
@@ -2371,5 +2372,181 @@ async fn api_key_installed_reference_principal<B: Backend>(db: Db) -> TestResult
     }
     authenticated(&auth, &cookies(&owner), "installed-owner@example.test").await;
     authenticated(&auth, &cookies(&foreign), "installed-foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn api_key_public_callback_500_identity<B: Backend>(db: Db) -> TestResult {
+    struct Application {
+        mode: Mutex<&'static str>,
+        lookups: std::sync::atomic::AtomicUsize,
+    }
+    fn failure(code: &str) -> AuthError {
+        AuthError::Api {
+            status: 500,
+            code: Some(code.into()),
+            message: "Application policy failed".into(),
+        }
+    }
+    #[async_trait::async_trait]
+    impl ApiKeyGenerator for Application {
+        async fn generate_key(&self, _: &ApiKeyGenerationOptions<'_>) -> AuthResult<String> {
+            if *self.mode.lock().unwrap() == "generator" {
+                return Err(failure("APPLICATION_GENERATOR_FAILED"));
+            }
+            Ok("public-policy-secret-material".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl ApiKeyValidator for Application {
+        async fn validate(&self, c: &ApiKeyCallbackContext<'_>, key: &str) -> AuthResult<bool> {
+            assert_eq!(key, "public-policy-secret-material");
+            if let Some(r) = c.request {
+                assert_eq!(
+                    r.headers.get("x-policy-marker").map(String::as_str),
+                    Some("actual-request")
+                );
+            }
+            if *self.mode.lock().unwrap() == "validator" {
+                return Err(failure("APPLICATION_VALIDATOR_FAILED"));
+            }
+            Ok(true)
+        }
+    }
+    impl ApiKeyGetter for Application {
+        fn get_key(&self, c: &ApiKeyCallbackContext<'_>) -> AuthResult<Option<String>> {
+            let Some(request) = c.request else {
+                return Ok(None);
+            };
+            let Some(key) = request.headers.get("x-application-key") else {
+                return Ok(None);
+            };
+            let lookup = self
+                .lookups
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mode = *self.mode.lock().unwrap();
+            if mode == "getter-match" || (mode == "getter-handler" && lookup == 1) {
+                return Err(failure("APPLICATION_GETTER_FAILED"));
+            }
+            Ok(Some(key.clone()))
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let application = Arc::new(Application {
+        mode: Mutex::new("generator"),
+        lookups: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let plugin = ApiKeyPlugin::with_config(ApiKeyConfig {
+        key_length: 16.0,
+        custom_key_generator: Some(application.clone()),
+        custom_api_key_validator: Some(application.clone()),
+        custom_api_key_getter: Some(application.clone()),
+        enable_session_for_api_keys: true,
+        rate_limit: RateLimitDefaults {
+            enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(plugin.clone())
+        .build()
+        .await?;
+    let owner = signup(&auth, "public-policy@example.test").await;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "api_keys"])
+        .await?;
+    let response = call(
+        &auth,
+        request("/api-key/create", Some(json!({})), &cookies(&owner)),
+        500,
+    )
+    .await;
+    assert_eq!(
+        body(&response),
+        json!({"code":"APPLICATION_GENERATOR_FAILED","message":"Application policy failed"})
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "api_keys"])
+            .await?,
+        before
+    );
+    *application.mode.lock().unwrap() = "accept";
+    let created = call(
+        &auth,
+        request("/api-key/create", Some(json!({})), &cookies(&owner)),
+        200,
+    )
+    .await;
+    let key = body(&created)["key"].as_str().unwrap().to_owned();
+    let before = db
+        .tables(&["users", "accounts", "sessions", "api_keys"])
+        .await?;
+    *application.mode.lock().unwrap() = "validator";
+    let explicit = Box::pin(auth.dispatch_endpoint(
+        ApiKeyPlugin::verify_endpoint(&ApiKeyVerificationInput {
+            key: key.clone(),
+            config_id: Some("default".into()),
+            permissions: None,
+        })?,
+        EndpointOptions::default(),
+    ))
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(explicit.error,AuthError::Api { status:500,ref code,ref message } if code.as_deref()==Some("APPLICATION_VALIDATOR_FAILED") && message=="Application policy failed")
+    );
+    let implicit = Box::pin(auth.dispatch_endpoint(
+        ApiKeyPlugin::verify_endpoint(&ApiKeyVerificationInput {
+            key: key.clone(),
+            config_id: None,
+            permissions: None,
+        })?,
+        EndpointOptions::default(),
+    ))
+    .await?
+    .decode()?;
+    assert!(!implicit.valid);
+    assert_eq!(
+        serde_json::to_value(implicit.error)?["code"],
+        "APPLICATION_VALIDATOR_FAILED"
+    );
+    for (mode, expected) in [
+        ("validator", Some("APPLICATION_VALIDATOR_FAILED")),
+        ("getter-handler", Some("APPLICATION_GETTER_FAILED")),
+        ("getter-match", None),
+    ] {
+        *application.mode.lock().unwrap() = mode;
+        application
+            .lookups
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        let mut input = request("/get-session", None, &cookies(&owner));
+        input.headers.extend([
+            ("x-application-key".into(), key.clone()),
+            ("x-policy-marker".into(), "actual-request".into()),
+        ]);
+        let denied = call(&auth, input, 500).await;
+        if let Some(code) = expected {
+            assert_eq!(
+                body(&denied),
+                json!({"code":code,"message":"Application policy failed"})
+            );
+        } else {
+            assert_eq!(
+                body(&denied)["message"],
+                "An error occurred during hook matcher execution. Check the logs for more details."
+            );
+        }
+        assert_eq!(
+            application
+                .lookups
+                .load(std::sync::atomic::Ordering::SeqCst),
+            if mode == "getter-match" { 1 } else { 2 }
+        );
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "api_keys"])
+                .await?,
+            before
+        );
+    }
     B::close(connection).await
 }
