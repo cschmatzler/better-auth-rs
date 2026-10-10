@@ -23,7 +23,8 @@ backend_tests!(
     admin_password_field_rejects_accompanying_profile_mutations,
     admin_colliding_email_rejects_accompanying_profile_mutations,
     admin_update_ban_revokes_every_target_browser_and_preserves_foreign_sessions,
-    admin_empty_update_authority_order
+    admin_empty_update_authority_order,
+    admin_literal_role_input_admission
 );
 
 async fn promote<S: AuthSchema>(auth: &Alibi<S>, response: &AuthResponse, role: &str) -> String {
@@ -1398,5 +1399,79 @@ async fn admin_empty_update_authority_order<B: Backend>(db: Db) -> TestResult {
         Some("Valid retry")
     );
     authenticated(&auth, &cookies(&target), "empty-update-target@example.test").await;
+    B::close(connection).await
+}
+
+async fn admin_literal_role_input_admission<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let mut configured = roles();
+    _ = configured.insert(String::new(), RolePermissions::new());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(AdminPlugin::new().roles(configured))
+        .build()
+        .await?;
+    let administrator = signup(&auth, "literal-admin@example.test").await;
+    _ = promote(&auth, &administrator, "admin").await;
+    let target = signup(&auth, "literal-target@example.test").await;
+    let id = body(&target)["user"]["id"].as_str().unwrap().to_owned();
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    for role in [
+        json!("admin,user"),
+        json!(["admin,user"]),
+        json!(" admin"),
+        json!([" user"]),
+    ] {
+        for (path, input) in [
+            ("/admin/set-role", json!({"userId":id,"role":role})),
+            (
+                "/admin/update-user",
+                json!({"userId":id,"data":{"role":role,"name":"Must not commit"}}),
+            ),
+        ] {
+            let response = call(
+                &auth,
+                request(path, Some(input), &cookies(&administrator)),
+                400,
+            )
+            .await;
+            assert_eq!(
+                body(&response)["code"],
+                "YOU_ARE_NOT_ALLOWED_TO_SET_NON_EXISTENT_VALUE"
+            );
+            assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+        }
+    }
+    for (role, expected) in [
+        (json!(["user", "admin"]), "user,admin"),
+        (json!([]), ""),
+        (json!(""), ""),
+        (json!([""]), ""),
+    ] {
+        let response = call(
+            &auth,
+            request(
+                "/admin/set-role",
+                Some(json!({"userId":id,"role":role})),
+                &cookies(&administrator),
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(body(&response)["user"]["role"], expected);
+        assert_eq!(
+            db.text("SELECT role FROM users WHERE id=$1", &[&id])
+                .await?
+                .as_deref(),
+            Some(expected)
+        );
+        assert_eq!(db.table("accounts").await?, before[1]);
+        assert_eq!(db.table("sessions").await?, before[2]);
+    }
+    authenticated(
+        &auth,
+        &cookies(&administrator),
+        "literal-admin@example.test",
+    )
+    .await;
     B::close(connection).await
 }
