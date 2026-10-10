@@ -20,7 +20,8 @@ backend_tests!(
     organization_plugin_helpers,
     organization_trusted_addition_preserves_literal_role_arrays_and_session_scope,
     fractional_organization_membership_limit_uses_actual_physical_count,
-    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results
+    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results,
+    organization_selected_role_permission_page
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -891,5 +892,171 @@ async fn organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_r
     );
     assert_eq!(policy.seen.lock().unwrap().len(), count);
     assert_eq!(db.count("member").await?, 2);
+    B::close(connection).await
+}
+
+async fn organization_selected_role_permission_page<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    config.advanced.database.default_find_many_limit = 1;
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            access_control: Some(default_organization_statements()),
+            dynamic_access_control: DynamicAccessControlConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let mut owner = account(&auth, "selected-role-owner@example.test").await;
+    let foreign = account(&auth, "selected-role-foreign@example.test").await;
+    let org = organization(&auth, &mut owner, "selected-role-page").await;
+    _ = auth
+        .store()
+        .create_organization_role(alibi::types::CreateOrganizationRole {
+            organization_id: org.clone(),
+            role: "prefix".into(),
+            permission: Default::default(),
+        })
+        .await?;
+    let protected = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    for (i, literal) in [
+        " [\"create\"] ",
+        " false ",
+        " 0 ",
+        " \"\" ",
+        " null ",
+        "",
+        "{bad",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("legacy-{i}");
+        let role = auth
+            .store()
+            .create_organization_role(alibi::types::CreateOrganizationRole {
+                organization_id: org.clone(),
+                role: name.clone(),
+                permission: Default::default(),
+            })
+            .await?;
+        _ = db
+            .execute(
+                "UPDATE organization_role SET permission=$1 WHERE id=$2",
+                &[literal, &role.id],
+            )
+            .await?;
+        let selected_before = db.table("organization_role").await?;
+        _ = call(
+            &auth,
+            request(
+                "/organization/update-role",
+                Some(json!({"organizationId":org,"roleId":role.id,"data":{}})),
+                &foreign.cookie,
+            ),
+            403,
+        )
+        .await;
+        assert_eq!(db.table("organization_role").await?, selected_before);
+        let read = call(
+            &auth,
+            get(
+                "/organization/get-role",
+                &[("organizationId", &org), ("roleId", &role.id)],
+                &owner.cookie,
+            ),
+            if literal.is_empty() || literal == "{bad" {
+                500
+            } else {
+                200
+            },
+        )
+        .await;
+        if literal.is_empty() || literal == "{bad" {
+            assert!(read.body.is_empty());
+        } else {
+            assert_eq!(
+                body(&read)["permission"],
+                serde_json::from_str::<Value>(literal)?
+            );
+        }
+        for data in [json!({}), json!({"roleName":format!("{name}-renamed")})] {
+            let update = call(
+                &auth,
+                request(
+                    "/organization/update-role",
+                    Some(json!({"organizationId":org,"roleId":role.id,"data":data})),
+                    &owner.cookie,
+                ),
+                if literal == "{bad" { 500 } else { 200 },
+            )
+            .await;
+            if literal == "{bad" {
+                assert!(update.body.is_empty());
+                assert_eq!(db.table("organization_role").await?, selected_before);
+            } else {
+                let parsed = if literal.trim().starts_with('[') {
+                    json!(["create"])
+                } else {
+                    Value::Null
+                };
+                assert_eq!(body(&update)["roleData"]["permission"], parsed);
+                assert_eq!(
+                    body(&update)["roleData"]["role"],
+                    data.get("roleName").cloned().unwrap_or_else(|| json!(name))
+                );
+                assert_eq!(
+                    db.text(
+                        "SELECT permission FROM organization_role WHERE id=$1",
+                        &[&role.id]
+                    )
+                    .await?
+                    .as_deref(),
+                    Some(literal)
+                );
+                assert!(
+                    db.text(
+                        "SELECT updated_at FROM organization_role WHERE id=$1",
+                        &[&role.id]
+                    )
+                    .await?
+                    .is_some()
+                );
+            }
+        }
+        let replacement=call(&auth,request("/organization/update-role",Some(json!({"organizationId":org,"roleId":role.id,"data":{"permission":{"team":["create"]}}})),&owner.cookie),if literal=="{bad"{500}else{200}).await;
+        if literal == "{bad" {
+            assert!(replacement.body.is_empty());
+            assert_eq!(db.table("organization_role").await?, selected_before);
+        } else {
+            assert_eq!(
+                body(&replacement)["roleData"]["permission"],
+                json!({"team":["create"]})
+            );
+            assert_eq!(
+                db.text(
+                    "SELECT permission FROM organization_role WHERE id=$1",
+                    &[&role.id]
+                )
+                .await?
+                .as_deref(),
+                Some("{\"team\":[\"create\"]}")
+            );
+        }
+    }
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?,
+        protected
+    );
     B::close(connection).await
 }
