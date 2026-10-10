@@ -26,7 +26,8 @@ backend_tests!(
     admin_empty_update_authority_order,
     admin_literal_role_input_admission,
     admin_create_role_selector_precedence,
-    admin_array_filter_sql_operands
+    admin_array_filter_sql_operands,
+    admin_repeated_query_validation_before_auth
 );
 
 async fn promote<S: AuthSchema>(auth: &Alibi<S>, response: &AuthResponse, role: &str) -> String {
@@ -1758,6 +1759,144 @@ async fn admin_array_filter_sql_operands<B: Backend>(db: Db) -> TestResult {
             status,
         )
         .await;
+    }
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    B::close(connection).await
+}
+
+async fn admin_repeated_query_validation_before_auth<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(AdminPlugin::new().roles(roles()))
+        .build()
+        .await?;
+    let owner = signup(&auth, "repeat-owner@example.test").await;
+    let regular = signup(&auth, "repeat-regular@example.test").await;
+    _ = promote(&auth, &owner, "admin").await;
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    for cookie in [String::new(), cookies(&regular), cookies(&owner)] {
+        for (route, key, a, b, message) in [
+            (
+                "get-user",
+                "id",
+                body(&owner)["user"]["id"].as_str().unwrap(),
+                body(&regular)["user"]["id"].as_str().unwrap(),
+                "[query.id] Invalid input: expected string, received array",
+            ),
+            (
+                "get-user",
+                "id",
+                "same",
+                "same",
+                "[query.id] Invalid input: expected string, received array",
+            ),
+            (
+                "list-users",
+                "searchValue",
+                "A",
+                "B",
+                "[query.searchValue] Invalid input: expected string, received array",
+            ),
+            (
+                "list-users",
+                "searchField",
+                "email",
+                "name",
+                "[query.searchField] Invalid option: expected one of \"email\"|\"name\"",
+            ),
+            (
+                "list-users",
+                "searchOperator",
+                "contains",
+                "starts_with",
+                "[query.searchOperator] Invalid option: expected one of \"contains\"|\"starts_with\"|\"ends_with\"",
+            ),
+            (
+                "list-users",
+                "limit",
+                "1",
+                "2",
+                "[query.limit] Invalid input",
+            ),
+            (
+                "list-users",
+                "offset",
+                "0",
+                "1",
+                "[query.offset] Invalid input",
+            ),
+            (
+                "list-users",
+                "sortBy",
+                "email",
+                "name",
+                "[query.sortBy] Invalid input: expected string, received array",
+            ),
+            (
+                "list-users",
+                "sortDirection",
+                "asc",
+                "desc",
+                "[query.sortDirection] Invalid option: expected one of \"asc\"|\"desc\"",
+            ),
+            (
+                "list-users",
+                "filterField",
+                "email",
+                "name",
+                "[query.filterField] Invalid input: expected string, received array",
+            ),
+            (
+                "list-users",
+                "filterOperator",
+                "eq",
+                "ne",
+                "[query.filterOperator] Invalid option: expected one of \"eq\"|\"ne\"|\"lt\"|\"lte\"|\"gt\"|\"gte\"|\"in\"|\"not_in\"|\"contains\"|\"starts_with\"|\"ends_with\"",
+            ),
+        ] {
+            let mut input = request(&format!("/admin/{route}"), None, &cookie);
+            input.set_query_pairs([(key, a), (key, b)]);
+            let denied = call(&auth, input, 400).await;
+            assert_eq!(
+                body(&denied),
+                json!({"code":"VALIDATION_ERROR","message":message})
+            );
+            assert_eq!(
+                denied.headers.get("content-type").map(String::as_str),
+                Some("application/json")
+            );
+            assert!(!denied.headers.contains_key("set-cookie"));
+        }
+    }
+    let mut combined = request("/admin/list-users", None, "");
+    combined.set_query_pairs([
+        ("sortBy", "name"),
+        ("sortBy", "email"),
+        ("limit", "1"),
+        ("limit", "2"),
+        ("searchValue", "A"),
+        ("searchValue", "B"),
+    ]);
+    let result = call(&auth, combined, 400).await;
+    assert_eq!(
+        body(&result),
+        json!({"code":"VALIDATION_ERROR","message":"[query.searchValue] Invalid input: expected string, received array; [query.limit] Invalid input; [query.sortBy] Invalid input: expected string, received array"})
+    );
+    for (cookie, status) in [
+        (String::new(), 401),
+        (cookies(&regular), 403),
+        (cookies(&owner), 200),
+    ] {
+        let mut input = request("/admin/get-user", None, &cookie);
+        input.set_query_pairs([
+            ("id", body(&regular)["user"]["id"].as_str().unwrap()),
+            ("ignored", "first"),
+            ("ignored", "second"),
+        ]);
+        let result = call(&auth, input, status).await;
+        if status == 200 {
+            assert_eq!(body(&result)["id"], body(&regular)["user"]["id"]);
+        }
     }
     assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
     B::close(connection).await
