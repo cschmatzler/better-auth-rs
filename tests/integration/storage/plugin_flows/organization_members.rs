@@ -21,6 +21,8 @@ backend_tests!(
     organization_trusted_addition_preserves_literal_role_arrays_and_session_scope,
     fractional_organization_membership_limit_uses_actual_physical_count,
     organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results,
+    organization_creation_raw_quota,
+    organization_creation_policy_principal,
     organization_creation_policy_error
 );
 
@@ -892,6 +894,244 @@ async fn organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_r
     );
     assert_eq!(policy.seen.lock().unwrap().len(), count);
     assert_eq!(db.count("member").await?, 2);
+    B::close(connection).await
+}
+
+async fn organization_creation_raw_quota<B: Backend>(db: Db) -> TestResult {
+    for (limit, allowed) in [
+        (1.5, false),
+        (-0.5, false),
+        (f64::NAN, true),
+        (f64::INFINITY, true),
+    ] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let setup = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(OrganizationPlugin::new())
+            .build()
+            .await?;
+        let mut owner = account(&setup, "creation-quota-owner@example.test").await;
+        let mut foreign = account(&setup, "creation-quota-foreign@example.test").await;
+        let own = organization(&setup, &mut owner, "quota-own").await;
+        let other = organization(&setup, &mut foreign, "quota-other").await;
+        _ = add(&setup, &other, &owner.id, "member").await;
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                organization_limit: Some(limit),
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let before = db
+            .tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?;
+        let response=call(&auth,request("/organization/create",Some(json!({"name":"Quota request","slug":if allowed {"quota-new"} else {"quota-own"},"userId":foreign.id})),&owner.cookie),if allowed {200} else {403}).await;
+        if allowed {
+            assert_eq!(body(&response)["members"][0]["userId"], owner.id);
+        } else {
+            assert_eq!(
+                body(&response)["code"],
+                "YOU_HAVE_REACHED_THE_MAXIMUM_NUMBER_OF_ORGANIZATIONS"
+            );
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                    .await?,
+                before
+            );
+        }
+        let before_trusted = db
+            .tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?;
+        let sessions = db.table("sessions").await?;
+        let result = Box::pin(auth.dispatch_endpoint(
+            OrganizationPlugin::create_endpoint(
+                &serde_json::from_value(
+                    json!({"name":"Trusted quota","slug":"quota-trusted","userId":owner.id}),
+                )?,
+                Some(&owner.id),
+            )?,
+            EndpointOptions::default(),
+        ))
+        .await;
+        if allowed {
+            let created = serde_json::to_value(result?.decode()?)?;
+            assert_eq!(created["members"][0]["userId"], owner.id);
+            assert_eq!(db.count("organization").await?, 4);
+            assert_eq!(db.table("sessions").await?, sessions);
+        } else {
+            assert_eq!(result.unwrap_err().error.status_code(), 403);
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                    .await?,
+                before_trusted
+            );
+        }
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM member WHERE organization_id=$1 AND user_id=$2",
+                &[&own, &owner.id]
+            )
+            .await?,
+            1
+        );
+        authenticated(
+            &auth,
+            &foreign.cookie,
+            "creation-quota-foreign@example.test",
+        )
+        .await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn organization_creation_policy_principal<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::OrganizationCreationPolicy;
+    #[derive(Debug)]
+    struct Policy {
+        reached: std::sync::atomic::AtomicBool,
+        events: Mutex<Vec<(&'static str, String)>>,
+    }
+    #[async_trait::async_trait]
+    impl OrganizationCreationPolicy for Policy {
+        async fn allow_creation(&self, user: &UserView) -> AuthResult<Option<bool>> {
+            self.events.lock().unwrap().push(("allow", user.id.clone()));
+            Ok(Some(user.name.as_deref() == Some("Paid")))
+        }
+        async fn limit_reached(&self, user: &UserView) -> AuthResult<Option<bool>> {
+            self.events.lock().unwrap().push(("limit", user.id.clone()));
+            Ok(Some(self.reached.load(std::sync::atomic::Ordering::SeqCst)))
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let policy = Arc::new(Policy {
+        reached: std::sync::atomic::AtomicBool::new(false),
+        events: Mutex::new(Vec::new()),
+    });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            creation_policy: Some(policy.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let free = account(&auth, "creation-free@example.test").await;
+    let paid = account(&auth, "creation-paid@example.test").await;
+    _ = db
+        .execute("UPDATE users SET name='Paid' WHERE id=$1", &[&paid.id])
+        .await?;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    assert_eq!(
+        body(
+            &call(
+                &auth,
+                request(
+                    "/organization/create",
+                    Some(json!({"name":"Free denied","slug":"free-denied","userId":paid.id})),
+                    &free.cookie
+                ),
+                403
+            )
+            .await
+        )["code"],
+        "YOU_ARE_NOT_ALLOWED_TO_CREATE_A_NEW_ORGANIZATION"
+    );
+    assert_eq!(*policy.events.lock().unwrap(), [("allow", free.id.clone())]);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?,
+        before
+    );
+    policy.events.lock().unwrap().clear();
+    let accepted = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Paid allowed","slug":"paid-allowed","userId":free.id})),
+            &paid.cookie,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&accepted)["members"][0]["userId"], paid.id);
+    assert_eq!(
+        *policy.events.lock().unwrap(),
+        [("allow", paid.id.clone()), ("limit", paid.id.clone())]
+    );
+    policy.events.lock().unwrap().clear();
+    policy
+        .reached
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let before = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    _ = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Paid capped","slug":"paid-capped"})),
+            &paid.cookie,
+        ),
+        403,
+    )
+    .await;
+    assert_eq!(
+        *policy.events.lock().unwrap(),
+        [("allow", paid.id.clone()), ("limit", paid.id.clone())]
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?,
+        before
+    );
+    policy
+        .reached
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    policy.events.lock().unwrap().clear();
+    let sessions = db.table("sessions").await?;
+    let input = serde_json::from_value(
+        json!({"name":"Trusted free","slug":"trusted-free","userId":free.id}),
+    )?;
+    let created = Box::pin(auth.dispatch_endpoint(
+        OrganizationPlugin::create_endpoint(&input, Some(&free.id))?,
+        EndpointOptions::default(),
+    ))
+    .await?
+    .decode()?;
+    assert_eq!(
+        serde_json::to_value(created)?["members"][0]["userId"],
+        free.id
+    );
+    assert_eq!(
+        *policy.events.lock().unwrap(),
+        [("allow", free.id.clone()), ("limit", free.id.clone())]
+    );
+    assert_eq!(db.table("sessions").await?, sessions);
+    policy
+        .reached
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let before = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    let rejected = Box::pin(auth.dispatch_endpoint(
+        OrganizationPlugin::create_endpoint(
+            &serde_json::from_value(
+                json!({"name":"Trusted capped","slug":"trusted-capped","userId":free.id}),
+            )?,
+            Some(&free.id),
+        )?,
+        EndpointOptions::default(),
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(rejected.error.status_code(), 403);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?,
+        before
+    );
     B::close(connection).await
 }
 
