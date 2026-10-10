@@ -24,7 +24,8 @@ backend_tests!(
     two_factor_pending_newest_expired_snapshot,
     two_factor_backup_view_exact_truthy_projection,
     two_factor_backup_remainder_json_normalization,
-    two_factor_pending_session_cancellation_retirement
+    two_factor_pending_session_cancellation_retirement,
+    two_factor_authenticated_totp_failed_rotation_retry
 );
 
 #[derive(Default)]
@@ -1972,6 +1973,133 @@ async fn two_factor_pending_session_cancellation_retirement<B: Backend>(db: Db) 
             authenticated(&auth, &cookies(&foreign), "other@example.test").await;
             B::close(connection).await?;
         }
+    }
+    Ok(())
+}
+
+async fn two_factor_authenticated_totp_failed_rotation_retry<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{DatabaseHookContext, DatabaseHooks, HookBackend, HookControl};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Debug)]
+    struct Reject {
+        mode: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl<S: AuthSchema, H: HookBackend> DatabaseHooks<S, H> for Reject {
+        async fn before_create_session(
+            &self,
+            _: &mut alibi::CreateSession,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<HookControl> {
+            match self.mode.load(Ordering::SeqCst) {
+                0 => Ok(HookControl::Continue),
+                1 => {
+                    _ = self.calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(HookControl::Cancel)
+                }
+                _ => {
+                    _ = self.calls.fetch_add(1, Ordering::SeqCst);
+                    Err(alibi::AuthError::forbidden(
+                        "session creation cancelled by database hook",
+                    ))
+                }
+            }
+        }
+    }
+
+    for mode in [1, 2] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let gate = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .store(B::hook(
+                B::store(Arc::new(config), &connection),
+                Reject {
+                    mode: gate.clone(),
+                    calls: calls.clone(),
+                },
+            ))
+            .plugin(TwoFactorPlugin::new())
+            .build()
+            .await?;
+        let signed = signup(&auth, "retry@example.test").await;
+        let id = body(&signed)["user"]["id"].as_str().unwrap().to_owned();
+        let jar = cookies(&signed);
+        let (totp, _, _) = enroll(&auth, &jar).await;
+        let original = db.table("two_factor").await?;
+        let sessions = db.table("sessions").await?;
+        gate.store(mode, Ordering::SeqCst);
+        let _ = call(
+            &auth,
+            request(
+                "/two-factor/verify-totp",
+                Some(json!({"code":"invalid-code"})),
+                &jar,
+            ),
+            401,
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(db.table("two_factor").await?, original);
+        let denied = call(
+            &auth,
+            request(
+                "/two-factor/verify-totp",
+                Some(json!({"code":totp.generate_current().to_string(),"trustDevice":true})),
+                &jar,
+            ),
+            if mode == 1 { 500 } else { 403 },
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(denied.headers.get_all("set-cookie").count(), 0);
+        if mode == 1 {
+            assert!(denied.body.is_empty());
+        } else {
+            assert_eq!(
+                body(&denied)["message"],
+                "session creation cancelled by database hook"
+            );
+        }
+        assert_eq!(db.table("two_factor").await?, original);
+        assert_eq!(db.table("sessions").await?, sessions);
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM users WHERE id=$1 AND two_factor_enabled=true",
+                &[&id]
+            )
+            .await?,
+            1
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM verifications WHERE identifier LIKE 'trust-device-%'",
+                &[]
+            )
+            .await?,
+            0
+        );
+        gate.store(0, Ordering::SeqCst);
+        let done = call(
+            &auth,
+            request(
+                "/two-factor/verify-totp",
+                Some(json!({"code":totp.generate_current().to_string()})),
+                &jar,
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(body(&done)["token"], body(&signed)["token"]);
+        assert_eq!(done.headers.get_all("set-cookie").count(), 0);
+        let factor = auth.store().get_two_factor_by_user_id(&id).await?.unwrap();
+        assert_eq!(factor.verified, Some(true));
+        assert_eq!(db.table("sessions").await?, sessions);
+        authenticated(&auth, &jar, "retry@example.test").await;
+        B::close(connection).await?;
     }
     Ok(())
 }
