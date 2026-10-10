@@ -16,7 +16,8 @@ backend_tests!(
     magic_link_redemption_matrix,
     magic_link_configured_quota_blocks_delivery_and_resets_at_configured_window,
     magic_link_returning_verified_owner_retains_credentials_oauth_and_browser_sessions,
-    magic_link_redemption_hasher_failure
+    magic_link_redemption_hasher_failure,
+    magic_link_fresh_empty_callback
 );
 
 #[derive(Default)]
@@ -579,4 +580,54 @@ async fn magic_link_redemption_hasher_failure<B: Backend>(db: Db) -> TestResult 
         B::close(connection).await?;
     }
     Ok(())
+}
+
+async fn magic_link_fresh_empty_callback<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let outbox = Arc::new(Outbox::default());
+    let auth = fast_builder::<B>(&connection)
+        .plugin(MagicLinkPlugin::new(MagicLinkConfig {
+            send_magic_link: Some(outbox.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    _ = call(
+        &auth,
+        request(
+            "/sign-in/magic-link",
+            Some(json!({"email":"fresh-json@example.test","name":"JSON owner"})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    let delivery = outbox.sent.lock().unwrap().last().unwrap().clone();
+    assert_eq!(db.count("users").await?, 0);
+    assert_eq!(db.count("verifications").await?, 1);
+    let input = redeem(
+        &delivery,
+        &[("callbackURL", ""), ("newUserCallbackURL", "/welcome")],
+    );
+    let accepted = call(&auth, input.clone(), 200).await;
+    assert!(!accepted.headers.contains_key("location"));
+    assert_eq!(body(&accepted)["user"]["name"], "JSON owner");
+    assert_eq!(body(&accepted)["user"]["emailVerified"], true);
+    assert!(body(&accepted)["token"].is_string());
+    authenticated(&auth, &cookies(&accepted), "fresh-json@example.test").await;
+    assert_eq!(db.count("sessions").await?, 1);
+    assert_eq!(db.count("verifications").await?, 0);
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    let replay = call(&auth, input, 302).await;
+    let location = url::Url::parse(replay.headers.get("location").unwrap())?;
+    assert_eq!(
+        location
+            .query_pairs()
+            .find(|(key, _)| key == "error")
+            .unwrap()
+            .1,
+        "INVALID_TOKEN"
+    );
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    B::close(connection).await
 }
