@@ -18,7 +18,8 @@ backend_tests!(
     two_factor_reenrollment_retains_row_policy,
     two_factor_pending_unverified_totp_backup_recovery,
     two_factor_account_lock_pending_only_scope,
-    two_factor_configured_account_lock_policy
+    two_factor_configured_account_lock_policy,
+    two_factor_otp_account_budget_coupling
 );
 
 #[derive(Default)]
@@ -1218,4 +1219,139 @@ async fn two_factor_configured_account_lock_policy<B: Backend>(db: Db) -> TestRe
         B::close(connection).await?;
     }
     Ok(())
+}
+
+async fn two_factor_otp_account_budget_coupling<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let outbox = Arc::new(Outbox::default());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(TwoFactorPlugin::with_config(TwoFactorConfig {
+            send_otp: Some(outbox.clone()),
+            account_lockout: alibi::plugins::two_factor::AccountLockoutConfig {
+                max_failed_attempts: 2.5,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let signed = signup(&auth, "coupled@example.test").await;
+    let id = body(&signed)["user"]["id"].as_str().unwrap().to_owned();
+    let (totp, _, _) = enroll(&auth, &cookies(&signed)).await;
+    let active = call(
+        &auth,
+        request(
+            "/two-factor/verify-totp",
+            Some(json!({"code":totp.generate_current().to_string()})),
+            &cookies(&signed),
+        ),
+        200,
+    )
+    .await;
+    _ = db
+        .execute("UPDATE two_factor SET failed_verification_count=1.5", &[])
+        .await?;
+    let original = db.table("two_factor").await?;
+    let _ = call(
+        &auth,
+        request("/two-factor/send-otp", Some(json!({})), &cookies(&active)),
+        200,
+    )
+    .await;
+    let _ = call(
+        &auth,
+        request(
+            "/two-factor/verify-otp",
+            Some(json!({"code":"invalid-code"})),
+            &cookies(&active),
+        ),
+        401,
+    )
+    .await;
+    assert_eq!(db.table("two_factor").await?, original);
+    let pending = sign_in(&auth, "coupled@example.test", json!({}), "").await;
+    let _ = call(
+        &auth,
+        request("/two-factor/send-otp", Some(json!({})), &cookies(&pending)),
+        200,
+    )
+    .await;
+    let actual = outbox.0.lock().unwrap().last().unwrap().clone();
+    let _ = call(
+        &auth,
+        request(
+            "/two-factor/verify-otp",
+            Some(json!({"code":"invalid-code"})),
+            &cookies(&pending),
+        ),
+        401,
+    )
+    .await;
+    let factor = auth.store().get_two_factor_by_user_id(&id).await?.unwrap();
+    assert_eq!(factor.failed_verification_count, Some(2.5));
+    assert!(factor.locked_until.unwrap() > chrono::Utc::now());
+    let before = db
+        .tables(&["two_factor", "verifications", "sessions"])
+        .await?;
+    for (path, code) in [
+        ("/two-factor/verify-otp", actual.clone()),
+        (
+            "/two-factor/verify-totp",
+            totp.generate_current().to_string(),
+        ),
+    ] {
+        let denied = call(
+            &auth,
+            request(path, Some(json!({"code":code})), &cookies(&pending)),
+            429,
+        )
+        .await;
+        assert_eq!(body(&denied)["code"], "ACCOUNT_TEMPORARILY_LOCKED");
+        assert_eq!(
+            db.tables(&["two_factor", "verifications", "sessions"])
+                .await?,
+            before
+        );
+    }
+    _ = auth
+        .store()
+        .set_two_factor_lock_if_count_at_least(
+            &factor.id,
+            2.5,
+            chrono::Utc::now() - chrono::Duration::seconds(1),
+        )
+        .await?;
+    let completed = call(
+        &auth,
+        request(
+            "/two-factor/verify-otp",
+            Some(json!({"code":actual})),
+            &cookies(&pending),
+        ),
+        200,
+    )
+    .await;
+    authenticated(&auth, &cookies(&completed), "coupled@example.test").await;
+    let final_factor = auth.store().get_two_factor_by_user_id(&id).await?.unwrap();
+    assert_eq!(final_factor.failed_verification_count, Some(0.0));
+    assert!(final_factor.locked_until.is_none());
+    assert_eq!(
+        (
+            final_factor.id,
+            final_factor.secret,
+            final_factor.backup_codes
+        ),
+        (factor.id, factor.secret, factor.backup_codes)
+    );
+    let _ = call(
+        &auth,
+        request(
+            "/two-factor/verify-otp",
+            Some(json!({"code":actual})),
+            &cookies(&pending),
+        ),
+        401,
+    )
+    .await;
+    B::close(connection).await
 }
