@@ -8,7 +8,8 @@ backend_tests!(
     profile_update_publishes_accepted_fields_and_preserves_rejected_identity,
     password_change_verification_and_session_revocation_are_owner_scoped,
     email_otp_verification_reset_and_email_change_bind_owner_and_scope,
-    password_length_limits_apply_to_every_new_password_endpoint
+    password_length_limits_apply_to_every_new_password_endpoint,
+    cookie_emission_failure_preserves_endpoint_commit_stage
 );
 postgres_tests!(
     username_signup_lookup_and_denials_share_normalized_identity,
@@ -735,4 +736,79 @@ async fn password_length_limits_apply_to_every_new_password_endpoint<B: Backend>
     .await;
     drop(auth);
     B::close(connection).await
+}
+
+async fn cookie_emission_failure_preserves_endpoint_commit_stage<B: Backend>(db: Db) -> TestResult {
+    use alibi::config::{CookieAttributes, CookieOverride};
+    for mode in ["age", "expiry", "cache"] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let normal = super::auth_probe::fast_builder::<B>(&connection)
+            .build()
+            .await?;
+        let owner = signup(&normal, "emission-owner@example.test").await;
+        let foreign = signup(&normal, "emission-foreign@example.test").await;
+        let principals = db.tables(&["users", "accounts"]).await?;
+        let sessions = db.count("sessions").await?;
+        let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        match mode {
+            "age" => config.session.expires_in = chrono::Duration::seconds(34_560_001),
+            "expiry" => {
+                _ = config.advanced.cookies.insert(
+                    "session_token".into(),
+                    CookieOverride {
+                        name: None,
+                        attributes: CookieAttributes {
+                            expires: Some(chrono::Utc::now() + chrono::Duration::days(401)),
+                            ..Default::default()
+                        },
+                    },
+                );
+            }
+            _ => {
+                config.session.cookie_cache = Some(alibi::CookieCacheConfig {
+                    enabled: true,
+                    max_age: f64::INFINITY,
+                    ..Default::default()
+                })
+            }
+        }
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .build()
+            .await?;
+        for signin in [false, true] {
+            let failed=call(&auth,request(if signin{"/sign-in/email"}else{"/sign-up/email"},Some(json!({"email":if signin{"emission-owner@example.test"}else{"emission-new@example.test"},"password":PASSWORD,"name":"Incoming"})),""),500).await;
+            assert!(failed.body.is_empty());
+            assert!(!failed.headers.contains_key("set-cookie"));
+            assert_eq!(db.tables(&["users", "accounts"]).await?, principals);
+            assert_eq!(
+                db.count("sessions").await?,
+                sessions + if signin { 1 } else { 0 }
+            );
+            assert_eq!(
+                db.count_where(
+                    "SELECT COUNT(*) FROM users WHERE email=$1",
+                    &["emission-new@example.test"]
+                )
+                .await?,
+                0
+            );
+        }
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM sessions WHERE user_id=$1",
+                &[body(&owner)["user"]["id"].as_str().unwrap()]
+            )
+            .await?,
+            2
+        );
+        authenticated(&normal, &cookies(&owner), "emission-owner@example.test").await;
+        authenticated(&normal, &cookies(&foreign), "emission-foreign@example.test").await;
+        B::close(connection).await?;
+    }
+    Ok(())
 }
