@@ -18,6 +18,7 @@ backend_tests!(
     jwt_session_claim_failures_stop_before_keyring_and_preserve_sessions,
     jwt_server_keyring_preserves_absent_request_and_virtual_endpoint,
     jwt_application_keyring_concurrent_initial_discovery_retains_both_signing_keys,
+    jwt_configured_expiration_precision,
     jwt_compact_revoked_principal_signing
 );
 
@@ -952,6 +953,115 @@ async fn jwt_application_keyring_concurrent_initial_discovery_retains_both_signi
     }
     assert!(auth.store().list_jwks().await?.is_empty());
     assert_eq!(db.count("sessions").await?, 0);
+    B::close(connection).await
+}
+
+async fn jwt_configured_expiration_precision<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let jwt = JwtPlugin::new();
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(jwt.clone())
+        .build()
+        .await?;
+    let keys: jsonwebtoken::jwk::JwkSet =
+        serde_json::from_value(body(&call(&auth, request("/jwks", None, ""), 200).await))?;
+    let decode = |token: &str| -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let h = jsonwebtoken::decode_header(token)?;
+        let mut v = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
+        v.validate_exp = false;
+        v.validate_aud = false;
+        v.required_spec_claims.clear();
+        Ok(jsonwebtoken::decode::<Value>(
+            token,
+            &jsonwebtoken::DecodingKey::from_jwk(keys.find(h.kid.as_deref().unwrap()).unwrap())?,
+            &v,
+        )?
+        .claims)
+    };
+    let cases = [
+        (JwtExpiration::Numeric(4102444800.25), 4102444800.25),
+        (JwtExpiration::Numeric(0.0), 0.0),
+        (JwtExpiration::Numeric(-12.25), -12.25),
+        (
+            JwtExpiration::At(chrono::DateTime::from_timestamp_millis(4102444800999).unwrap()),
+            4102444800.0,
+        ),
+        (
+            JwtExpiration::At(chrono::DateTime::from_timestamp_millis(-1).unwrap()),
+            -1.0,
+        ),
+        (
+            JwtExpiration::After(chrono::Duration::milliseconds(500)),
+            101.0,
+        ),
+        (
+            JwtExpiration::After(chrono::Duration::milliseconds(-500)),
+            100.0,
+        ),
+        (
+            JwtExpiration::After(chrono::Duration::milliseconds(-1500)),
+            99.0,
+        ),
+    ];
+    for (expiration, expected) in cases {
+        let options = JwtSignOptions {
+            claims: Some(JwtClaimsConfig {
+                expiration,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let token = jwt
+            .sign_jwt(
+                json!({"iat":100,"sub":"precision-owner"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                &options,
+                None,
+                auth.context(),
+            )
+            .await?;
+        let claims = decode(&token)?;
+        assert_eq!(claims["iat"], 100);
+        assert_eq!(claims["exp"].as_f64(), Some(expected));
+    }
+    let before = db.table("jwks").await?;
+    for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let options = JwtSignOptions {
+            claims: Some(JwtClaimsConfig {
+                expiration: JwtExpiration::Numeric(invalid),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            jwt.sign_jwt(
+                json!({"iat":100,"sub":"invalid-default"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                &options,
+                None,
+                auth.context()
+            )
+            .await
+            .is_err()
+        );
+        let token = jwt
+            .sign_jwt(
+                json!({"iat":100,"sub":"explicit-owner","exp":4102444800_u64})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                &options,
+                None,
+                auth.context(),
+            )
+            .await?;
+        assert_eq!(decode(&token)?["exp"], 4102444800_u64);
+        assert_eq!(db.table("jwks").await?, before);
+    }
     B::close(connection).await
 }
 
