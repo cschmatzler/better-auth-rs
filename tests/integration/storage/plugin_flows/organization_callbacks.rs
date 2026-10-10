@@ -31,7 +31,8 @@ backend_tests!(
     organization_deletion_original_row_snapshot,
     organization_deletion_before_await_boundary,
     organization_signed_team_helper_session_scope,
-    organization_member_team_policy_headers
+    organization_member_team_policy_headers,
+    organization_member_retargeted_team_rollback
 );
 postgres_tests!(
     organization_lifecycle_callbacks_preserve_patch_authority_and_committed_phases,
@@ -4651,5 +4652,219 @@ async fn organization_member_team_policy_headers<B: Backend>(db: Db) -> TestResu
         stable
     );
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn organization_member_retargeted_team_rollback<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::extensions::TeamLimitContext;
+    #[derive(Debug, Default)]
+    struct Hooks {
+        patch: Mutex<Option<(String, String)>>,
+        contexts: Mutex<Vec<TeamLimitContext>>,
+        after: Mutex<usize>,
+    }
+    #[async_trait]
+    impl OrganizationMemberAdditionHooks for Hooks {
+        async fn before_add_member(
+            &self,
+            _: &OrganizationMemberAdditionContext,
+        ) -> AuthResult<Option<OrganizationMemberCreatePatch>> {
+            Ok(self
+                .patch
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(organization, user)| OrganizationMemberCreatePatch {
+                    organization_id: Some(organization.clone()),
+                    user_id: Some(user.clone()),
+                    ..Default::default()
+                }))
+        }
+        async fn after_add_member(&self, _: &OrganizationMemberAddedContext) -> AuthResult<()> {
+            *self.after.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+    #[async_trait]
+    impl OrganizationLimitResolver for Hooks {
+        async fn maximum_team_members(&self, c: &TeamLimitContext) -> AuthResult<Option<f64>> {
+            if self.patch.lock().unwrap().is_some() {
+                self.contexts.lock().unwrap().push(c.clone());
+                Err(AuthError::Api {
+                    status: 403,
+                    code: Some("TEAM_LIMIT_POLICY_REJECTED".into()),
+                    message: "team policy rejected".into(),
+                })
+            } else {
+                Ok(Some(2.0))
+            }
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let hooks = Arc::new(Hooks::default());
+    let config = OrganizationConfig {
+        member_addition_hooks: Some(hooks.clone()),
+        teams: TeamsConfig {
+            enabled: true,
+            create_default_team: false,
+            limit_resolver: Some(hooks.clone()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let helper = OrganizationPlugin::with_config(config.clone());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(config))
+        .build()
+        .await?;
+
+    let owner = signup(&auth, "owner@example.test").await;
+    let target = signup(&auth, "target@example.test").await;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let target_id = body(&target)["user"]["id"].as_str().unwrap().to_owned();
+    let foreign_id = body(&foreign)["user"]["id"].as_str().unwrap().to_owned();
+    let org = body(
+        &call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Owned","slug":"owned"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await,
+    );
+    let other = body(
+        &call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Foreign","slug":"foreign"})),
+                &cookies(&foreign),
+            ),
+            200,
+        )
+        .await,
+    );
+    let mut teams = Vec::new();
+    let mut own_member_id = String::new();
+    for (organization, actor) in [(&org, &owner), (&other, &foreign)] {
+        let member = auth
+            .dispatch_endpoint(
+                OrganizationPlugin::add_member_endpoint(&serde_json::from_value(
+                    json!({"organizationId":organization["id"],"userId":target_id,"role":"member"}),
+                )?)?,
+                alibi::endpoint::EndpointOptions::default(),
+            )
+            .await?
+            .decode()?;
+        if organization["id"] == org["id"] {
+            own_member_id = member.id;
+        }
+        let team = body(
+            &call(
+                &auth,
+                request(
+                    "/organization/create-team",
+                    Some(json!({"organizationId":organization["id"],"name":"Seat"})),
+                    &cookies(actor),
+                ),
+                200,
+            )
+            .await,
+        );
+        let _=call(&auth,request("/organization/add-team-member",Some(json!({"organizationId":organization["id"],"teamId":team["id"],"userId":target_id})),&cookies(actor)),200).await;
+        teams.push(team);
+    }
+    auth.store().delete_member(&own_member_id).await?;
+    let own_team = teams.first().unwrap()["id"].as_str().unwrap().to_owned();
+    let foreign_team = teams.last().unwrap()["id"].as_str().unwrap().to_owned();
+
+    let patched = signup(&auth, "patched@example.test").await;
+    let patched_id = body(&patched)["user"]["id"].as_str().unwrap().to_owned();
+    let _ = auth
+        .dispatch_endpoint(
+            OrganizationPlugin::add_member_endpoint(&serde_json::from_value(
+                json!({"organizationId":other["id"],"userId":patched_id,"role":"member"}),
+            )?)?,
+            alibi::endpoint::EndpointOptions::default(),
+        )
+        .await?
+        .decode()?;
+    let _ = call(
+        &auth,
+        request(
+            "/organization/add-team-member",
+            Some(json!({"organizationId":other["id"],"teamId":foreign_team,"userId":patched_id})),
+            &cookies(&foreign),
+        ),
+        200,
+    )
+    .await;
+    *hooks.patch.lock().unwrap() = Some((other["id"].as_str().unwrap().into(), patched_id.clone()));
+    *hooks.after.lock().unwrap() = 0;
+    let before_members = db.table("member").await?;
+    let stable = db
+        .tables(&["users", "accounts", "sessions", "organization"])
+        .await?;
+    let input = serde_json::from_value(
+        json!({"organizationId":org["id"],"userId":target_id,"role":"member","teamId":own_team}),
+    )?;
+    let headers = std::collections::HashMap::from([("cookie".into(), cookies(&owner))]);
+    let rejected = helper
+        .add_member_with_headers(auth.context(), &headers, &input)
+        .await
+        .unwrap_err();
+    assert!(matches!(rejected, AuthError::Api { status: 403, .. }));
+    assert_eq!(*hooks.after.lock().unwrap(), 0);
+    assert_eq!(db.table("member").await?, before_members);
+    let contexts = hooks.contexts.lock().unwrap().clone();
+    let c = contexts.first().unwrap();
+    assert_eq!(contexts.len(), 1);
+    assert_eq!(c.organization_id, org["id"].as_str().unwrap());
+    assert_eq!(c.team_id.as_deref(), Some(own_team.as_str()));
+    assert_eq!(
+        c.user.as_ref().unwrap().id,
+        body(&owner)["user"]["id"].as_str().unwrap()
+    );
+    drop(contexts);
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM team_member WHERE team_id=$1 AND user_id=$2",
+            &[&own_team, &target_id]
+        )
+        .await?,
+        0
+    );
+    assert_eq!(
+        db.count_where("SELECT member_count FROM team WHERE id=$1", &[&own_team])
+            .await?,
+        0
+    );
+    for user in [&patched_id, &target_id] {
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM team_member WHERE team_id=$1 AND user_id=$2",
+                &[&foreign_team, user]
+            )
+            .await?,
+            1
+        );
+    }
+    assert_eq!(
+        db.count_where(
+            "SELECT member_count FROM team WHERE id=$1",
+            &[&foreign_team]
+        )
+        .await?,
+        2
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization"])
+            .await?,
+        stable
+    );
+    let _ = foreign_id;
     B::close(connection).await
 }
