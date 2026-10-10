@@ -14,7 +14,8 @@ backend_tests!(
     two_factor_forged_trust_proofs,
     two_factor_otp_budget_and_session_choices,
     two_factor_numeric_options_and_damaged_factor,
-    two_factor_otp_resends_are_consumed_once_across_real_requests
+    two_factor_otp_resends_are_consumed_once_across_real_requests,
+    two_factor_pending_newest_expired_snapshot
 );
 
 #[derive(Default)]
@@ -757,4 +758,132 @@ async fn two_factor_otp_resends_are_consumed_once_across_real_requests<B: Backen
     authenticated(&auth, &cookie, "owner@example.test").await;
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
+}
+
+async fn two_factor_pending_newest_expired_snapshot<B: Backend>(db: Db) -> TestResult {
+    use alibi::entity::AuthVerification;
+    for disabled in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        config.verification.disable_cleanup = disabled;
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(TwoFactorPlugin::with_config(TwoFactorConfig {
+                skip_verification_on_enable: true,
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let signed = signup(&auth, "shadow@example.test").await;
+        let id = body(&signed)["user"]["id"].as_str().unwrap().to_owned();
+        let (_, enrollment, _) = enroll(&auth, &cookies(&signed)).await;
+        let pending = sign_in(&auth, "shadow@example.test", json!({}), "").await;
+        let key=db.text("SELECT identifier FROM verifications WHERE value=$1 AND identifier LIKE '2fa-%' AND identifier NOT LIKE '2fa-attempts-%'",&[&id]).await?.unwrap();
+        let shadow = auth
+            .store()
+            .create_verification(alibi::CreateVerification {
+                identifier: key.clone(),
+                value: "missing-shadow-owner".into(),
+                expires_at: chrono::Utc::now() - chrono::Duration::hours(1),
+            })
+            .await?;
+        db.set_timestamp(
+            "verifications",
+            "created_at",
+            ("id", shadow.id().as_ref()),
+            "2030-01-01T00:00:00Z".parse()?,
+        )
+        .await?;
+        let principals = db
+            .tables(&["two_factor", "users", "accounts", "sessions"])
+            .await?;
+        let denied = call(
+            &auth,
+            request(
+                "/two-factor/verify-backup-code",
+                Some(json!({"code":enrollment["backupCodes"][0]})),
+                &cookies(&pending),
+            ),
+            401,
+        )
+        .await;
+        assert_eq!(body(&denied)["code"], "INVALID_TWO_FACTOR_COOKIE");
+        assert_eq!(
+            db.tables(&["two_factor", "users", "accounts", "sessions"])
+                .await?,
+            principals
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM verifications WHERE id=$1",
+                &[shadow.id().as_ref()]
+            )
+            .await?,
+            i64::from(disabled)
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM verifications WHERE identifier=$1 AND value=$2",
+                &[&key, &id]
+            )
+            .await?,
+            1
+        );
+        assert_eq!(
+            db.text(
+                "SELECT value FROM verifications WHERE identifier=$1",
+                &[&format!("2fa-attempts-{key}")]
+            )
+            .await?
+            .as_deref(),
+            Some("0")
+        );
+        if disabled {
+            let before = db.table("verifications").await?;
+            let _ = call(
+                &auth,
+                request(
+                    "/two-factor/verify-backup-code",
+                    Some(json!({"code":enrollment["backupCodes"][0]})),
+                    &cookies(&pending),
+                ),
+                401,
+            )
+            .await;
+            assert_eq!(db.table("verifications").await?, before);
+            _ = db
+                .execute(
+                    "DELETE FROM verifications WHERE id=$1",
+                    &[shadow.id().as_ref()],
+                )
+                .await?;
+        }
+        let done = call(
+            &auth,
+            request(
+                "/two-factor/verify-backup-code",
+                Some(json!({"code":enrollment["backupCodes"][0]})),
+                &cookies(&pending),
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(body(&done)["user"]["id"], id);
+        authenticated(&auth, &cookies(&done), "shadow@example.test").await;
+        let _ = call(
+            &auth,
+            request(
+                "/two-factor/verify-backup-code",
+                Some(json!({"code":enrollment["backupCodes"][0]})),
+                &cookies(&pending),
+            ),
+            401,
+        )
+        .await;
+        B::close(connection).await?;
+    }
+    Ok(())
 }
