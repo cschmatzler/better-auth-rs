@@ -22,7 +22,8 @@ backend_tests!(
     create_only_role_cannot_select_explicit_or_nested_roles,
     admin_password_field_rejects_accompanying_profile_mutations,
     admin_colliding_email_rejects_accompanying_profile_mutations,
-    admin_update_ban_revokes_every_target_browser_and_preserves_foreign_sessions
+    admin_update_ban_revokes_every_target_browser_and_preserves_foreign_sessions,
+    admin_date_callback_error_identity
 );
 
 async fn promote<S: AuthSchema>(auth: &Alibi<S>, response: &AuthResponse, role: &str) -> String {
@@ -1347,5 +1348,95 @@ async fn admin_update_ban_revokes_every_target_browser_and_preserves_foreign_ses
     }
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     authenticated(&auth, &cookies(&admin), "admin@example.test").await;
+    B::close(connection).await
+}
+
+async fn admin_date_callback_error_identity<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{DatabaseHookContext, DatabaseHooks, HookBackend, HookControl};
+    use alibi::{AuthError, AuthResult, CreateSession};
+    struct Hooks;
+    #[async_trait::async_trait]
+    impl<S: AuthSchema, H: HookBackend> DatabaseHooks<S, H> for Hooks {
+        async fn before_update_user(
+            &self,
+            _: &str,
+            u: &mut UpdateUser,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<HookControl> {
+            if u.banned == Some(true) {
+                return Err(AuthError::Api {
+                    status: 403,
+                    code: Some("APPLICATION_BAN_REFUSED".into()),
+                    message: "Invalid Date".into(),
+                });
+            }
+            Ok(HookControl::Continue)
+        }
+        async fn before_create_session(
+            &self,
+            s: &mut CreateSession,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<HookControl> {
+            if s.impersonated_by.is_some() {
+                return Err(AuthError::Api {
+                    status: 500,
+                    code: Some("APPLICATION_SESSION_REFUSED".into()),
+                    message: "Invalid Date".into(),
+                });
+            }
+            Ok(HookControl::Continue)
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let setup = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(AdminPlugin::new().roles(roles()))
+        .build()
+        .await?;
+    let owner = signup(&setup, "date-callback-admin@example.test").await;
+    let target = signup(&setup, "date-callback-target@example.test").await;
+    let foreign = signup(&setup, "date-callback-foreign@example.test").await;
+    _ = promote(&setup, &owner, "admin").await;
+    let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::hook(B::store(Arc::new(config), &connection), Hooks))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(AdminPlugin::new().roles(roles()))
+        .build()
+        .await?;
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    for (route, data, status, code) in [
+        (
+            "/admin/ban-user",
+            json!({"userId":body(&target)["user"]["id"],"banExpiresIn":300.5}),
+            403,
+            "APPLICATION_BAN_REFUSED",
+        ),
+        (
+            "/admin/impersonate-user",
+            json!({"userId":body(&target)["user"]["id"]}),
+            500,
+            "APPLICATION_SESSION_REFUSED",
+        ),
+    ] {
+        let failed = call(&auth, request(route, Some(data), &cookies(&owner)), status).await;
+        assert_eq!(body(&failed), json!({"code":code,"message":"Invalid Date"}));
+        assert!(!failed.headers.contains_key("set-cookie"));
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    }
+    authenticated(&auth, &cookies(&owner), "date-callback-admin@example.test").await;
+    authenticated(
+        &auth,
+        &cookies(&target),
+        "date-callback-target@example.test",
+    )
+    .await;
+    authenticated(
+        &auth,
+        &cookies(&foreign),
+        "date-callback-foreign@example.test",
+    )
+    .await;
     B::close(connection).await
 }
