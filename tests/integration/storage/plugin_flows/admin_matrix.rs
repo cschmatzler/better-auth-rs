@@ -22,7 +22,8 @@ backend_tests!(
     create_only_role_cannot_select_explicit_or_nested_roles,
     admin_password_field_rejects_accompanying_profile_mutations,
     admin_colliding_email_rejects_accompanying_profile_mutations,
-    admin_update_ban_revokes_every_target_browser_and_preserves_foreign_sessions
+    admin_update_ban_revokes_every_target_browser_and_preserves_foreign_sessions,
+    admin_empty_update_authority_order
 );
 
 async fn promote<S: AuthSchema>(auth: &Alibi<S>, response: &AuthResponse, role: &str) -> String {
@@ -1347,5 +1348,55 @@ async fn admin_update_ban_revokes_every_target_browser_and_preserves_foreign_ses
     }
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     authenticated(&auth, &cookies(&admin), "admin@example.test").await;
+    B::close(connection).await
+}
+
+async fn admin_empty_update_authority_order<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(AdminPlugin::new().roles(roles()))
+        .build()
+        .await?;
+    let administrator = signup(&auth, "empty-update-admin@example.test").await;
+    _ = promote(&auth, &administrator, "admin").await;
+    let target = signup(&auth, "empty-update-target@example.test").await;
+    let id = body(&target)["user"]["id"].as_str().unwrap().to_owned();
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    for (cookie, status, code) in [
+        (cookies(&target), 403, "YOU_ARE_NOT_ALLOWED_TO_UPDATE_USERS"),
+        (cookies(&administrator), 400, "NO_DATA_TO_UPDATE"),
+    ] {
+        let response = call(
+            &auth,
+            request(
+                "/admin/update-user",
+                Some(json!({"userId":id,"data":{}})),
+                &cookie,
+            ),
+            status,
+        )
+        .await;
+        assert_eq!(body(&response)["code"], code);
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    }
+    let retry = call(
+        &auth,
+        request(
+            "/admin/update-user",
+            Some(json!({"userId":id,"data":{"name":"Valid retry"}})),
+            &cookies(&administrator),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&retry)["id"], id);
+    assert_eq!(body(&retry)["name"], "Valid retry");
+    assert_eq!(
+        db.text("SELECT name FROM users WHERE id=$1", &[&id])
+            .await?
+            .as_deref(),
+        Some("Valid retry")
+    );
+    authenticated(&auth, &cookies(&target), "empty-update-target@example.test").await;
     B::close(connection).await
 }
