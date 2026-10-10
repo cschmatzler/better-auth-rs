@@ -22,7 +22,8 @@ backend_tests!(
     static_org_update_requires_update_action_and_preserves_key_identity,
     static_org_delete_requires_delete_action_and_revokes_only_selected_key,
     disabled_custom_key_expiration_retains_default_lifetime_through_rename,
-    banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_authority
+    banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_authority,
+    api_key_installed_reference_principal
 );
 
 fn raw(path: &str, text: &str, cookie: &str) -> AuthRequest {
@@ -1893,5 +1894,89 @@ async fn banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_autho
     assert!(!orphan.headers.contains_key("set-cookie"));
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     authenticated(&auth, &cookies(&admin), "admin@example.test").await;
+    B::close(connection).await
+}
+
+async fn api_key_installed_reference_principal<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let plugin = ApiKeyPlugin::with_config(ApiKeyConfig {
+        enable_session_for_api_keys: true,
+        defer_updates: false,
+        rate_limit: RateLimitDefaults {
+            enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(plugin.clone())
+        .build()
+        .await?;
+    let owner = signup(&auth, "installed-owner@example.test").await;
+    let foreign = signup(&auth, "installed-foreign@example.test").await;
+    let created = Box::pin(auth.dispatch_endpoint(
+        ApiKeyPlugin::create_endpoint(&serde_json::from_value(
+            json!({"userId":body(&owner)["user"]["id"],"remaining":8}),
+        )?)?,
+        EndpointOptions::default(),
+    ))
+    .await?
+    .decode()?;
+    let protected = db.tables(&["users", "accounts", "sessions"]).await?;
+    for (index, reference) in [
+        body(&foreign)["user"]["id"].as_str().unwrap(),
+        "installed-missing-user",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        _ = db
+            .execute(
+                "UPDATE api_keys SET reference_id=$1 WHERE id=$2",
+                &[reference, &created.api_key.id],
+            )
+            .await?;
+        let checked = plugin
+            .verify_api_key(
+                &VerifyApiKey {
+                    key: &created.key,
+                    config_id: Some("default"),
+                    permissions: None,
+                },
+                auth.context(),
+            )
+            .await?;
+        assert_eq!(checked.reference_id, reference);
+        assert_eq!(checked.remaining, Some(if index == 0 { 7.0 } else { 5.0 }));
+        let mut input = request("/get-session", None, &cookies(&owner));
+        _ = input
+            .headers
+            .insert("x-api-key".into(), created.key.clone());
+        let response = call(&auth, input, if index == 0 { 200 } else { 401 }).await;
+        if index == 0 {
+            let current = body(&response);
+            assert_eq!(current["user"]["id"], reference);
+            assert_eq!(current["session"]["userId"], reference);
+            assert_eq!(current["session"]["id"], created.api_key.id);
+            assert_eq!(current["session"]["token"], created.key);
+        } else {
+            assert_eq!(body(&response)["code"], "INVALID_REFERENCE_ID_FROM_API_KEY");
+        }
+        assert_eq!(
+            db.text(
+                "SELECT CAST(remaining AS TEXT) FROM api_keys WHERE id=$1",
+                &[&created.api_key.id]
+            )
+            .await?
+            .as_deref(),
+            Some(if index == 0 { "6.0" } else { "4.0" })
+        );
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions"]).await?,
+            protected
+        );
+    }
+    authenticated(&auth, &cookies(&owner), "installed-owner@example.test").await;
+    authenticated(&auth, &cookies(&foreign), "installed-foreign@example.test").await;
     B::close(connection).await
 }
