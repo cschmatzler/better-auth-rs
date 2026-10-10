@@ -19,7 +19,8 @@ backend_tests!(
     callback_protocol_outcomes,
     sign_in_policies,
     valid_form_post_preserves_issued_state_and_escaped_query_until_get,
-    different_email_opt_in_links_unlinks_and_relinks_original_owner
+    different_email_opt_in_links_unlinks_and_relinks_original_owner,
+    disabled_implicit_linking_preserves_explicit_and_returning_account_authority
 );
 
 #[derive(Clone)]
@@ -809,5 +810,123 @@ async fn different_email_opt_in_links_unlinks_and_relinks_original_owner<B: Back
         assert_eq!(db.tables(&["users", "sessions"]).await?, before);
     }
     authenticated(&auth, &cookies(&foreign), "local-link-foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn disabled_implicit_linking_preserves_explicit_and_returning_account_authority<
+    B: Backend,
+>(
+    db: Db,
+) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let social = Social::start().await;
+    let cfg = AuthConfig::new(SECRET)
+        .base_url(ORIGIN)
+        .account(linking(|config| config.disable_implicit_linking = true));
+    let auth = AuthBuilder::new(cfg.clone())
+        .store(B::store(Arc::new(cfg), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(OAuthPlugin::new().add_provider("google", social.google(|_| {})))
+        .build()
+        .await?;
+    let owner = signup(&auth, "explicit-owner@example.test").await;
+    let owner_id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+    _ = db
+        .execute(
+            "UPDATE users SET email_verified=1 WHERE id=$1",
+            &[&owner_id],
+        )
+        .await?;
+    social
+        .profile
+        .set("explicit-subject", "explicit-owner@example.test", true);
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    let (state, cookie) = authorize(
+        &auth,
+        "/sign-in/social",
+        json!({"provider":"google","callbackURL":"/home"}),
+        "",
+    )
+    .await;
+    let denied = callback(&auth, &[("code", "grant"), ("state", &state)], &cookie).await;
+    assert_eq!(denied.status, 302);
+    assert_eq!(
+        url::Url::parse(ORIGIN)?
+            .join(denied.headers.get("location").unwrap())?
+            .query_pairs()
+            .find(|(key, _)| key == "error")
+            .unwrap()
+            .1,
+        "account_not_linked"
+    );
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    let (state, cookie) = authorize(
+        &auth,
+        "/link-social",
+        json!({"provider":"google","callbackURL":"/settings"}),
+        &cookies(&owner),
+    )
+    .await;
+    let linked = callback(&auth, &[("code", "grant"), ("state", &state)], &cookie).await;
+    assert_eq!(linked.status, 302);
+    assert_eq!(
+        url::Url::parse(ORIGIN)?
+            .join(linked.headers.get("location").unwrap())?
+            .path(),
+        "/settings"
+    );
+    assert_eq!(db.count("users").await?, 1);
+    assert_eq!(db.count("sessions").await?, 1);
+    assert_eq!(db.count("accounts").await?, 2);
+    assert_eq!(
+        db.text(
+            "SELECT user_id FROM accounts WHERE provider_id='google'",
+            &[]
+        )
+        .await?
+        .as_deref(),
+        Some(owner_id.as_str())
+    );
+    let stable_accounts = |rows: String| -> serde_json::Result<Vec<Value>> {
+        let mut rows = serde_json::from_str::<Vec<Value>>(&rows)?;
+        for row in &mut rows {
+            let row = row.as_object_mut().unwrap();
+            _ = row.remove("updated_at");
+            _ = row.remove("access_token_expires_at");
+        }
+        Ok(rows)
+    };
+    let accounts = stable_accounts(db.table("accounts").await?)?;
+    let (state, cookie) = authorize(
+        &auth,
+        "/sign-in/social",
+        json!({"provider":"google","callbackURL":"/home"}),
+        "",
+    )
+    .await;
+    let returning = callback(&auth, &[("code", "grant"), ("state", &state)], &cookie).await;
+    assert_eq!(returning.status, 302);
+    assert_eq!(
+        url::Url::parse(ORIGIN)?
+            .join(returning.headers.get("location").unwrap())?
+            .path(),
+        "/home"
+    );
+    let current = body(
+        &call(
+            &auth,
+            request("/get-session", None, &cookies(&returning)),
+            200,
+        )
+        .await,
+    );
+    assert_eq!(current["user"]["id"], owner_id);
+    assert_eq!(stable_accounts(db.table("accounts").await?)?, accounts);
+    assert_eq!(db.count("users").await?, 1);
+    assert_eq!(db.count("sessions").await?, 2);
+    assert_eq!(db.count("verifications").await?, 0);
+    authenticated(&auth, &cookies(&owner), "explicit-owner@example.test").await;
     B::close(connection).await
 }
