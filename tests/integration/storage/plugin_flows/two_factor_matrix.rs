@@ -28,7 +28,8 @@ backend_tests!(
     two_factor_authenticated_totp_failed_rotation_retry,
     two_factor_expired_pending_factor_stage_policy,
     two_factor_configured_proof_cookie_lifetimes,
-    two_factor_trust_syntax_before_cleanup
+    two_factor_trust_syntax_before_cleanup,
+    two_factor_trust_lookup_cleanup_policy
 );
 
 #[derive(Default)]
@@ -2464,4 +2465,118 @@ async fn two_factor_trust_syntax_before_cleanup<B: Backend>(db: Db) -> TestResul
         0
     );
     B::close(connection).await
+}
+
+async fn two_factor_trust_lookup_cleanup_policy<B: Backend>(db: Db) -> TestResult {
+    for disabled in [false, true] {
+        for expired in [false, true] {
+            let db = db.fresh().await?;
+            let (connection, _) = db.migrated::<B>(SECRET).await?;
+            let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+            config.verification.disable_cleanup = disabled;
+            let auth = AuthBuilder::new(config.clone())
+                .store(B::store(Arc::new(config), &connection))
+                .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+                .plugin(super::auth_probe::fast_password())
+                .plugin(TwoFactorPlugin::with_config(TwoFactorConfig {
+                    skip_verification_on_enable: true,
+                    ..Default::default()
+                }))
+                .build()
+                .await?;
+            let signed = signup(&auth, "lookup@example.test").await;
+            let id = body(&signed)["user"]["id"].as_str().unwrap().to_owned();
+            let (totp, _, _) = enroll(&auth, &cookies(&signed)).await;
+            let pending = sign_in(&auth, "lookup@example.test", json!({}), "").await;
+            let done = call(
+                &auth,
+                request(
+                    "/two-factor/verify-totp",
+                    Some(json!({"code":totp.generate_current().to_string(),"trustDevice":true})),
+                    &cookies(&pending),
+                ),
+                200,
+            )
+            .await;
+            let real = cookies(&done)
+                .split("; ")
+                .find(|x| x.starts_with("better-auth.trust_device="))
+                .unwrap()
+                .to_owned();
+            let key = db
+                .text(
+                    "SELECT identifier FROM verifications WHERE identifier LIKE 'trust-device-%'",
+                    &[],
+                )
+                .await?
+                .unwrap();
+            if expired {
+                db.set_timestamp(
+                    "verifications",
+                    "expires_at",
+                    ("identifier", &key),
+                    "2020-01-01T00:00:00Z".parse()?,
+                )
+                .await?;
+            } else {
+                _ = db
+                    .execute(
+                        "UPDATE verifications SET value='changed-trust-owner' WHERE identifier=$1",
+                        &[&key],
+                    )
+                    .await?;
+            }
+            let _ = auth
+                .store()
+                .create_verification(alibi::CreateVerification {
+                    identifier: "unrelated-expired-lookup".into(),
+                    value: id.clone(),
+                    expires_at: chrono::Utc::now() - chrono::Duration::days(1),
+                })
+                .await?;
+            let before = db
+                .tables(&["two_factor", "users", "accounts", "sessions"])
+                .await?;
+            let rejected = sign_in(&auth, "lookup@example.test", json!({}), &real).await;
+            assert_eq!(body(&rejected)["twoFactorRedirect"], true);
+            assert_eq!(
+                db.tables(&["two_factor", "users", "accounts", "sessions"])
+                    .await?,
+                before
+            );
+            assert_eq!(db.count_where("SELECT COUNT(*) FROM verifications WHERE identifier='unrelated-expired-lookup'",&[]).await?,i64::from(disabled));
+            assert_eq!(
+                db.count_where(
+                    "SELECT COUNT(*) FROM verifications WHERE identifier=$1",
+                    &[&key]
+                )
+                .await?,
+                i64::from(disabled || !expired)
+            );
+            if !expired {
+                assert_eq!(
+                    db.text(
+                        "SELECT value FROM verifications WHERE identifier=$1",
+                        &[&key]
+                    )
+                    .await?
+                    .as_deref(),
+                    Some("changed-trust-owner")
+                );
+            }
+            let recovered = call(
+                &auth,
+                request(
+                    "/two-factor/verify-totp",
+                    Some(json!({"code":totp.generate_current().to_string()})),
+                    &cookies(&rejected),
+                ),
+                200,
+            )
+            .await;
+            authenticated(&auth, &cookies(&recovered), "lookup@example.test").await;
+            B::close(connection).await?;
+        }
+    }
+    Ok(())
 }
