@@ -4,7 +4,10 @@ use super::*;
 use alibi::plugins::phone_number::{PhoneNumberConfig, PhoneNumberPlugin};
 use alibi::plugins::{AdminPlugin, AnonymousPlugin, LastLoginMethodPlugin, TwoFactorPlugin};
 
-backend_tests!(duplicate_signup_preserves_identity_and_filters_synthetic_output);
+backend_tests!(
+    duplicate_signup_preserves_identity_and_filters_synthetic_output,
+    signup_privacy_never_synthesizes_creation_cancellation_or_ordinary_error
+);
 postgres_tests!(duplicate_signup_preserves_identity_and_filters_synthetic_output);
 
 async fn duplicate_signup_preserves_identity_and_filters_synthetic_output<B: Backend>(
@@ -162,5 +165,88 @@ async fn duplicate_signup_preserves_identity_and_filters_synthetic_output<B: Bac
         }
     }
     authenticated(&original_auth, &cookies(&owner), "duplicate@example.test").await;
+    B::close(connection).await
+}
+
+async fn signup_privacy_never_synthesizes_creation_cancellation_or_ordinary_error<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::store::{DatabaseHookContext, DatabaseHooks, HookBackend, HookControl};
+    use alibi::{AuthError, AuthResult, PasswordHasher};
+    struct Crypto(Arc<Mutex<Vec<&'static str>>>);
+    #[async_trait::async_trait]
+    impl PasswordHasher for Crypto {
+        async fn hash(&self, p: &str) -> AuthResult<String> {
+            self.0.lock().unwrap().push("hash");
+            super::auth_probe::FastHasher.hash(p).await
+        }
+        async fn verify(&self, h: &str, p: &str) -> AuthResult<bool> {
+            super::auth_probe::FastHasher.verify(h, p).await
+        }
+    }
+    struct Hook {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        cancel: bool,
+    }
+    #[async_trait::async_trait]
+    impl<S: AuthSchema, H: HookBackend> DatabaseHooks<S, H> for Hook {
+        async fn before_create_user(
+            &self,
+            _: &mut alibi::CreateUser,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<HookControl> {
+            self.events.lock().unwrap().push("hook");
+            if self.cancel {
+                Ok(HookControl::Cancel)
+            } else {
+                Err(AuthError::CallbackFailure(Box::new(AuthError::internal(
+                    "actual creation policy outage",
+                ))))
+            }
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let setup = super::auth_probe::fast_builder::<B>(&connection)
+        .build()
+        .await?;
+    let owner = signup(&setup, "creation-existing@example.test").await;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "verifications"])
+        .await?;
+    for generic in [false, true] {
+        for cancel in [false, true] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+            let plugin = EmailPasswordPlugin::new()
+                .password_hasher(Arc::new(Crypto(events.clone())))
+                .auto_sign_in(!generic)
+                .custom_synthetic_user(Arc::new(|_| {
+                    panic!("new creation failures must not become synthetic duplicates")
+                }));
+            let auth = AuthBuilder::new(config.clone())
+                .store(B::hook(
+                    B::store(Arc::new(config), &connection),
+                    Hook {
+                        events: events.clone(),
+                        cancel,
+                    },
+                ))
+                .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+                .plugin(plugin)
+                .plugin(SessionManagementPlugin::new())
+                .build()
+                .await?;
+            let denied=call(&auth,request("/sign-up/email",Some(json!({"email":"creation-new@example.test","password":PASSWORD,"name":"New identity"})),""),if cancel{400}else{422}).await;
+            assert_eq!(body(&denied)["code"], "FAILED_TO_CREATE_USER");
+            assert!(!denied.headers.contains_key("set-cookie"));
+            assert_eq!(*events.lock().unwrap(), ["hash", "hook"]);
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions", "verifications"])
+                    .await?,
+                before
+            );
+        }
+    }
+    authenticated(&setup, &cookies(&owner), "creation-existing@example.test").await;
     B::close(connection).await
 }
