@@ -4,7 +4,10 @@ use super::*;
 use alibi::plugins::phone_number::{PhoneNumberConfig, PhoneNumberPlugin};
 use alibi::plugins::{AdminPlugin, AnonymousPlugin, LastLoginMethodPlugin, TwoFactorPlugin};
 
-backend_tests!(duplicate_signup_preserves_identity_and_filters_synthetic_output);
+backend_tests!(
+    duplicate_signup_preserves_identity_and_filters_synthetic_output,
+    synthetic_callback_failures_keep_public_error_boundary_and_principals
+);
 postgres_tests!(duplicate_signup_preserves_identity_and_filters_synthetic_output);
 
 async fn duplicate_signup_preserves_identity_and_filters_synthetic_output<B: Backend>(
@@ -162,5 +165,97 @@ async fn duplicate_signup_preserves_identity_and_filters_synthetic_output<B: Bac
         }
     }
     authenticated(&original_auth, &cookies(&owner), "duplicate@example.test").await;
+    B::close(connection).await
+}
+
+async fn synthetic_callback_failures_keep_public_error_boundary_and_principals<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::{AuthError, AuthResult, PasswordHasher};
+    struct Crypto(Arc<Mutex<Vec<&'static str>>>);
+    #[async_trait::async_trait]
+    impl PasswordHasher for Crypto {
+        async fn hash(&self, p: &str) -> AuthResult<String> {
+            self.0.lock().unwrap().push("hash");
+            super::auth_probe::FastHasher.hash(p).await
+        }
+        async fn verify(&self, h: &str, p: &str) -> AuthResult<bool> {
+            super::auth_probe::FastHasher.verify(h, p).await
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let setup = super::auth_probe::fast_builder::<B>(&connection)
+        .build()
+        .await?;
+    let owner = signup(&setup, "synthetic-error-owner@example.test").await;
+    let foreign = signup(&setup, "synthetic-error-foreign@example.test").await;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "verifications"])
+        .await?;
+    for api in [false, true] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let notification = events.clone();
+        let customization = events.clone();
+        let plugin = EmailPasswordPlugin::new()
+            .password_hasher(Arc::new(Crypto(events.clone())))
+            .auto_sign_in(false)
+            .on_existing_user_signup(Arc::new(move |_, _| {
+                let events = notification.clone();
+                Box::pin(async move {
+                    events.lock().unwrap().push("existing");
+                    Ok(())
+                })
+            }))
+            .custom_synthetic_user(Arc::new(move |c| {
+                assert_eq!(c.core_fields["name"], "Submitted");
+                assert_eq!(c.core_fields["email"], "synthetic-error-owner@example.test");
+                customization.lock().unwrap().push("synthetic");
+                if api {
+                    Err(AuthError::Api {
+                        status: 403,
+                        code: Some("SYNTHETIC_REJECTED".into()),
+                        message: "Configured synthetic-user rejected".into(),
+                    })
+                } else {
+                    Err(AuthError::internal("Actual synthetic-user callback failed"))
+                }
+            }));
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(plugin)
+            .plugin(SessionManagementPlugin::new())
+            .build()
+            .await?;
+        let response=call(&auth,request("/sign-up/email",Some(json!({"email":"synthetic-error-owner@example.test","password":PASSWORD,"name":"Submitted"})),""),if api{403}else{500}).await;
+        if api {
+            assert_eq!(
+                body(&response),
+                json!({"code":"SYNTHETIC_REJECTED","message":"Configured synthetic-user rejected"})
+            );
+        } else {
+            assert!(response.body.is_empty());
+        }
+        assert!(!response.headers.contains_key("set-cookie"));
+        assert_eq!(*events.lock().unwrap(), ["hash", "existing", "synthetic"]);
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+    }
+    authenticated(
+        &setup,
+        &cookies(&owner),
+        "synthetic-error-owner@example.test",
+    )
+    .await;
+    authenticated(
+        &setup,
+        &cookies(&foreign),
+        "synthetic-error-foreign@example.test",
+    )
+    .await;
     B::close(connection).await
 }
