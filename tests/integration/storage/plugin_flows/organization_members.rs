@@ -36,7 +36,8 @@ backend_tests!(
     organization_member_role_guest_validation,
     organization_legacy_role_read_without_ac,
     organization_legacy_role_loader_after_warm_cache,
-    organization_selected_role_permission_page
+    organization_selected_role_permission_page,
+    organization_duplicate_role_omitted_permission_bytes
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -2876,6 +2877,119 @@ async fn organization_selected_role_permission_page<B: Backend>(db: Db) -> TestR
         db.tables(&["users", "accounts", "sessions", "organization", "member"])
             .await?,
         protected
+    );
+    B::close(connection).await
+}
+
+async fn organization_duplicate_role_omitted_permission_bytes<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            access_control: Some(default_organization_statements()),
+            dynamic_access_control: DynamicAccessControlConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let mut owner = account(&auth, "duplicate-role-owner@example.test").await;
+    let mut foreign = account(&auth, "duplicate-role-foreign@example.test").await;
+    let org = organization(&auth, &mut owner, "omitted-own").await;
+    let other = organization(&auth, &mut foreign, "omitted-other").await;
+    let literals = [
+        "{ \"team\" : [\"create\", \"create\"], \"member\" : [\"update\"] }",
+        "{ \"member\" : [\"update\"], \"team\" : [\"delete\"] }",
+        "{ \"team\" : [\"create\"] }",
+    ];
+    let mut ids = Vec::new();
+    for (i, org_id) in [&org, &org, &other].into_iter().enumerate() {
+        let role = auth
+            .store()
+            .create_organization_role(alibi::types::CreateOrganizationRole {
+                organization_id: org_id.clone(),
+                role: "legacy-editor".into(),
+                permission: Default::default(),
+            })
+            .await?;
+        _ = db
+            .execute(
+                "UPDATE organization_role SET permission=$1 WHERE id=$2",
+                &[literals[i], &role.id],
+            )
+            .await?;
+        ids.push(role.id);
+    }
+    let before = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    let foreign_before=db.text("SELECT CAST(json_object('id',id,'role',role,'permission',permission,'updatedAt',updated_at) AS TEXT) FROM organization_role WHERE id=$1", &[&ids[2]]).await?;
+    for data in [json!({}), json!({"roleName":"Renamed-Editor"})] {
+        let response = call(
+            &auth,
+            request(
+                "/organization/update-role",
+                Some(json!({"organizationId":org,"roleName":"legacy-editor","data":data})),
+                &owner.cookie,
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(body(&response)["roleData"]["id"], ids[0]);
+        assert_eq!(
+            body(&response)["roleData"]["permission"],
+            serde_json::from_str::<Value>(literals[0])?
+        );
+        for (i, id) in ids[..2].iter().enumerate() {
+            assert_eq!(
+                db.text(
+                    "SELECT permission FROM organization_role WHERE id=$1",
+                    &[id]
+                )
+                .await?
+                .as_deref(),
+                Some(literals[i])
+            );
+            assert_eq!(
+                db.text("SELECT role FROM organization_role WHERE id=$1", &[id])
+                    .await?
+                    .as_deref(),
+                Some(if data.get("roleName").is_some() {
+                    "renamed-editor"
+                } else {
+                    "legacy-editor"
+                })
+            );
+            assert!(
+                db.text(
+                    "SELECT updated_at FROM organization_role WHERE id=$1",
+                    &[id]
+                )
+                .await?
+                .is_some()
+            );
+        }
+    }
+    let updated=call(&auth,request("/organization/update-role",Some(json!({"organizationId":org,"roleId":ids[0],"data":{"permission":{"team":["update"]}}})),&owner.cookie),200).await;
+    assert_eq!(
+        body(&updated)["roleData"]["permission"],
+        json!({"team":["update"]})
+    );
+    assert_eq!(
+        db.text(
+            "SELECT permission FROM organization_role WHERE id=$1",
+            &[&ids[1]]
+        )
+        .await?
+        .as_deref(),
+        Some(literals[1])
+    );
+    assert_eq!(db.text("SELECT CAST(json_object('id',id,'role',role,'permission',permission,'updatedAt',updated_at) AS TEXT) FROM organization_role WHERE id=$1", &[&ids[2]]).await?,foreign_before);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?,
+        before
     );
     B::close(connection).await
 }
