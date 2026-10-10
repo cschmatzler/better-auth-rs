@@ -16,7 +16,8 @@ backend_tests!(
     multi_session_raw_capacity_controls_proofs_without_evicting_durable_sessions,
     multi_session_repeated_genuine_proofs_retire_before_fractional_capacity,
     multi_session_without_database_preserves_order_fallback_and_cache_replay_limits,
-    parallel_sibling_revocation_retains_owned_deletes_after_rejection
+    parallel_sibling_revocation_retains_owned_deletes_after_rejection,
+    bearer_browser_header_precedence
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -869,5 +870,84 @@ async fn parallel_sibling_revocation_retains_owned_deletes_after_rejection<B: Ba
     authenticated(&auth, &siblings[1].1, "parallel-owner@example.test").await;
     authenticated(&auth, &cookies(&owner), "parallel-owner@example.test").await;
     authenticated(&auth, &cookies(&foreign), "parallel-foreign@example.test").await;
+    Ok(())
+}
+
+async fn bearer_browser_header_precedence<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::bearer::BearerConfig;
+    for signature_required in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(BearerPlugin::with_config(BearerConfig {
+                require_signature: signature_required,
+            }))
+            .build()
+            .await?;
+        let owner = signup(&auth, "header-owner@example.test").await;
+        let foreign = signup(&auth, "header-foreign@example.test").await;
+        let jar = cookies(&foreign);
+        let own = cookies(&owner);
+        let encoded = own
+            .split("; ")
+            .find_map(|v| v.strip_prefix("better-auth.session_token="))
+            .unwrap();
+        let query = format!("v={encoded}");
+        let signed = url::form_urlencoded::parse(query.as_bytes())
+            .next()
+            .unwrap()
+            .1
+            .into_owned();
+        let before = db.tables(&["users", "accounts", "sessions"]).await?;
+        for route in ["/get-session", "/list-sessions"] {
+            let mut input = request(route, None, &jar);
+            _ = input
+                .headers
+                .insert("authorization".into(), format!("Bearer {signed}"));
+            let response = call(&auth, input, 200).await;
+            if route == "/get-session" {
+                assert_eq!(body(&response)["user"]["id"], body(&owner)["user"]["id"]);
+                assert_eq!(body(&response)["session"]["token"], body(&owner)["token"]);
+            } else {
+                let records = body(&response);
+                let sessions = records.as_array().unwrap();
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(sessions[0]["userId"], body(&owner)["user"]["id"]);
+                assert_eq!(sessions[0]["token"], body(&owner)["token"]);
+            }
+        }
+        let mut rejected = request("/get-session", None, &jar);
+        _ = rejected.headers.insert(
+            "authorization".into(),
+            format!("Bearer {}.invalid", body(&owner)["token"].as_str().unwrap()),
+        );
+        let fallback = call(&auth, rejected, 200).await;
+        assert_eq!(body(&fallback)["user"]["id"], body(&foreign)["user"]["id"]);
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+        let mut logout = request("/sign-out", Some(json!({})), &jar);
+        _ = logout
+            .headers
+            .insert("authorization".into(), format!("Bearer {signed}"));
+        _ = call(&auth, logout, 200).await;
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM sessions WHERE token=$1",
+                &[body(&owner)["token"].as_str().unwrap()]
+            )
+            .await?,
+            0
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM sessions WHERE token=$1",
+                &[body(&foreign)["token"].as_str().unwrap()]
+            )
+            .await?,
+            1
+        );
+        assert_eq!(db.tables(&["users", "accounts"]).await?, before[..2]);
+        authenticated(&auth, &jar, "header-foreign@example.test").await;
+        B::close(connection).await?;
+    }
     Ok(())
 }
