@@ -24,7 +24,8 @@ backend_tests!(
     last_login_tracks_social_callbacks,
     last_login_resolver_receives_transformed_numbers_and_original_http_bytes,
     last_login_tracking_update_failure_is_best_effort_for_authentication,
-    last_login_configured_tracking_cookie_receipt
+    last_login_configured_tracking_cookie_receipt,
+    last_login_consent_original_issuance_snapshot
 );
 
 const COOKIE: &str = "better-auth.last_used_login_method";
@@ -611,4 +612,144 @@ async fn last_login_configured_tracking_cookie_receipt<B: Backend>(db: Db) -> Te
         B::close(connection).await?;
     }
     Ok(())
+}
+
+async fn last_login_consent_original_issuance_snapshot<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::last_login_method::BeforeStoreLastLoginMethodCookie;
+    struct Transform;
+    #[async_trait::async_trait]
+    impl<S: AuthSchema> alibi::AuthPlugin<S> for Transform {
+        async fn on_request(
+            &self,
+            _: &AuthRequest,
+            _: &alibi::AuthContext<S>,
+        ) -> AuthResult<Option<AuthResponse>> {
+            Ok(None)
+        }
+        fn name(&self) -> &'static str {
+            "application-tracking-transform"
+        }
+        fn routes(&self) -> Vec<alibi::AuthRoute> {
+            Vec::new()
+        }
+        async fn on_init(&self, c: &mut alibi::AuthInitContext<S>) -> AuthResult<()> {
+            c.register_user_update_transform(|_, mut u| {
+                if let Some(value) = u.last_login_method {
+                    u.last_login_method = Some(value.map(|m| format!("stored:{m}")));
+                }
+                Ok(u)
+            });
+            Ok(())
+        }
+    }
+    struct Consent(Mutex<Vec<(Value, Value, String)>>);
+    #[async_trait::async_trait]
+    impl BeforeStoreLastLoginMethodCookie for Consent {
+        async fn before_store(&self, c: &LastLoginMethodContext, method: &str) -> AuthResult<bool> {
+            let s = c
+                .new_session
+                .as_ref()
+                .expect("real completed authentication");
+            assert_eq!(s.session.user_id, s.user.id);
+            self.0.lock().unwrap().push((
+                serde_json::to_value(&s.user)?,
+                serde_json::to_value(&s.session)?,
+                method.into(),
+            ));
+            Ok(true)
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let consent = Arc::new(Consent(Mutex::new(Vec::new())));
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(Transform)
+        .plugin(LastLoginMethodPlugin::with_config(LastLoginMethodConfig {
+            store_in_database: true,
+            before_store_cookie: Some(consent.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let owner = signup(&auth, "snapshot-tracking-owner@example.test").await;
+    let foreign = signup(&auth, "snapshot-tracking-foreign@example.test").await;
+    let foreign_id = body(&foreign)["user"]["id"].as_str().unwrap().to_owned();
+    _ = db
+        .execute(
+            "UPDATE users SET last_login_method='prior-owned-method' WHERE id=$1",
+            &[body(&owner)["user"]["id"].as_str().unwrap()],
+        )
+        .await?;
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    consent.0.lock().unwrap().clear();
+    let signed = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"snapshot-tracking-owner@example.test","password":PASSWORD})),
+            &cookies(&foreign),
+        ),
+        200,
+    )
+    .await;
+    let seen = consent.0.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, body(&signed)["user"]);
+    assert_eq!(seen[0].1["token"], body(&signed)["token"]);
+    assert_eq!(seen[0].2, "email");
+    assert_eq!(seen[0].0["lastLoginMethod"], "prior-owned-method");
+    assert_eq!(
+        db.text(
+            "SELECT last_login_method FROM users WHERE id=$1",
+            &[body(&owner)["user"]["id"].as_str().unwrap()]
+        )
+        .await?
+        .as_deref(),
+        Some("stored:email")
+    );
+    assert_eq!(
+        tracked(&signed).as_deref(),
+        Some("better-auth.last_used_login_method=email")
+    );
+    authenticated(
+        &auth,
+        &cookies(&signed),
+        "snapshot-tracking-owner@example.test",
+    )
+    .await;
+    let after = db.tables(&["users", "accounts", "sessions"]).await?;
+    for index in 0..3 {
+        let old: Vec<Value> = serde_json::from_str(&before[index])?;
+        let current: Vec<Value> = serde_json::from_str(&after[index])?;
+        let key = if index == 0 { "id" } else { "user_id" };
+        assert_eq!(
+            current
+                .into_iter()
+                .filter(|r| r[key] == foreign_id)
+                .collect::<Vec<_>>(),
+            old.into_iter()
+                .filter(|r| r[key] == foreign_id)
+                .collect::<Vec<_>>()
+        );
+    }
+    let count = consent.0.lock().unwrap().len();
+    _ = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(
+                json!({"email":"snapshot-tracking-owner@example.test","password":"wrong-password"}),
+            ),
+            "",
+        ),
+        401,
+    )
+    .await;
+    assert_eq!(consent.0.lock().unwrap().len(), count);
+    authenticated(
+        &auth,
+        &cookies(&foreign),
+        "snapshot-tracking-foreign@example.test",
+    )
+    .await;
+    B::close(connection).await
 }
