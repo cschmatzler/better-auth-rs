@@ -20,7 +20,8 @@ backend_tests!(
     organization_plugin_helpers,
     organization_trusted_addition_preserves_literal_role_arrays_and_session_scope,
     fractional_organization_membership_limit_uses_actual_physical_count,
-    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results
+    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results,
+    organization_raw_role_count_quota
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -892,4 +893,81 @@ async fn organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_r
     assert_eq!(policy.seen.lock().unwrap().len(), count);
     assert_eq!(db.count("member").await?, 2);
     B::close(connection).await
+}
+
+async fn organization_raw_role_count_quota<B: Backend>(db: Db) -> TestResult {
+    #[derive(Debug)]
+    struct Policy {
+        maximum: Option<f64>,
+        calls: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl OrganizationLimitResolver for Policy {
+        async fn maximum_roles(&self, org: &str) -> AuthResult<Option<f64>> {
+            self.calls.lock().unwrap().push(org.into());
+            Ok(self.maximum)
+        }
+    }
+    for resolved in [false, true] {
+        for (maximum, allowed) in [
+            (Some(0.0), 0),
+            (Some(f64::NAN), 3),
+            (Some(1.5), 2),
+            (Some(-1.0), 0),
+            (Some(f64::NEG_INFINITY), 0),
+            (Some(f64::INFINITY), 3),
+            (None, 3),
+        ] {
+            let db = db.fresh().await?;
+            let (connection, _) = db.migrated::<B>(SECRET).await?;
+            let policy = Arc::new(Policy {
+                maximum,
+                calls: Mutex::new(Vec::new()),
+            });
+            let auth = super::auth_probe::fast_builder::<B>(&connection)
+                .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                    access_control: Some(default_organization_statements()),
+                    dynamic_access_control: DynamicAccessControlConfig {
+                        enabled: true,
+                        maximum_roles_per_organization: maximum,
+                        limit_resolver: resolved
+                            .then(|| policy.clone() as Arc<dyn OrganizationLimitResolver>),
+                    },
+                    ..Default::default()
+                }))
+                .build()
+                .await?;
+            let mut owner = account(&auth, "raw-role-owner@example.test").await;
+            let org = organization(&auth, &mut owner, "raw-role").await;
+            let protected = db
+                .tables(&["users", "accounts", "sessions", "organization", "member"])
+                .await?;
+            for index in 0..3 {
+                let accepted = index < allowed;
+                let response=call(&auth,request("/organization/create-role",Some(json!({"organizationId":org,"role":format!("quota-role-{index}"),"permission":{}})),&owner.cookie),if accepted {200} else {400}).await;
+                if accepted {
+                    assert_eq!(body(&response)["roleData"]["organizationId"], org);
+                } else {
+                    assert_eq!(body(&response)["code"], "TOO_MANY_ROLES");
+                }
+                assert_eq!(
+                    db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                        .await?,
+                    protected
+                );
+            }
+            assert_eq!(
+                policy.calls.lock().unwrap().as_slice(),
+                if resolved {
+                    vec![org.clone(), org.clone(), org.clone()]
+                } else {
+                    vec![]
+                }
+                .as_slice()
+            );
+            assert_eq!(db.count("organization_role").await?, allowed);
+            B::close(connection).await?;
+        }
+    }
+    Ok(())
 }
