@@ -14,7 +14,8 @@ backend_tests!(
     two_factor_forged_trust_proofs,
     two_factor_otp_budget_and_session_choices,
     two_factor_numeric_options_and_damaged_factor,
-    two_factor_otp_resends_are_consumed_once_across_real_requests
+    two_factor_otp_resends_are_consumed_once_across_real_requests,
+    two_factor_trust_ignored_components
 );
 
 #[derive(Default)]
@@ -756,5 +757,115 @@ async fn two_factor_otp_resends_are_consumed_once_across_real_requests<B: Backen
     );
     authenticated(&auth, &cookie, "owner@example.test").await;
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn two_factor_trust_ignored_components<B: Backend>(db: Db) -> TestResult {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use hkdf::hmac::{Hmac, KeyInit, Mac};
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(TwoFactorPlugin::with_config(TwoFactorConfig {
+            skip_verification_on_enable: true,
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let signed = signup(&auth, "components@example.test").await;
+    let id = body(&signed)["user"]["id"].as_str().unwrap().to_owned();
+    let (totp, _, _) = enroll(&auth, &cookies(&signed)).await;
+    let pending = sign_in(&auth, "components@example.test", json!({}), "").await;
+    let done = call(
+        &auth,
+        request(
+            "/two-factor/verify-totp",
+            Some(json!({"code":totp.generate_current().to_string(),"trustDevice":true})),
+            &cookies(&pending),
+        ),
+        200,
+    )
+    .await;
+    let jar = cookies(&done);
+    let encoded = jar
+        .split("; ")
+        .find_map(|x| x.strip_prefix("better-auth.trust_device="))
+        .unwrap();
+    let decoded = url::form_urlencoded::parse(format!("v={encoded}").as_bytes())
+        .next()
+        .unwrap()
+        .1
+        .into_owned();
+    let payload = decoded.rsplit_once('.').unwrap().0;
+    let key = payload.split('!').nth(1).unwrap();
+    let preceding = sign_in(&auth, "components@example.test", json!({}), "").await;
+    let pending_key=db.text("SELECT identifier FROM verifications WHERE value=$1 AND identifier LIKE '2fa-%' AND identifier NOT LIKE '2fa-attempts-%'",&[&id]).await?.unwrap();
+    let extended = format!("{payload}!ignored!components");
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(SECRET.as_bytes())?;
+    mac.update(extended.as_bytes());
+    let wire = url::form_urlencoded::byte_serialize(
+        format!(
+            "{extended}.{}",
+            STANDARD.encode(mac.finalize().into_bytes())
+        )
+        .as_bytes(),
+    )
+    .collect::<String>();
+    let pair = format!("better-auth.trust_device={wire}");
+    let rotated = sign_in(&auth, "components@example.test", json!({}), &pair).await;
+    assert_eq!(body(&rotated)["user"]["id"], id);
+    authenticated(&auth, &cookies(&rotated), "components@example.test").await;
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM verifications WHERE identifier=$1",
+            &[key]
+        )
+        .await?,
+        0
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM verifications WHERE identifier LIKE 'trust-device-%'",
+            &[]
+        )
+        .await?,
+        1
+    );
+    let next = db
+        .text(
+            "SELECT identifier FROM verifications WHERE identifier LIKE 'trust-device-%'",
+            &[],
+        )
+        .await?
+        .unwrap();
+    assert_ne!(next, key);
+    let replay = sign_in(&auth, "components@example.test", json!({}), &pair).await;
+    assert_eq!(body(&replay)["twoFactorRedirect"], true);
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM verifications WHERE identifier=$1 AND value=$2",
+            &[&next, &id]
+        )
+        .await?,
+        1
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM verifications WHERE identifier=$1 AND value=$2",
+            &[&pending_key, &id]
+        )
+        .await?,
+        1
+    );
+    let retained = call(
+        &auth,
+        request(
+            "/two-factor/verify-totp",
+            Some(json!({"code":totp.generate_current().to_string()})),
+            &cookies(&preceding),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&retained)["user"]["id"], id);
     B::close(connection).await
 }
