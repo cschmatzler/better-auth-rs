@@ -9,7 +9,8 @@ backend_tests!(
     organization_route_matrix,
     organization_without_teams_or_deletion,
     organization_mixed_selectors_only_update_current_token_selection,
-    organization_selection_returns_stored_metadata_text_without_rewriting_rows
+    organization_selection_returns_stored_metadata_text_without_rewriting_rows,
+    organization_empty_update_storage_error
 );
 
 fn get(path: &str, query: &[(&str, &str)], cookie: &str) -> AuthRequest {
@@ -584,5 +585,124 @@ async fn organization_selection_returns_stored_metadata_text_without_rewriting_r
         serde_json::from_str::<Value>(selected["metadata"].as_str().unwrap())?,
         json!({"replacement":true})
     );
+    B::close(connection).await
+}
+
+async fn organization_empty_update_storage_error<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::new())
+        .build()
+        .await?;
+    let owner = signup(&auth, "sql-update-owner@example.test").await;
+    let sibling = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"sql-update-owner@example.test","password":PASSWORD})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    let member = signup(&auth, "sql-update-member@example.test").await;
+    let foreign = signup(&auth, "sql-update-foreign@example.test").await;
+    let created=call(&auth,request("/organization/create",Some(json!({"name":"Target","slug":"sql-target","logo":"https://example.test/logo.png","metadata":{"original":true}})),&cookies(&owner)),200).await;
+    let id = body(&created)["id"].as_str().unwrap().to_owned();
+    _ = auth
+        .dispatch_endpoint(
+            OrganizationPlugin::add_member_endpoint(&serde_json::from_value(
+                json!({"organizationId":id,"userId":body(&member)["user"]["id"],"role":"member"}),
+            )?)?,
+            alibi::endpoint::EndpointOptions::default(),
+        )
+        .await?;
+    let selected = call(
+        &auth,
+        request(
+            "/organization/set-active",
+            Some(json!({"organizationId":id})),
+            &cookies(&sibling),
+        ),
+        200,
+    )
+    .await;
+    let sibling_jar = [cookies(&sibling), cookies(&selected)].join("; ");
+    let before = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    for (jar, status) in [
+        (String::new(), 401),
+        (cookies(&member), 403),
+        (cookies(&foreign), 400),
+        (cookies(&owner), 500),
+    ] {
+        let failed = call(
+            &auth,
+            request(
+                "/organization/update",
+                Some(json!({"organizationId":id,"data":{}})),
+                &jar,
+            ),
+            status,
+        )
+        .await;
+        if status == 500 {
+            assert!(failed.body.is_empty());
+            assert!(!failed.headers.contains_key("content-type"));
+        }
+        assert!(!failed.headers.contains_key("set-cookie"));
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                .await?,
+            before
+        );
+    }
+    let retry = call(
+        &auth,
+        request(
+            "/organization/update",
+            Some(json!({"organizationId":"","data":{"name":"Recovered","logo":null}})),
+            &sibling_jar,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&retry)["id"], id);
+    assert_eq!(body(&retry)["name"], "Recovered");
+    assert_eq!(body(&retry)["logo"], Value::Null);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        before[..3]
+    );
+    assert_eq!(db.table("member").await?, before[4]);
+    let after = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    let trigger = format!(
+        "CREATE TRIGGER organization_update_veto BEFORE UPDATE ON organization WHEN OLD.id='{}' BEGIN SELECT RAISE(ABORT,'actual update unavailable'); END",
+        id.replace('\'', "''")
+    );
+    _ = db.execute(&trigger, &[]).await?;
+    let veto = call(
+        &auth,
+        request(
+            "/organization/update",
+            Some(json!({"organizationId":id,"data":{"name":"Vetoed"}})),
+            &cookies(&owner),
+        ),
+        500,
+    )
+    .await;
+    assert!(veto.body.is_empty());
+    assert!(!veto.headers.contains_key("content-type"));
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?,
+        after
+    );
+    _ = db
+        .execute("DROP TRIGGER organization_update_veto", &[])
+        .await?;
     B::close(connection).await
 }
