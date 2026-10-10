@@ -16,7 +16,8 @@ backend_tests!(
     organization_invitation_policy,
     organization_anonymous_and_failures,
     organization_invitation_stamps,
-    processed_invitation_cancellation_keeps_members_and_original_callback_status
+    processed_invitation_cancellation_keeps_members_and_original_callback_status,
+    organization_invitation_raw_expiry
 );
 
 #[derive(Debug, Default)]
@@ -710,6 +711,110 @@ async fn processed_invitation_cancellation_keeps_members_and_original_callback_s
         );
         assert_eq!(db.count("member").await?, if accepted { 2 } else { 1 });
         authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn organization_invitation_raw_expiry<B: Backend>(db: Db) -> TestResult {
+    for (seconds, span) in [
+        (0.0, 172800000_i64),
+        (-0.5, -500),
+        (0.125, 125),
+        (f64::NAN, 172800000),
+    ] {
+        let db = db.fresh().await?;
+        let organization = OrganizationConfig {
+            invitation_expires_in: Some(seconds),
+            ..Default::default()
+        };
+
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(OrganizationPlugin::with_config(organization))
+            .build()
+            .await?;
+        let owner = signup(&auth, "invitation-life-owner@example.test").await;
+        let foreign = signup(&auth, "invitation-life-foreign@example.test").await;
+        let target = signup(&auth, "invitation-life-target@example.test").await;
+        let created = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Life","slug":"invitation-life"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+        let org = body(&created)["id"].as_str().unwrap().to_owned();
+        let jar = merge(&cookies(&owner), &cookies(&created));
+
+        let before = db
+            .tables(&[
+                "users",
+                "accounts",
+                "sessions",
+                "member",
+                "team",
+                "team_member",
+            ])
+            .await?;
+        let start = chrono::Utc::now().timestamp_millis();
+        let response=call(&auth,request("/organization/invite-member",Some(json!({"organizationId":org,"email":"invitation-life-target@example.test","role":"member"})),&jar),200).await;
+        let end = chrono::Utc::now().timestamp_millis();
+        let returned = body(&response);
+        let expiry = chrono::DateTime::parse_from_rfc3339(returned["expiresAt"].as_str().unwrap())?
+            .timestamp_millis();
+        assert!((start + span..=end + span).contains(&expiry));
+        let physical = auth
+            .store()
+            .get_invitation_by_id(returned["id"].as_str().unwrap())
+            .await?
+            .unwrap();
+        assert_eq!(physical.expires_at.timestamp_millis(), expiry);
+        if seconds < 0.0 {
+            let rejected = call(
+                &auth,
+                request(
+                    "/organization/accept-invitation",
+                    Some(json!({"invitationId":physical.id})),
+                    &cookies(&target),
+                ),
+                400,
+            )
+            .await;
+            assert_eq!(body(&rejected)["code"], "INVITATION_NOT_FOUND");
+            assert_eq!(
+                auth.store()
+                    .get_invitation_by_id(&physical.id)
+                    .await?
+                    .unwrap(),
+                physical
+            );
+        }
+        assert_eq!(
+            db.tables(&[
+                "users",
+                "accounts",
+                "sessions",
+                "member",
+                "team",
+                "team_member"
+            ])
+            .await?,
+            before
+        );
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "invitation-life-foreign@example.test",
+        )
+        .await;
         B::close(connection).await?;
     }
     Ok(())
