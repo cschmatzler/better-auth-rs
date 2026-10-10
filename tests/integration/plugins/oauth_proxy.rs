@@ -783,6 +783,141 @@ async fn proxy_cache_publication_failure_retains_commit_and_discards_all_cookies
     Ok(())
 }
 
+async fn proxy_loose_profile_retains_resolved_account_key_authority<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::plugins::oauth::{OAuthAccountKey, OAuthAccountKeyContext, OAuthAccountKeyResolver};
+    struct Key;
+    #[async_trait::async_trait]
+    impl OAuthAccountKeyResolver for Key {
+        async fn resolve(&self, c: OAuthAccountKeyContext) -> Result<Value, String> {
+            assert_eq!(c.profile.get("id").unwrap(), 777);
+            assert_eq!(
+                c.tokens.access_token.as_deref(),
+                Some("real-provider-access")
+            );
+            Ok(json!("stable-custom-account"))
+        }
+    }
+    let mut fixture = Fixture::<B>::new(db).await;
+    let (authorization, _) = fixture.issue("/api/auth/sign-in/social", None).await;
+    let issuer = authorization.origin().ascii_serialization();
+    let config = (*fixture.production.context().config).clone();
+    let mut provider = OAuthProvider::gitlab_with_issuer("local-client", "local-secret", &issuer);
+    provider
+        .authorization
+        .get_or_insert_with(Default::default)
+        .account_key = Some(OAuthAccountKey(Arc::new(Key)));
+    fixture.production = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &fixture._connections.1))
+        .plugin(OAuthPlugin::new().add_provider("gitlab", provider))
+        .plugin(OAuthProxyPlugin::with_config(OAuthProxyConfig {
+            current_url: Some(PRODUCTION.into()),
+            production_url: Some(PRODUCTION.into()),
+            secret: Some(PROXY_SECRET.into()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let (_, mut bridge) = fixture.forward(&authorization).await;
+    let profile = bridge
+        .query_pairs()
+        .find(|(k, _)| k == "profile")
+        .unwrap()
+        .1
+        .into_owned();
+    let mut payload = open(&profile, PROXY_SECRET, "oauth-proxy-profile");
+    assert_eq!(
+        payload.get("account").unwrap().get("accountId").unwrap(),
+        "stable-custom-account"
+    );
+    _ = payload
+        .get_mut("userInfo")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .insert("id".into(), json!("display-only-id"));
+    _ = payload
+        .get_mut("userInfo")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .insert("unrelated".into(), json!({"nested":true}));
+    _ = payload
+        .get_mut("account")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .insert("extra".into(), json!({"kept":"input"}));
+    _ = payload
+        .as_object_mut()
+        .unwrap()
+        .insert("extra".into(), json!([1, true]));
+    let sealed = seal(&payload.to_string(), PROXY_SECRET, "oauth-proxy-profile");
+    let pairs = bridge
+        .query_pairs()
+        .map(|(k, v)| {
+            let value = if k == "profile" {
+                sealed.clone()
+            } else {
+                v.into_owned()
+            };
+            (k.into_owned(), value)
+        })
+        .collect::<Vec<_>>();
+    _ = bridge.query_pairs_mut().clear().extend_pairs(pairs);
+    let production = rows(&fixture.production_db).await;
+    let done = request(&fixture.preview, &target(&bridge), None, None).await;
+    assert_eq!(done.status, 302);
+    assert_eq!(location(&done).as_str(), format!("{PREVIEW}/new-owner"));
+    assert_eq!(
+        fixture
+            .preview_db
+            .text(
+                "SELECT account_id FROM accounts WHERE provider_id='gitlab'",
+                &[]
+            )
+            .await?
+            .as_deref(),
+        Some("stable-custom-account")
+    );
+    assert_eq!(
+        fixture
+            .preview_db
+            .count_where(
+                "SELECT COUNT(*) FROM accounts WHERE account_id='display-only-id'",
+                &[]
+            )
+            .await?,
+        0
+    );
+    let read = request(
+        &fixture.preview,
+        "/api/auth/get-session",
+        None,
+        Some(&cookies(&done)),
+    )
+    .await;
+    let view: Value = serde_json::from_slice(&read.body)?;
+    assert_eq!(
+        view.get("user").unwrap().get("email").unwrap(),
+        "proxy-owner@fixture.test"
+    );
+    assert_eq!(
+        fixture
+            .preview_db
+            .text(
+                "SELECT user_id FROM accounts WHERE provider_id='gitlab'",
+                &[]
+            )
+            .await?
+            .as_deref(),
+        view.get("user").unwrap().get("id").unwrap().as_str()
+    );
+    assert_eq!(rows(&fixture.production_db).await, production);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -793,7 +928,8 @@ mod tests {
     cookie_state_link_restores_initiating_owner_across_session_change,
     cookie_state_expiry_clears_only_authenticated_matching_proof,
     raw_profile_max_age_controls_admission_before_state_consumption,
-    proxy_cache_publication_failure_retains_commit_and_discards_all_cookies
+    proxy_cache_publication_failure_retains_commit_and_discards_all_cookies,
+    proxy_loose_profile_retains_resolved_account_key_authority
 );
     postgres_tests!(production_exchange_preserves_rows_then_preview_consumes_state_and_issues_only_the_actual_owner,completion_rejects_foreign_origin_provider_tampering_and_expired_state_before_any_principal_write);
 
