@@ -26,7 +26,8 @@ backend_tests!(
     organization_default_team_factory_failure,
     organization_orphan_delete_selection,
     organization_removal_original_target_snapshots,
-    organization_removal_before_await_boundary
+    organization_removal_before_await_boundary,
+    organization_removal_callback_500_identity
 );
 postgres_tests!(
     organization_lifecycle_callbacks_preserve_patch_authority_and_committed_phases,
@@ -3693,4 +3694,201 @@ async fn organization_removal_before_await_boundary<B: Backend>(db: Db) -> TestR
     );
     let _ = owner_id;
     B::close(connection).await
+}
+
+async fn organization_removal_callback_500_identity<B: Backend>(db: Db) -> TestResult {
+    struct Hooks<S: AuthSchema> {
+        store: Arc<dyn alibi::AuthStore<S>>,
+        after: bool,
+        database: bool,
+        events: Mutex<Vec<&'static str>>,
+    }
+    impl<S: AuthSchema> std::fmt::Debug for Hooks<S> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("RemovalErrorIdentity")
+        }
+    }
+    impl<S: AuthSchema> Hooks<S> {
+        async fn phase(
+            &self,
+            c: &OrganizationMemberRemovalContext,
+            phase: &'static str,
+            fail: bool,
+        ) -> AuthResult<()> {
+            self.events.lock().unwrap().push(phase);
+            if !fail {
+                return Ok(());
+            }
+            if self.database {
+                _ = self
+                    .store
+                    .update_user(
+                        &c.user.id,
+                        alibi::UpdateUser {
+                            name: Some("Vetoed Write".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                Ok(())
+            } else {
+                Err(AuthError::Api {
+                    status: 500,
+                    code: Some("PUBLIC_REMOVAL_500".into()),
+                    message: format!("{phase} explicit failure"),
+                })
+            }
+        }
+    }
+    #[async_trait]
+    impl<S: AuthSchema> OrganizationMemberRemovalHooks for Hooks<S> {
+        async fn before_remove(&self, c: &OrganizationMemberRemovalContext) -> AuthResult<()> {
+            self.phase(c, "before", !self.after).await
+        }
+        async fn after_remove(&self, c: &OrganizationMemberRemovalContext) -> AuthResult<()> {
+            self.phase(c, "after", self.after).await
+        }
+    }
+    for after in [false, true] {
+        for database in [false, true] {
+            let db = db.fresh().await?;
+            let (connection, store) = db.migrated::<B>(SECRET).await?;
+            let hooks = Arc::new(Hooks {
+                store: Arc::new(store),
+                after,
+                database,
+                events: Mutex::new(Vec::new()),
+            });
+            let auth = super::auth_probe::fast_builder::<B>(&connection)
+                .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                    member_removal_hooks: Some(hooks.clone()),
+                    teams: TeamsConfig {
+                        enabled: true,
+                        create_default_team: false,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }))
+                .build()
+                .await?;
+
+            let owner = signup(&auth, "owner@example.test").await;
+            let target = signup(&auth, "target@example.test").await;
+            let foreign = signup(&auth, "foreign@example.test").await;
+            let target_id = body(&target)["user"]["id"].as_str().unwrap().to_owned();
+            let owner_id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+            let org=body(&call(&auth,request("/organization/create",Some(json!({"name":"Original Organization","slug":"owned","metadata":{"original":true}})),&cookies(&owner)),200).await);
+            let other = body(
+                &call(
+                    &auth,
+                    request(
+                        "/organization/create",
+                        Some(json!({"name":"Foreign Organization","slug":"foreign"})),
+                        &cookies(&foreign),
+                    ),
+                    200,
+                )
+                .await,
+            );
+            let mut members = Vec::new();
+            let mut teams = Vec::new();
+            for (organization, actor) in [(&org, &owner), (&other, &foreign)] {
+                let member=auth.dispatch_endpoint(OrganizationPlugin::add_member_endpoint(&serde_json::from_value(json!({"organizationId":organization["id"],"userId":target_id,"role":"member"}))?)?,alibi::endpoint::EndpointOptions::default()).await?.decode()?;
+                members.push(member);
+                let team = body(
+                    &call(
+                        &auth,
+                        request(
+                            "/organization/create-team",
+                            Some(json!({"organizationId":organization["id"],"name":"Seat"})),
+                            &cookies(actor),
+                        ),
+                        200,
+                    )
+                    .await,
+                );
+                let _=call(&auth,request("/organization/add-team-member",Some(json!({"organizationId":organization["id"],"teamId":team["id"],"userId":target_id})),&cookies(actor)),200).await;
+                teams.push(team);
+            }
+            let original = members.first().unwrap();
+            let own_team = teams.first().unwrap()["id"].as_str().unwrap().to_owned();
+            let foreign_team = teams.last().unwrap()["id"].as_str().unwrap().to_owned();
+
+            if database {
+                _=db.execute(&format!("CREATE TRIGGER veto_target_name BEFORE UPDATE OF name ON users WHEN NEW.id='{}' BEGIN SELECT RAISE(ABORT,'application callback database failure'); END",target_id),&[]).await?;
+            }
+            let stable = db
+                .tables(&["users", "accounts", "sessions", "organization"])
+                .await?;
+            let failed = call(
+                &auth,
+                request(
+                    "/organization/remove-member",
+                    Some(json!({"organizationId":org["id"],"memberIdOrEmail":original.id})),
+                    &cookies(&owner),
+                ),
+                500,
+            )
+            .await;
+            assert_eq!(failed.headers.get_all("set-cookie").count(), 0);
+            if database {
+                assert!(failed.body.is_empty());
+                assert!(failed.headers.get("content-type").is_none());
+            } else {
+                assert_eq!(
+                    body(&failed),
+                    json!({"code":"PUBLIC_REMOVAL_500","message":format!("{} explicit failure",if after {"after"} else {"before"})})
+                );
+                assert!(
+                    failed
+                        .headers
+                        .get("content-type")
+                        .unwrap()
+                        .contains("application/json")
+                );
+            }
+            assert_eq!(
+                *hooks.events.lock().unwrap(),
+                if after {
+                    vec!["before", "after"]
+                } else {
+                    vec!["before"]
+                }
+            );
+            assert_eq!(
+                db.count_where("SELECT COUNT(*) FROM member WHERE id=$1", &[&original.id])
+                    .await?,
+                i64::from(!after)
+            );
+            assert_eq!(
+                db.count_where(
+                    "SELECT COUNT(*) FROM team_member WHERE team_id=$1",
+                    &[&own_team]
+                )
+                .await?,
+                i64::from(!after)
+            );
+            assert_eq!(
+                db.count_where("SELECT member_count FROM team WHERE id=$1", &[&own_team])
+                    .await?,
+                i64::from(!after)
+            );
+            assert_eq!(
+                db.count_where(
+                    "SELECT member_count FROM team WHERE id=$1",
+                    &[&foreign_team]
+                )
+                .await?,
+                1
+            );
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions", "organization"])
+                    .await?,
+                stable
+            );
+            let _ = owner_id;
+            B::close(connection).await?;
+        }
+    }
+    Ok(())
 }
