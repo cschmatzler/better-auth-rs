@@ -21,7 +21,8 @@ backend_tests!(
     jwt_configured_expiration_precision,
     jwt_compact_revoked_principal_signing,
     jwt_server_claim_override_replacement,
-    jwt_remote_signer_selection_options
+    jwt_remote_signer_selection_options,
+    jwt_custom_cache_callback_shape
 );
 
 #[derive(Default)]
@@ -1346,5 +1347,147 @@ async fn jwt_remote_signer_selection_options<B: Backend>(db: Db) -> TestResult {
         assert_eq!(db.count("jwks").await?, 0);
     }
     assert_eq!(signer.0.lock().unwrap().len(), 3);
+    B::close(connection).await
+}
+
+async fn jwt_custom_cache_callback_shape<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::jwt::DefineJwtSubject;
+    use hkdf::hmac::{Hmac, KeyInit, Mac};
+    struct Callback(Mutex<Vec<(bool, Value)>>);
+    #[async_trait::async_trait]
+    impl DefineJwtPayload for Callback {
+        async fn define_payload(&self, s: &JwtSession) -> AuthResult<Map<String, Value>> {
+            let value = serde_json::to_value(s)?;
+            self.0.lock().unwrap().push((false, value.clone()));
+            Ok([("snapshot".into(), value)].into_iter().collect())
+        }
+    }
+    #[async_trait::async_trait]
+    impl DefineJwtSubject for Callback {
+        async fn subject(&self, s: &JwtSession) -> AuthResult<Option<String>> {
+            let value = serde_json::to_value(s)?;
+            self.0.lock().unwrap().push((true, value));
+            Ok(Some(
+                if s.updated_at.is_some() {
+                    "direct-cache"
+                } else {
+                    "nested-or-stored"
+                }
+                .into(),
+            ))
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let callback = Arc::new(Callback(Mutex::new(Vec::new())));
+    let jwt = JwtPlugin::with_config(JwtPluginConfig {
+        define_payload: Some(callback.clone()),
+        define_subject: Some(callback.clone()),
+        ..Default::default()
+    });
+    let config = AuthConfig::new(SECRET)
+        .base_url(ORIGIN)
+        .session_cookie_cache(CookieCacheConfig {
+            enabled: true,
+            strategy: CookieCacheStrategy::Compact,
+            max_age: 300.0,
+            version: Some(CookieCacheVersion::Literal("1".into())),
+        });
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(jwt.clone())
+        .build()
+        .await?;
+    let owner = signup(&auth, "shape-owner@example.test").await;
+    let foreign = signup(&auth, "shape-foreign@example.test").await;
+    let protected = db.table("sessions").await?;
+    let jar = cookies(&owner);
+    let encoded = jar
+        .split("; ")
+        .find_map(|v| v.strip_prefix("better-auth.session_data="))
+        .unwrap();
+    let envelope: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?;
+    for direct in [true, false] {
+        callback.0.lock().unwrap().clear();
+        let response = call(
+            &auth,
+            request(if direct { "/get-session" } else { "/token" }, None, &jar),
+            200,
+        )
+        .await;
+        let token = if direct {
+            response.headers.get("set-auth-jwt").unwrap().to_string()
+        } else {
+            body(&response)["token"].as_str().unwrap().to_owned()
+        };
+        let claims = jwt
+            .verify_jwt(&token, None, None, auth.context())
+            .await?
+            .unwrap();
+        let snapshot = &claims["snapshot"];
+        assert_eq!(snapshot["user"]["id"], body(&owner)["user"]["id"]);
+        assert_eq!(snapshot["session"]["token"], body(&owner)["token"]);
+        if direct {
+            assert_eq!(
+                snapshot["updatedAt"].as_f64(),
+                envelope["session"]["updatedAt"].as_f64()
+            );
+            assert_eq!(snapshot["version"], "1");
+            assert_eq!(claims["sub"], "direct-cache");
+        } else {
+            assert!(snapshot.get("updatedAt").is_none());
+            assert!(snapshot.get("version").is_none());
+            assert_eq!(claims["sub"], "nested-or-stored");
+        }
+        let seen = callback.0.lock().unwrap().clone();
+        let mut expected = snapshot.clone();
+        if let Some(updated_at) = snapshot.get("updatedAt") {
+            expected["updatedAt"] = json!(updated_at.as_f64().unwrap());
+        }
+        assert_eq!(seen, [(false, expected.clone()), (true, expected)]);
+    }
+    let mut legacy = envelope.clone();
+    _ = legacy["session"].as_object_mut().unwrap().remove("version");
+    let mut signed = legacy["session"].as_object().unwrap().clone();
+    _ = signed.insert("expiresAt".into(), legacy["expiresAt"].clone());
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(SECRET.as_bytes())?;
+    mac.update(&serde_json::to_vec(&signed)?);
+    legacy["signature"] = json!(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()));
+    let legacy_encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&legacy)?);
+    let legacy_jar = jar.replace(encoded, &legacy_encoded);
+    let legacy_read = call(&auth, request("/get-session", None, &legacy_jar), 200).await;
+    let claims = jwt
+        .verify_jwt(
+            legacy_read.headers.get("set-auth-jwt").unwrap(),
+            None,
+            None,
+            auth.context(),
+        )
+        .await?
+        .unwrap();
+    assert_eq!(claims["sub"], "direct-cache");
+    assert!(claims["snapshot"].get("version").is_none());
+    assert_eq!(
+        claims["snapshot"]["updatedAt"].as_f64(),
+        envelope["session"]["updatedAt"].as_f64()
+    );
+    let mut bypass = request("/get-session", None, &jar);
+    bypass.set_query_pairs([("disableCookieCache", "true"), ("disableRefresh", "true")]);
+    let stored = call(&auth, bypass, 200).await;
+    let claims = jwt
+        .verify_jwt(
+            stored.headers.get("set-auth-jwt").unwrap(),
+            None,
+            None,
+            auth.context(),
+        )
+        .await?
+        .unwrap();
+    assert!(claims["snapshot"].get("updatedAt").is_none());
+    assert!(claims["snapshot"].get("version").is_none());
+    assert_eq!(db.table("sessions").await?, protected);
+    authenticated(&auth, &cookies(&foreign), "shape-foreign@example.test").await;
     B::close(connection).await
 }
