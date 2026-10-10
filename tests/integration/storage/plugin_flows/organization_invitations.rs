@@ -21,7 +21,8 @@ backend_tests!(
     organization_invitation_raw_expiry,
     organization_invitation_delivery_await_policy,
     organization_invitation_page_before_expiry,
-    organization_invitation_first_reinvite_cancellation
+    organization_invitation_first_reinvite_cancellation,
+    organization_invitation_limit_callback_error
 );
 
 #[derive(Debug, Default)]
@@ -1428,6 +1429,183 @@ async fn organization_invitation_first_reinvite_cancellation<B: Backend>(db: Db)
         ])
         .await?,
         before
+    );
+    authenticated(
+        &auth,
+        &cookies(&foreign),
+        "invitation-life-foreign@example.test",
+    )
+    .await;
+    authenticated(
+        &auth,
+        &cookies(&target),
+        "invitation-life-target@example.test",
+    )
+    .await;
+    B::close(connection).await
+}
+
+async fn organization_invitation_limit_callback_error<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        InvitationLimit, OrganizationInvitationContext, OrganizationInvitationLimitContext,
+        OrganizationInvitationLimitResolver,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    #[derive(Debug)]
+    struct Policy {
+        reject: AtomicBool,
+        events: Mutex<Vec<&'static str>>,
+    }
+    #[async_trait::async_trait]
+    impl OrganizationInvitationLimitResolver for Policy {
+        async fn invitation_limit(
+            &self,
+            c: &OrganizationInvitationLimitContext,
+            callback: &alibi::CallbackContext,
+        ) -> AuthResult<f64> {
+            assert_eq!(c.user.id, c.member.user_id);
+            assert_eq!(c.member_user.id, c.user.id);
+            assert_eq!(c.member.organization_id, c.organization.id);
+            assert_eq!(
+                callback.request.as_ref().unwrap().headers["x-invitation-marker"],
+                "original-marker"
+            );
+            self.events.lock().unwrap().push("limit");
+            if self.reject.load(Ordering::SeqCst) {
+                Err(alibi::AuthError::Upstream {
+                    status: 403,
+                    code: "INVITATION_APPLICATION_REJECTED",
+                    message: "application invitation policy rejected",
+                })
+            } else {
+                Ok(100.0)
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl OrganizationInvitationHooks for Policy {
+        async fn before_create_invitation(
+            &self,
+            _: &OrganizationInvitationCreationContext,
+        ) -> AuthResult<Option<OrganizationInvitationCreatePatch>> {
+            self.events.lock().unwrap().push("before");
+            Ok(None)
+        }
+        async fn after_create_invitation(
+            &self,
+            _: &OrganizationInvitationContext,
+        ) -> AuthResult<()> {
+            self.events.lock().unwrap().push("after");
+            Ok(())
+        }
+    }
+    #[async_trait::async_trait]
+    impl OrganizationInvitationEmailSender for Policy {
+        async fn send_invitation_email(
+            &self,
+            _: &OrganizationInvitationDelivery,
+            _: &alibi::CallbackContext,
+        ) -> AuthResult<()> {
+            self.events.lock().unwrap().push("send");
+            Ok(())
+        }
+    }
+    let policy = Arc::new(Policy {
+        reject: AtomicBool::new(true),
+        events: Mutex::new(Vec::new()),
+    });
+    let organization = OrganizationConfig {
+        invitation_limit: Some(InvitationLimit::Resolver(policy.clone())),
+        invitation_hooks: Some(policy.clone()),
+        send_invitation_email: Some(policy.clone()),
+        ..Default::default()
+    };
+
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(OrganizationPlugin::with_config(organization))
+        .build()
+        .await?;
+    let owner = signup(&auth, "invitation-life-owner@example.test").await;
+    let foreign = signup(&auth, "invitation-life-foreign@example.test").await;
+    let target = signup(&auth, "invitation-life-target@example.test").await;
+    let created = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Life","slug":"invitation-life"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let org = body(&created)["id"].as_str().unwrap().to_owned();
+    let jar = merge(&cookies(&owner), &cookies(&created));
+
+    let before = db
+        .tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "organization",
+            "team",
+            "team_member",
+            "invitation",
+        ])
+        .await?;
+    let input =
+        json!({"organizationId":org,"email":"policy-recipient@example.test","role":"member"});
+    let mut rejected = request("/organization/invite-member", Some(input.clone()), &jar);
+    _ = rejected
+        .headers
+        .insert("x-invitation-marker".into(), "original-marker".into());
+    let response = call(&auth, rejected, 403).await;
+    assert_eq!(body(&response)["code"], "INVITATION_APPLICATION_REJECTED");
+    assert!(cookies(&response).is_empty());
+    assert_eq!(*policy.events.lock().unwrap(), vec!["limit"]);
+    assert_eq!(
+        db.tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "organization",
+            "team",
+            "team_member",
+            "invitation"
+        ])
+        .await?,
+        before
+    );
+    policy.events.lock().unwrap().clear();
+    policy.reject.store(false, Ordering::SeqCst);
+    let mut retry = request("/organization/invite-member", Some(input), &jar);
+    _ = retry
+        .headers
+        .insert("x-invitation-marker".into(), "original-marker".into());
+    _ = call(&auth, retry, 200).await;
+    assert_eq!(
+        *policy.events.lock().unwrap(),
+        vec!["limit", "before", "send", "after"]
+    );
+    assert_eq!(db.count("invitation").await?, 1);
+    assert_eq!(
+        db.tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "organization",
+            "team",
+            "team_member"
+        ])
+        .await?,
+        before[..7]
     );
     authenticated(
         &auth,
