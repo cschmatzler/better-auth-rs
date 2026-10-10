@@ -20,7 +20,8 @@ backend_tests!(
     organization_plugin_helpers,
     organization_trusted_addition_preserves_literal_role_arrays_and_session_scope,
     fractional_organization_membership_limit_uses_actual_physical_count,
-    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results
+    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results,
+    organization_raw_team_seat_endpoint_policy
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -892,4 +893,151 @@ async fn organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_r
     assert_eq!(policy.seen.lock().unwrap().len(), count);
     assert_eq!(db.count("member").await?, 2);
     B::close(connection).await
+}
+
+async fn organization_raw_team_seat_endpoint_policy<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::OrganizationTeamHooks;
+    use alibi::plugins::organization::extensions::TeamHookContext;
+    use alibi::plugins::organization::extensions::TeamLimitContext;
+    #[derive(Debug)]
+    struct Policy {
+        maximum: Option<f64>,
+        events: Mutex<Vec<&'static str>>,
+    }
+    #[async_trait::async_trait]
+    impl OrganizationLimitResolver for Policy {
+        async fn maximum_team_members(&self, c: &TeamLimitContext) -> AuthResult<Option<f64>> {
+            assert!(c.team_id.is_some());
+            assert_eq!(
+                c.session.as_ref().unwrap().user_id,
+                c.user.as_ref().unwrap().id
+            );
+            self.events.lock().unwrap().push("quota");
+            Ok(self.maximum)
+        }
+    }
+    #[async_trait::async_trait]
+    impl OrganizationTeamHooks for Policy {
+        async fn before_add_member(
+            &self,
+            _: &alibi::Team,
+            _: &UserView,
+            c: &TeamHookContext,
+        ) -> AuthResult<()> {
+            assert!(c.user.is_some());
+            self.events.lock().unwrap().push("before");
+            Ok(())
+        }
+        async fn after_add_member(
+            &self,
+            _: &alibi::TeamMember,
+            _: &alibi::Team,
+            _: &UserView,
+            _: &TeamHookContext,
+        ) -> AuthResult<()> {
+            self.events.lock().unwrap().push("after");
+            Ok(())
+        }
+    }
+    for resolved in [false, true] {
+        for (maximum, allowed) in [
+            (Some(0.0), 0),
+            (Some(f64::NAN), 0),
+            (Some(1.5), 2),
+            (Some(-1.0), 0),
+            (Some(f64::NEG_INFINITY), 0),
+            (Some(f64::INFINITY), 3),
+            (None, 3),
+        ] {
+            let db = db.fresh().await?;
+            let (connection, _) = db.migrated::<B>(SECRET).await?;
+            let policy = Arc::new(Policy {
+                maximum,
+                events: Mutex::new(Vec::new()),
+            });
+            let auth = super::auth_probe::fast_builder::<B>(&connection)
+                .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                    teams: TeamsConfig {
+                        enabled: true,
+                        create_default_team: false,
+                        maximum_members_per_team: maximum,
+                        limit_resolver: resolved
+                            .then(|| policy.clone() as Arc<dyn OrganizationLimitResolver>),
+                        hooks: Some(policy.clone()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }))
+                .build()
+                .await?;
+            let mut owner = account(&auth, "raw-seat-owner@example.test").await;
+            let first = account(&auth, "raw-seat-first@example.test").await;
+            let second = account(&auth, "raw-seat-second@example.test").await;
+            let org = organization(&auth, &mut owner, "raw-seat").await;
+            _ = add(&auth, &org, &first.id, "member").await;
+            _ = add(&auth, &org, &second.id, "member").await;
+            let team = body(
+                &call(
+                    &auth,
+                    request(
+                        "/organization/create-team",
+                        Some(json!({"name":"Seat team","organizationId":org})),
+                        &owner.cookie,
+                    ),
+                    200,
+                )
+                .await,
+            )["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let protected = db
+                .tables(&["users", "accounts", "sessions", "organization", "member"])
+                .await?;
+            for (index, target) in [&owner.id, &first.id, &second.id, &owner.id]
+                .into_iter()
+                .enumerate()
+            {
+                policy.events.lock().unwrap().clear();
+                let accepted = index < usize::try_from(allowed)? || (index == 3 && allowed > 0);
+                let response = call(
+                    &auth,
+                    request(
+                        "/organization/add-team-member",
+                        Some(json!({"teamId":team,"userId":target,"organizationId":org})),
+                        &owner.cookie,
+                    ),
+                    if accepted { 200 } else { 403 },
+                )
+                .await;
+                if !accepted {
+                    assert_eq!(body(&response)["code"], "TEAM_MEMBER_LIMIT_REACHED");
+                }
+                let mut expected = vec!["before"];
+                if resolved {
+                    expected.push("quota");
+                }
+                if accepted {
+                    expected.push("after");
+                }
+                assert_eq!(*policy.events.lock().unwrap(), expected);
+                assert_eq!(
+                    db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                        .await?,
+                    protected
+                );
+            }
+            assert_eq!(db.count("team_member").await?, allowed);
+            assert_eq!(
+                db.text(
+                    "SELECT CAST(member_count AS TEXT) FROM team WHERE id=$1",
+                    &[&team]
+                )
+                .await?,
+                Some(allowed.to_string())
+            );
+            B::close(connection).await?;
+        }
+    }
+    Ok(())
 }
