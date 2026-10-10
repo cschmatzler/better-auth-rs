@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 backend_tests!(
     identity_policy_admits_mutations_and_isolates_concurrent_requests,
     provider_admission_distinguishes_creation_returning_and_linking,
-    verification_identifier_policy_preserves_logical_access_and_failure_atomicity
+    verification_identifier_policy_preserves_logical_access_and_failure_atomicity,
+    verification_trusted_create_cache_key
 );
 postgres_tests!(
     identity_policy_admits_mutations_and_isolates_concurrent_requests,
@@ -464,5 +465,144 @@ async fn provider_admission_distinguishes_creation_returning_and_linking<B: Back
             UserValidationAction::LinkAccount
         ]
     );
+    B::close(connection).await
+}
+
+async fn verification_trusted_create_cache_key<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{
+        CacheAdapter, DatabaseHookContext, DatabaseHooks, HookBackend, HookControl,
+        MemoryCacheAdapter,
+    };
+    use alibi::verification::{VerificationCreation, VerificationSnapshot};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest, Sha256};
+    struct Mutation {
+        events: Arc<Mutex<Vec<Value>>>,
+        cache: Arc<MemoryCacheAdapter>,
+        key: String,
+    }
+    #[async_trait]
+    impl<S: AuthSchema, H: HookBackend> DatabaseHooks<S, H> for Mutation {
+        async fn before_create_verification_record(
+            &self,
+            v: &mut VerificationCreation,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<HookControl> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(v.snapshot().data())?);
+            v.id = Some("trusted-storage-primary".into());
+            v.identifier = "trusted-stored-identifier".into();
+            v.value = "trusted-proof".into();
+            v.created_at = chrono::DateTime::parse_from_rfc3339("2010-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            v.updated_at = chrono::DateTime::parse_from_rfc3339("2011-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            Ok(HookControl::Continue)
+        }
+        async fn after_create_verification_record(
+            &self,
+            v: &VerificationSnapshot,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<()> {
+            let actual = serde_json::to_value(v.data())?;
+            let published: Value =
+                serde_json::from_str(&self.cache.get(&self.key).await?.unwrap())?;
+            assert_eq!(published, actual);
+            self.events.lock().unwrap().push(actual);
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let cache = Arc::new(MemoryCacheAdapter::new());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let key = format!(
+        "verification:{}",
+        URL_SAFE_NO_PAD.encode(Sha256::digest(b"original-logical-identifier"))
+    );
+    let mut config = AuthConfig::new(SECRET);
+    config.verification.secondary_storage = Some(cache.clone());
+    config.verification.store_in_database = true;
+    config.verification.store_identifier.default = VerificationIdentifierStrategy::Hashed;
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::hook(
+            B::store(Arc::new(config), &connection),
+            Mutation {
+                events: events.clone(),
+                cache: cache.clone(),
+                key: key.clone(),
+            },
+        ))
+        .build()
+        .await?;
+    let created = auth
+        .context()
+        .verifications()
+        .create(VerificationCreation {
+            id: None,
+            identifier: "original-logical-identifier".into(),
+            value: "original-proof".into(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+            created_at: chrono::DateTime::parse_from_rfc3339("2020-01-02T03:04:05Z")?
+                .with_timezone(&chrono::Utc),
+            updated_at: chrono::DateTime::parse_from_rfc3339("2021-02-03T04:05:06Z")?
+                .with_timezone(&chrono::Utc),
+        })
+        .await?
+        .unwrap();
+    let actual = serde_json::to_value(created.data())?;
+    assert_eq!(actual["id"], "trusted-storage-primary");
+    assert_eq!(actual["identifier"], "trusted-stored-identifier");
+    assert_eq!(actual["value"], "trusted-proof");
+    assert_eq!(actual["createdAt"], "2010-01-01T00:00:00.000Z");
+    assert_eq!(actual["updatedAt"], "2011-01-01T00:00:00.000Z");
+    assert_eq!(
+        db.text(
+            "SELECT identifier FROM verifications WHERE id=$1",
+            &["trusted-storage-primary"]
+        )
+        .await?
+        .as_deref(),
+        Some("trusted-stored-identifier")
+    );
+    assert_eq!(
+        db.text(
+            "SELECT value FROM verifications WHERE id=$1",
+            &["trusted-storage-primary"]
+        )
+        .await?
+        .as_deref(),
+        Some("trusted-proof")
+    );
+    assert_eq!(db.count("verifications").await?, 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&cache.get(&key).await?.unwrap())?,
+        actual
+    );
+    assert!(
+        cache
+            .get("verification:trusted-stored-identifier")
+            .await?
+            .is_none()
+    );
+    let found = auth
+        .context()
+        .verifications()
+        .find("original-logical-identifier")
+        .await?
+        .unwrap();
+    assert_eq!(serde_json::to_value(found.data())?, actual);
+    let receipts = events.lock().unwrap().clone();
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[0]["value"], "original-proof");
+    assert_eq!(receipts[0]["createdAt"], "2020-01-02T03:04:05.000Z");
+    assert_eq!(
+        receipts[0]["identifier"],
+        key.strip_prefix("verification:").unwrap()
+    );
+    assert_eq!(receipts[1], actual);
     B::close(connection).await
 }
