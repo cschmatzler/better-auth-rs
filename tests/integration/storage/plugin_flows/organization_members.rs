@@ -33,7 +33,8 @@ backend_tests!(
     organization_physical_membership_pages,
     organization_concurrent_member_admission,
     organization_member_role_js_whitespace,
-    organization_member_role_guest_validation
+    organization_member_role_guest_validation,
+    organization_legacy_role_read_without_ac
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -2350,6 +2351,231 @@ async fn organization_member_role_guest_validation<B: Backend>(db: Db) -> TestRe
         db.tables(&["users", "accounts", "sessions", "organization", "member"])
             .await?,
         before
+    );
+    B::close(connection).await
+}
+
+async fn organization_legacy_role_read_without_ac<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            dynamic_access_control: DynamicAccessControlConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let mut owner = account(&auth, "no-ac-owner@example.test").await;
+    let member = account(&auth, "no-ac-member@example.test").await;
+    let foreign = account(&auth, "no-ac-foreign@example.test").await;
+    let org = organization(&auth, &mut owner, "raw-no-ac").await;
+    let member_row = add(&auth, &org, &member.id, "member").await;
+    let protected = db
+        .tables(&["users", "accounts", "sessions", "organization"])
+        .await?;
+    let mut roles = Vec::new();
+    for (i, literal) in [
+        " [\"create\"] ",
+        " \"grant\" ",
+        " 0 ",
+        " true ",
+        " false ",
+        " null ",
+        "{\"team\":\"create\"}",
+        "{\"invented\":[\"grant\"]}",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let role = auth
+            .store()
+            .create_organization_role(alibi::types::CreateOrganizationRole {
+                organization_id: org.clone(),
+                role: format!("legacy-{i}"),
+                permission: Default::default(),
+            })
+            .await?;
+        _ = db
+            .execute(
+                "UPDATE organization_role SET permission=$1 WHERE id=$2",
+                &[literal, &role.id],
+            )
+            .await?;
+        let read = call(
+            &auth,
+            get(
+                "/organization/get-role",
+                &[("organizationId", &org), ("roleId", &role.id)],
+                &owner.cookie,
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(
+            body(&read)["permission"],
+            serde_json::from_str::<Value>(literal)?
+        );
+        let row = db.table("organization_role").await?;
+        let denied = call(
+            &auth,
+            request(
+                "/organization/update-role",
+                Some(json!({"organizationId":org,"roleId":role.id,"data":{"permission":{}}})),
+                &owner.cookie,
+            ),
+            501,
+        )
+        .await;
+        assert_eq!(body(&denied)["code"], "MISSING_AC_INSTANCE");
+        assert_eq!(db.table("organization_role").await?, row);
+        roles.push((role, literal));
+    }
+    let list = call(
+        &auth,
+        get(
+            "/organization/list-roles",
+            &[("organizationId", &org)],
+            &owner.cookie,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(
+        body(&list)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["permission"].clone())
+            .collect::<Vec<_>>(),
+        roles
+            .iter()
+            .map(|(_, raw)| serde_json::from_str::<Value>(raw).unwrap())
+            .collect::<Vec<_>>()
+    );
+    _ = db
+        .execute(
+            "UPDATE member SET role=$1 WHERE id=$2",
+            &[&roles[0].0.role, member_row["id"].as_str().unwrap()],
+        )
+        .await?;
+    let permission = call(
+        &auth,
+        request(
+            "/organization/has-permission",
+            Some(json!({"organizationId":org,"permissions":{"team":["create"]}})),
+            &member.cookie,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&permission)["success"], false);
+    for (actor, code) in [
+        (&member, "YOU_ARE_NOT_ALLOWED_TO_READ_A_ROLE"),
+        (&foreign, "YOU_ARE_NOT_A_MEMBER_OF_THIS_ORGANIZATION"),
+    ] {
+        let denied = call(
+            &auth,
+            get(
+                "/organization/get-role",
+                &[("organizationId", &org), ("roleId", &roles[0].0.id)],
+                &actor.cookie,
+            ),
+            403,
+        )
+        .await;
+        assert_eq!(body(&denied)["code"], code);
+    }
+    let create = call(
+        &auth,
+        request(
+            "/organization/create-role",
+            Some(json!({"organizationId":org,"role":"new","permission":{}})),
+            &owner.cookie,
+        ),
+        501,
+    )
+    .await;
+    assert_eq!(body(&create)["code"], "MISSING_AC_INSTANCE");
+    _ = db
+        .execute(
+            "UPDATE member SET role='member' WHERE id=$1",
+            &[member_row["id"].as_str().unwrap()],
+        )
+        .await?;
+    for (role, _) in roles {
+        _ = call(
+            &auth,
+            request(
+                "/organization/delete-role",
+                Some(json!({"organizationId":org,"roleId":role.id})),
+                &owner.cookie,
+            ),
+            200,
+        )
+        .await;
+    }
+    assert_eq!(db.count("organization_role").await?, 0);
+    for literal in ["{bad", ""] {
+        let role = auth
+            .store()
+            .create_organization_role(alibi::types::CreateOrganizationRole {
+                organization_id: org.clone(),
+                role: "malformed".into(),
+                permission: Default::default(),
+            })
+            .await?;
+        _ = db
+            .execute(
+                "UPDATE organization_role SET permission=$1 WHERE id=$2",
+                &[literal, &role.id],
+            )
+            .await?;
+        let before = db.table("organization_role").await?;
+        for input in [
+            get(
+                "/organization/get-role",
+                &[("organizationId", &org), ("roleId", &role.id)],
+                &owner.cookie,
+            ),
+            get(
+                "/organization/list-roles",
+                &[("organizationId", &org)],
+                &owner.cookie,
+            ),
+            request(
+                "/organization/delete-role",
+                Some(json!({"organizationId":org,"roleId":role.id})),
+                &owner.cookie,
+            ),
+        ] {
+            let failed = call(&auth, input, 500).await;
+            assert!(failed.body.is_empty());
+        }
+        let denied = call(
+            &auth,
+            request(
+                "/organization/delete-role",
+                Some(json!({"organizationId":org,"roleId":role.id})),
+                &foreign.cookie,
+            ),
+            403,
+        )
+        .await;
+        assert_eq!(
+            body(&denied)["code"],
+            "YOU_ARE_NOT_A_MEMBER_OF_THIS_ORGANIZATION"
+        );
+        assert_eq!(db.table("organization_role").await?, before);
+        _ = db
+            .execute("DELETE FROM organization_role WHERE id=$1", &[&role.id])
+            .await?;
+    }
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization"])
+            .await?,
+        protected
     );
     B::close(connection).await
 }
