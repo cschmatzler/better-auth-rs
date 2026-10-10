@@ -23,6 +23,11 @@ backend_tests!(
     admin_password_field_rejects_accompanying_profile_mutations,
     admin_colliding_email_rejects_accompanying_profile_mutations,
     admin_update_ban_revokes_every_target_browser_and_preserves_foreign_sessions,
+    admin_empty_update_authority_order,
+    admin_literal_role_input_admission,
+    admin_create_role_selector_precedence,
+    admin_array_filter_sql_operands,
+    admin_repeated_query_validation_before_auth,
     admin_date_callback_error_identity
 );
 
@@ -1348,6 +1353,553 @@ async fn admin_update_ban_revokes_every_target_browser_and_preserves_foreign_ses
     }
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     authenticated(&auth, &cookies(&admin), "admin@example.test").await;
+    B::close(connection).await
+}
+
+async fn admin_empty_update_authority_order<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(AdminPlugin::new().roles(roles()))
+        .build()
+        .await?;
+    let administrator = signup(&auth, "empty-update-admin@example.test").await;
+    _ = promote(&auth, &administrator, "admin").await;
+    let target = signup(&auth, "empty-update-target@example.test").await;
+    let id = body(&target)["user"]["id"].as_str().unwrap().to_owned();
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    for (cookie, status, code) in [
+        (cookies(&target), 403, "YOU_ARE_NOT_ALLOWED_TO_UPDATE_USERS"),
+        (cookies(&administrator), 400, "NO_DATA_TO_UPDATE"),
+    ] {
+        let response = call(
+            &auth,
+            request(
+                "/admin/update-user",
+                Some(json!({"userId":id,"data":{}})),
+                &cookie,
+            ),
+            status,
+        )
+        .await;
+        assert_eq!(body(&response)["code"], code);
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    }
+    let retry = call(
+        &auth,
+        request(
+            "/admin/update-user",
+            Some(json!({"userId":id,"data":{"name":"Valid retry"}})),
+            &cookies(&administrator),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&retry)["id"], id);
+    assert_eq!(body(&retry)["name"], "Valid retry");
+    assert_eq!(
+        db.text("SELECT name FROM users WHERE id=$1", &[&id])
+            .await?
+            .as_deref(),
+        Some("Valid retry")
+    );
+    authenticated(&auth, &cookies(&target), "empty-update-target@example.test").await;
+    B::close(connection).await
+}
+
+async fn admin_literal_role_input_admission<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let mut configured = roles();
+    _ = configured.insert(String::new(), RolePermissions::new());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(AdminPlugin::new().roles(configured))
+        .build()
+        .await?;
+    let administrator = signup(&auth, "literal-admin@example.test").await;
+    _ = promote(&auth, &administrator, "admin").await;
+    let target = signup(&auth, "literal-target@example.test").await;
+    let id = body(&target)["user"]["id"].as_str().unwrap().to_owned();
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    for role in [
+        json!("admin,user"),
+        json!(["admin,user"]),
+        json!(" admin"),
+        json!([" user"]),
+    ] {
+        for (path, input) in [
+            ("/admin/set-role", json!({"userId":id,"role":role})),
+            (
+                "/admin/update-user",
+                json!({"userId":id,"data":{"role":role,"name":"Must not commit"}}),
+            ),
+        ] {
+            let response = call(
+                &auth,
+                request(path, Some(input), &cookies(&administrator)),
+                400,
+            )
+            .await;
+            assert_eq!(
+                body(&response)["code"],
+                "YOU_ARE_NOT_ALLOWED_TO_SET_NON_EXISTENT_VALUE"
+            );
+            assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+        }
+    }
+    for (role, expected) in [
+        (json!(["user", "admin"]), "user,admin"),
+        (json!([]), ""),
+        (json!(""), ""),
+        (json!([""]), ""),
+    ] {
+        let response = call(
+            &auth,
+            request(
+                "/admin/set-role",
+                Some(json!({"userId":id,"role":role})),
+                &cookies(&administrator),
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(body(&response)["user"]["role"], expected);
+        assert_eq!(
+            db.text("SELECT role FROM users WHERE id=$1", &[&id])
+                .await?
+                .as_deref(),
+            Some(expected)
+        );
+        assert_eq!(db.table("accounts").await?, before[1]);
+        assert_eq!(db.table("sessions").await?, before[2]);
+    }
+    authenticated(
+        &auth,
+        &cookies(&administrator),
+        "literal-admin@example.test",
+    )
+    .await;
+    B::close(connection).await
+}
+
+async fn admin_create_role_selector_precedence<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let mut configured = roles();
+    _ = configured.insert(String::new(), RolePermissions::new());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(AdminPlugin::new().roles(configured).default_role("admin"))
+        .build()
+        .await?;
+    let administrator = signup(&auth, "create-role-admin@example.test").await;
+    _ = promote(&auth, &administrator, "admin").await;
+    let initial = db.tables(&["users", "accounts", "sessions"]).await?;
+    for (index, input) in [
+        json!({"role":["user"],"data":{"role":"admin,user"}}),
+        json!({"data":{"role":["user"]}}),
+        json!({"role":"","data":{"role":["admin"]}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let email = format!("create-role-{index}@example.test");
+        let mut input = input.as_object().unwrap().clone();
+        input.extend([
+            (String::from("email"), json!(email)),
+            (String::from("name"), json!("Created owner")),
+            (String::from("password"), json!(PASSWORD)),
+        ]);
+        let response = call(
+            &auth,
+            request(
+                "/admin/create-user",
+                Some(Value::Object(input)),
+                &cookies(&administrator),
+            ),
+            200,
+        )
+        .await;
+        let expected = if index == 2 { "" } else { "user" };
+        assert_eq!(body(&response)["user"]["role"], expected);
+        let id = body(&response)["user"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            db.text("SELECT role FROM users WHERE id=$1", &[&id])
+                .await?
+                .as_deref(),
+            Some(expected)
+        );
+        assert_eq!(db.count_where("SELECT COUNT(*) FROM accounts WHERE user_id=$1 AND account_id=$1 AND provider_id='credential'", &[&id]).await?, 1);
+        let login = call(
+            &auth,
+            request(
+                "/sign-in/email",
+                Some(json!({"email":email,"password":PASSWORD})),
+                "",
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(body(&login)["user"]["id"], id);
+        assert_eq!(body(&login)["user"]["role"], expected);
+    }
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    for role in [Value::Null, json!({"unexpected":"admin"})] {
+        let response = call(&auth, request("/admin/create-user", Some(json!({"email":"invalid-nested@example.test","name":"Invalid","data":{"role":role}})), &cookies(&administrator)), 400).await;
+        assert_eq!(body(&response)["code"], "INVALID_ROLE_TYPE");
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    }
+    let users: Vec<Value> = serde_json::from_str(&db.table("users").await?)?;
+    assert!(
+        serde_json::from_str::<Vec<Value>>(&initial[0])?
+            .iter()
+            .all(|row| users.contains(row))
+    );
+    authenticated(
+        &auth,
+        &cookies(&administrator),
+        "create-role-admin@example.test",
+    )
+    .await;
+    B::close(connection).await
+}
+
+async fn admin_array_filter_sql_operands<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(AdminPlugin::new().roles(roles()))
+        .build()
+        .await?;
+    let names = [
+        "Array Owner",
+        "Array Alpha",
+        "Array Beta",
+        "Array Alpha,Array Beta",
+        "Array %_",
+    ];
+    let mut users = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        users.push(call(&auth,request("/sign-up/email",Some(json!({"email":format!("array-{i}@example.test"),"password":PASSWORD,"name":name})),""),200).await);
+    }
+    _ = promote(&auth, &users[0], "admin").await;
+    let jar = cookies(&users[0]);
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    let make = |field: &str, operator: &str, values: Vec<String>, page: bool, cookie: &str| {
+        let mut input = request("/admin/list-users", None, cookie);
+        let mut query: Vec<(String, String)> = vec![
+            ("sortBy".into(), "name".into()),
+            ("sortDirection".into(), "asc".into()),
+            ("filterField".into(), field.into()),
+            ("filterOperator".into(), operator.into()),
+        ];
+        query.extend(values.into_iter().map(|v| ("filterValue".into(), v)));
+        if page {
+            query.extend([("limit".into(), "1".into()), ("offset".into(), "1".into())]);
+        }
+        input.set_query_pairs(query);
+        input
+    };
+    for (op, values, expected, page) in [
+        (
+            "in",
+            vec![names[1], names[2]],
+            vec![names[1], names[2]],
+            false,
+        ),
+        (
+            "in",
+            vec![names[2], names[1]],
+            vec![names[1], names[2]],
+            false,
+        ),
+        ("in", vec![names[1], names[1]], vec![names[1]], false),
+        (
+            "not_in",
+            vec![names[1], names[2]],
+            vec![names[4], names[3], names[0]],
+            false,
+        ),
+        ("in", vec![names[1], names[2]], vec![names[2]], true),
+    ] {
+        let result = call(
+            &auth,
+            make(
+                "name",
+                op,
+                values.into_iter().map(str::to_owned).collect(),
+                page,
+                &jar,
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(
+            body(&result)["users"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|u| u["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            body(&result)["total"],
+            if page { 2 } else { expected.len() }
+        );
+        if page {
+            assert_eq!(body(&result)["limit"], 1);
+            assert_eq!(body(&result)["offset"], 1);
+        }
+    }
+    for field in ["id", "email"] {
+        let operands = [&users[2], &users[1]]
+            .into_iter()
+            .map(|r| body(r)["user"][field].as_str().unwrap().to_owned())
+            .collect();
+        let result = call(&auth, make(field, "in", operands, false, &jar), 200).await;
+        assert_eq!(
+            body(&result)["users"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|u| u["id"].clone())
+                .collect::<Vec<_>>(),
+            [
+                body(&users[1])["user"]["id"].clone(),
+                body(&users[2])["user"]["id"].clone()
+            ]
+        );
+    }
+    for operator in ["contains", "starts_with", "ends_with"] {
+        let result = call(
+            &auth,
+            make(
+                "name",
+                operator,
+                vec!["array alpha".into(), "array beta".into()],
+                false,
+                &jar,
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(
+            body(&result)["users"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|u| u["name"].clone())
+                .collect::<Vec<_>>(),
+            [json!(names[3])]
+        );
+    }
+    let wildcard = call(
+        &auth,
+        make(
+            "name",
+            "contains",
+            vec!["%".into(), "Array Beta".into()],
+            false,
+            &jar,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(
+        body(&wildcard)["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["name"].clone())
+            .collect::<Vec<_>>(),
+        [json!(names[3])]
+    );
+    let boolean = call(
+        &auth,
+        make(
+            "emailVerified",
+            "in",
+            vec!["0".into(), "0".into()],
+            false,
+            &jar,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&boolean)["total"], 5);
+    for value in ["true", "false", "FALSE", "0"] {
+        let result = call(
+            &auth,
+            make("emailVerified", "not_in", vec![value.into()], false, &jar),
+            200,
+        )
+        .await;
+        assert_eq!(body(&result)["total"], if value == "true" { 5 } else { 0 });
+    }
+    for operator in ["eq", "ne", "lt", "lte", "gt", "gte"] {
+        let result = call(
+            &auth,
+            make(
+                "name",
+                operator,
+                vec![names[1].into(), names[2].into()],
+                true,
+                &jar,
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(body(&result), json!({"users":[],"total":0}));
+    }
+    for (jar, status) in [(String::new(), 401), (cookies(&users[1]), 403)] {
+        _ = call(
+            &auth,
+            make(
+                "name",
+                "in",
+                vec![names[1].into(), names[2].into()],
+                false,
+                &jar,
+            ),
+            status,
+        )
+        .await;
+    }
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    B::close(connection).await
+}
+
+async fn admin_repeated_query_validation_before_auth<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(AdminPlugin::new().roles(roles()))
+        .build()
+        .await?;
+    let owner = signup(&auth, "repeat-owner@example.test").await;
+    let regular = signup(&auth, "repeat-regular@example.test").await;
+    _ = promote(&auth, &owner, "admin").await;
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    for cookie in [String::new(), cookies(&regular), cookies(&owner)] {
+        for (route, key, a, b, message) in [
+            (
+                "get-user",
+                "id",
+                body(&owner)["user"]["id"].as_str().unwrap(),
+                body(&regular)["user"]["id"].as_str().unwrap(),
+                "[query.id] Invalid input: expected string, received array",
+            ),
+            (
+                "get-user",
+                "id",
+                "same",
+                "same",
+                "[query.id] Invalid input: expected string, received array",
+            ),
+            (
+                "list-users",
+                "searchValue",
+                "A",
+                "B",
+                "[query.searchValue] Invalid input: expected string, received array",
+            ),
+            (
+                "list-users",
+                "searchField",
+                "email",
+                "name",
+                "[query.searchField] Invalid option: expected one of \"email\"|\"name\"",
+            ),
+            (
+                "list-users",
+                "searchOperator",
+                "contains",
+                "starts_with",
+                "[query.searchOperator] Invalid option: expected one of \"contains\"|\"starts_with\"|\"ends_with\"",
+            ),
+            (
+                "list-users",
+                "limit",
+                "1",
+                "2",
+                "[query.limit] Invalid input",
+            ),
+            (
+                "list-users",
+                "offset",
+                "0",
+                "1",
+                "[query.offset] Invalid input",
+            ),
+            (
+                "list-users",
+                "sortBy",
+                "email",
+                "name",
+                "[query.sortBy] Invalid input: expected string, received array",
+            ),
+            (
+                "list-users",
+                "sortDirection",
+                "asc",
+                "desc",
+                "[query.sortDirection] Invalid option: expected one of \"asc\"|\"desc\"",
+            ),
+            (
+                "list-users",
+                "filterField",
+                "email",
+                "name",
+                "[query.filterField] Invalid input: expected string, received array",
+            ),
+            (
+                "list-users",
+                "filterOperator",
+                "eq",
+                "ne",
+                "[query.filterOperator] Invalid option: expected one of \"eq\"|\"ne\"|\"lt\"|\"lte\"|\"gt\"|\"gte\"|\"in\"|\"not_in\"|\"contains\"|\"starts_with\"|\"ends_with\"",
+            ),
+        ] {
+            let mut input = request(&format!("/admin/{route}"), None, &cookie);
+            input.set_query_pairs([(key, a), (key, b)]);
+            let denied = call(&auth, input, 400).await;
+            assert_eq!(
+                body(&denied),
+                json!({"code":"VALIDATION_ERROR","message":message})
+            );
+            assert_eq!(
+                denied.headers.get("content-type").map(String::as_str),
+                Some("application/json")
+            );
+            assert!(!denied.headers.contains_key("set-cookie"));
+        }
+    }
+    let mut combined = request("/admin/list-users", None, "");
+    combined.set_query_pairs([
+        ("sortBy", "name"),
+        ("sortBy", "email"),
+        ("limit", "1"),
+        ("limit", "2"),
+        ("searchValue", "A"),
+        ("searchValue", "B"),
+    ]);
+    let result = call(&auth, combined, 400).await;
+    assert_eq!(
+        body(&result),
+        json!({"code":"VALIDATION_ERROR","message":"[query.searchValue] Invalid input: expected string, received array; [query.limit] Invalid input; [query.sortBy] Invalid input: expected string, received array"})
+    );
+    for (cookie, status) in [
+        (String::new(), 401),
+        (cookies(&regular), 403),
+        (cookies(&owner), 200),
+    ] {
+        let mut input = request("/admin/get-user", None, &cookie);
+        input.set_query_pairs([
+            ("id", body(&regular)["user"]["id"].as_str().unwrap()),
+            ("ignored", "first"),
+            ("ignored", "second"),
+        ]);
+        let result = call(&auth, input, status).await;
+        if status == 200 {
+            assert_eq!(body(&result)["id"], body(&regular)["user"]["id"]);
+        }
+    }
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
     B::close(connection).await
 }
 
