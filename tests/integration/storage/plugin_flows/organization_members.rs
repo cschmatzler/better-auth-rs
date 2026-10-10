@@ -20,7 +20,8 @@ backend_tests!(
     organization_plugin_helpers,
     organization_trusted_addition_preserves_literal_role_arrays_and_session_scope,
     fractional_organization_membership_limit_uses_actual_physical_count,
-    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results
+    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results,
+    organization_duplicate_member_authority
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -891,5 +892,131 @@ async fn organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_r
     );
     assert_eq!(policy.seen.lock().unwrap().len(), count);
     assert_eq!(db.count("member").await?, 2);
+    B::close(connection).await
+}
+
+async fn organization_duplicate_member_authority<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        OrganizationMemberAddedContext, OrganizationMemberAdditionContext,
+    };
+    #[derive(Debug, Default)]
+    struct Patch {
+        target: Mutex<Option<String>>,
+        seen: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl OrganizationMemberAdditionHooks for Patch {
+        async fn before_add_member(
+            &self,
+            c: &OrganizationMemberAdditionContext,
+        ) -> AuthResult<Option<OrganizationMemberCreatePatch>> {
+            self.seen.lock().unwrap().push(c.user.id.clone());
+            Ok(self
+                .target
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|id| OrganizationMemberCreatePatch {
+                    user_id: Some(id.clone()),
+                    role: Some("admin".into()),
+                    ..Default::default()
+                }))
+        }
+        async fn after_add_member(&self, c: &OrganizationMemberAddedContext) -> AuthResult<()> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(format!("after:{}:{}", c.user.id, c.member.user_id));
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let patch = Arc::new(Patch::default());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            member_addition_hooks: Some(patch.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let mut owner = account(&auth, "duplicate-owner@example.test").await;
+    let target = account(&auth, "duplicate-target@example.test").await;
+    let candidate = account(&auth, "duplicate-candidate@example.test").await;
+    let mut foreign = account(&auth, "duplicate-foreign@example.test").await;
+    let own = organization(&auth, &mut owner, "duplicate-own").await;
+    let other = organization(&auth, &mut foreign, "duplicate-other").await;
+    let first = add(&auth, &own, &target.id, "member").await;
+    _ = add(&auth, &other, &target.id, "member").await;
+    let protected = db.tables(&["users", "accounts", "sessions"]).await?;
+    *patch.target.lock().unwrap() = Some(target.id.clone());
+    patch.seen.lock().unwrap().clear();
+    let duplicate = add(&auth, &own, &candidate.id, "member").await;
+    assert_eq!(duplicate["userId"], target.id);
+    assert_eq!(duplicate["role"], "admin");
+    assert_ne!(duplicate["id"], first["id"]);
+    assert_eq!(
+        *patch.seen.lock().unwrap(),
+        [
+            candidate.id.clone(),
+            format!("after:{}:{}", candidate.id, target.id)
+        ]
+    );
+    let role = call(
+        &auth,
+        get(
+            "/organization/get-active-member-role",
+            &[("organizationId", &own)],
+            &target.cookie,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&role)["role"], "member");
+    _ = call(
+        &auth,
+        request(
+            "/organization/update-member-role",
+            Some(json!({"organizationId":own,"memberId":first["id"],"role":"admin"})),
+            &target.cookie,
+        ),
+        403,
+    )
+    .await;
+    let listed = body(
+        &call(
+            &auth,
+            request("/organization/list", None, &target.cookie),
+            200,
+        )
+        .await,
+    );
+    let ids = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, [own.as_str(), other.as_str(), own.as_str()]);
+    assert_eq!(
+        db.text(
+            "SELECT role FROM member WHERE id=$1",
+            &[first["id"].as_str().unwrap()]
+        )
+        .await?
+        .as_deref(),
+        Some("member")
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM member WHERE organization_id=$1 AND user_id=$2",
+            &[&own, &target.id]
+        )
+        .await?,
+        2
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        protected
+    );
     B::close(connection).await
 }
