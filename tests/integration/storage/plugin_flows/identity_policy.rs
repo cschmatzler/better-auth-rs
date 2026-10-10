@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 backend_tests!(
     identity_policy_admits_mutations_and_isolates_concurrent_requests,
     provider_admission_distinguishes_creation_returning_and_linking,
-    verification_identifier_policy_preserves_logical_access_and_failure_atomicity
+    verification_identifier_policy_preserves_logical_access_and_failure_atomicity,
+    verification_cache_before_veto
 );
 postgres_tests!(
     identity_policy_admits_mutations_and_isolates_concurrent_requests,
@@ -464,5 +465,106 @@ async fn provider_admission_distinguishes_creation_returning_and_linking<B: Back
             UserValidationAction::LinkAccount
         ]
     );
+    B::close(connection).await
+}
+
+async fn verification_cache_before_veto<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{
+        CacheAdapter, DatabaseHookContext, DatabaseHooks, HookBackend, HookControl,
+        MemoryCacheAdapter,
+    };
+    struct Veto {
+        cache: Arc<MemoryCacheAdapter>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+    #[async_trait]
+    impl<S: AuthSchema, H: HookBackend> DatabaseHooks<S, H> for Veto {
+        async fn before_update_verification(
+            &self,
+            _: &str,
+            _: &mut UpdateVerification,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<HookControl> {
+            let cached: Value = serde_json::from_str(
+                &self
+                    .cache
+                    .get("verification:application:owner")
+                    .await?
+                    .unwrap(),
+            )?;
+            assert_eq!(cached["value"], "cached-patch");
+            self.events.lock().unwrap().push("update");
+            Ok(HookControl::Cancel)
+        }
+        async fn before_delete_verification(
+            &self,
+            _: &S::Verification,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<HookControl> {
+            assert!(
+                self.cache
+                    .get("verification:application:owner")
+                    .await?
+                    .is_none()
+            );
+            self.events.lock().unwrap().push("delete");
+            Ok(HookControl::Cancel)
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let cache = Arc::new(MemoryCacheAdapter::new());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut config = AuthConfig::new(SECRET);
+    config.verification.secondary_storage = Some(cache.clone());
+    config.verification.store_in_database = true;
+    config.verification.store_identifier.default = VerificationIdentifierStrategy::Custom(
+        Arc::new(IdentifierHasher(Arc::new(AtomicBool::new(false)))),
+    );
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::hook(
+            B::store(Arc::new(config), &connection),
+            Veto {
+                cache: cache.clone(),
+                events: events.clone(),
+            },
+        ))
+        .build()
+        .await?;
+    _ = auth
+        .context()
+        .verifications()
+        .create(CreateVerification {
+            identifier: "owner".into(),
+            value: "original".into(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+        })
+        .await?;
+    _ = auth
+        .store()
+        .create_verification(CreateVerification {
+            identifier: "owner".into(),
+            value: "legacy-plain".into(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+        })
+        .await?;
+    let before = db.table("verifications").await?;
+    assert!(
+        auth.context()
+            .verifications()
+            .update(
+                "owner",
+                UpdateVerification {
+                    value: Some("cached-patch".into()),
+                    ..Default::default()
+                }
+            )
+            .await?
+            .is_none()
+    );
+    assert_eq!(db.table("verifications").await?, before);
+    auth.context().verifications().delete("owner").await?;
+    assert_eq!(db.table("verifications").await?, before);
+    assert!(cache.get("verification:application:owner").await?.is_none());
+    assert_eq!(*events.lock().unwrap(), ["update", "delete"]);
     B::close(connection).await
 }
