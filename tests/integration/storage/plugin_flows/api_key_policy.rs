@@ -22,7 +22,8 @@ backend_tests!(
     static_org_update_requires_update_action_and_preserves_key_identity,
     static_org_delete_requires_delete_action_and_revokes_only_selected_key,
     disabled_custom_key_expiration_retains_default_lifetime_through_rename,
-    banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_authority
+    banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_authority,
+    api_key_selected_list_storage_isolation
 );
 
 fn raw(path: &str, text: &str, cookie: &str) -> AuthRequest {
@@ -1893,5 +1894,148 @@ async fn banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_autho
     assert!(!orphan.headers.contains_key("set-cookie"));
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     authenticated(&auth, &cookies(&admin), "admin@example.test").await;
+    B::close(connection).await
+}
+
+async fn api_key_selected_list_storage_isolation<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{CacheAdapter, MemoryCacheAdapter};
+    struct ApplicationStorage {
+        cache: MemoryCacheAdapter,
+        writes: Mutex<Vec<(String, Option<i64>)>>,
+        keys: Mutex<std::collections::BTreeSet<String>>,
+        fail_get: Mutex<Option<String>>,
+    }
+    impl ApplicationStorage {
+        fn new() -> Self {
+            Self {
+                cache: MemoryCacheAdapter::new(),
+                writes: Mutex::new(Vec::new()),
+                keys: Mutex::new(Default::default()),
+                fail_get: Mutex::new(None),
+            }
+        }
+        async fn snapshot(&self) -> AuthResult<std::collections::BTreeMap<String, String>> {
+            let keys = self
+                .keys
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut snapshot = std::collections::BTreeMap::new();
+            for key in keys {
+                if let Some(value) = self.cache.get(&key).await? {
+                    _ = snapshot.insert(key, value);
+                }
+            }
+            Ok(snapshot)
+        }
+    }
+    #[async_trait::async_trait]
+    impl ApiKeyStorage for ApplicationStorage {
+        async fn get(&self, key: &str) -> AuthResult<Option<String>> {
+            if self
+                .fail_get
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|prefix| key.starts_with(prefix))
+            {
+                return Err(AuthError::internal("Application key storage unavailable"));
+            }
+            self.cache.get(key).await
+        }
+        async fn set(
+            &self,
+            key: &str,
+            value: &str,
+            ttl: Option<chrono::Duration>,
+        ) -> AuthResult<()> {
+            _ = self.keys.lock().unwrap().insert(key.into());
+            self.writes
+                .lock()
+                .unwrap()
+                .push((key.into(), ttl.map(|ttl| ttl.num_seconds())));
+            match ttl {
+                Some(ttl) => self.cache.set(key, value, ttl).await,
+                None => self.cache.set_without_expiry(key, value).await,
+            }
+        }
+        async fn delete(&self, key: &str) -> AuthResult<()> {
+            self.cache.delete(key).await
+        }
+    }
+
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let storage = Arc::new(ApplicationStorage::new());
+    let isolated = Arc::new(ApplicationStorage::new());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(
+            ApiKeyPlugin::with_config(ApiKeyConfig {
+                storage: ApiKeyStorageMode::SecondaryStorage,
+                custom_storage: Some(storage.clone()),
+                defer_updates: false,
+                ..Default::default()
+            })
+            .configuration(ApiKeyConfig {
+                config_id: "isolated".into(),
+                storage: ApiKeyStorageMode::SecondaryStorage,
+                custom_storage: Some(isolated.clone()),
+                defer_updates: false,
+                ..Default::default()
+            }),
+        )
+        .build()
+        .await?;
+    let owner = signup(&auth, "isolated-list@example.test").await;
+    let selected = body(
+        &call(
+            &auth,
+            request(
+                "/api-key/create",
+                Some(json!({"name":"Selected"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await,
+    );
+    _ = call(
+        &auth,
+        request(
+            "/api-key/create",
+            Some(json!({"configId":"isolated","name":"Other store"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let before = storage.snapshot().await?;
+    let other_before = isolated.snapshot().await?;
+    let protected = db
+        .tables(&["users", "accounts", "sessions", "api_keys"])
+        .await?;
+    *isolated.fail_get.lock().unwrap() = Some("api-key:by-ref:".into());
+    let mut input = request("/api-key/list", None, &cookies(&owner));
+    input.set_query_pairs([("configId", "default")]);
+    let list = body(&call(&auth, input, 200).await);
+    assert_eq!(list["total"], 1);
+    assert_eq!(list["apiKeys"][0]["id"], selected["id"]);
+    assert_eq!(storage.snapshot().await?, before);
+    assert_eq!(isolated.snapshot().await?, other_before);
+    let denied = call(&auth, request("/api-key/list", None, &cookies(&owner)), 500).await;
+    assert!(denied.body.is_empty());
+    assert_eq!(storage.snapshot().await?, before);
+    assert_eq!(isolated.snapshot().await?, other_before);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "api_keys"])
+            .await?,
+        protected
+    );
+    *isolated.fail_get.lock().unwrap() = None;
+    assert_eq!(
+        body(&call(&auth, request("/api-key/list", None, &cookies(&owner)), 200).await)["total"],
+        2
+    );
     B::close(connection).await
 }
