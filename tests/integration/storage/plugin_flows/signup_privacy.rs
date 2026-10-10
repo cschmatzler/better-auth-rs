@@ -10,7 +10,8 @@ backend_tests!(
     existing_signup_notification_waits_or_remains_owned_in_background,
     synthetic_callback_failures_keep_public_error_boundary_and_principals,
     signup_privacy_never_synthesizes_creation_cancellation_or_ordinary_error,
-    synthetic_duplicate_identity_uses_application_id_policy
+    synthetic_duplicate_identity_uses_application_id_policy,
+    synthetic_customization_retains_declared_application_fields
 );
 postgres_tests!(duplicate_signup_preserves_identity_and_filters_synthetic_output);
 
@@ -668,6 +669,168 @@ async fn synthetic_duplicate_identity_uses_application_id_policy<B: Backend>(db:
         &setup,
         &cookies(&foreign),
         "synthetic-id-foreign@example.test",
+    )
+    .await;
+    B::close(connection).await
+}
+
+async fn synthetic_customization_retains_declared_application_fields<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::field_policy::FieldConfig;
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    for column in [
+        "synthetic_tier",
+        "synthetic_secret",
+        "synthetic_locale",
+        "synthetic_note",
+    ] {
+        _ = db
+            .execute(&format!("ALTER TABLE users ADD COLUMN {column} TEXT"), &[])
+            .await?;
+    }
+    let setup = super::auth_probe::fast_builder::<B>(&connection)
+        .build()
+        .await?;
+    let owner = signup(&setup, "synthetic-fields-owner@example.test").await;
+    let foreign = signup(&setup, "synthetic-fields-foreign@example.test").await;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "verifications"])
+        .await?;
+    for custom in [false, true] {
+        let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        _ = config.user.additional_fields.insert(
+            "syntheticTier".into(),
+            FieldConfig::new(json!({"type":"string"}))
+                .field_name("synthetic_tier")
+                .validate(|value| {
+                    value
+                        .as_str()
+                        .map(|v| {
+                            alibi::utils::json::JsValue::String(format!(
+                                "parsed:{}",
+                                v.trim().to_lowercase()
+                            ))
+                        })
+                        .ok_or_else(|| "tier must be a string".into())
+                }),
+        );
+        _ = config.user.additional_fields.insert(
+            "syntheticSecret".into(),
+            FieldConfig::new(json!({"type":"string"}))
+                .field_name("synthetic_secret")
+                .hidden(),
+        );
+        _ = config.user.additional_fields.insert(
+            "syntheticLocale".into(),
+            FieldConfig::new(json!({"type":"string"}))
+                .field_name("synthetic_locale")
+                .default_value(json!("en")),
+        );
+        _ = config.user.additional_fields.insert(
+            "syntheticNote".into(),
+            FieldConfig::new(json!({"type":"string"})).field_name("synthetic_note"),
+        );
+        let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let mut plugin = super::auth_probe::fast_password().auto_sign_in(false);
+        if custom {
+            let observed = seen.clone();
+            plugin = plugin.custom_synthetic_user(Arc::new(move |input| {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push(json!(input.additional_fields));
+                assert!(!input.additional_fields.contains_key("name"));
+                assert!(!input.additional_fields.contains_key("unknownApplication"));
+                let mut fields = input.core_fields;
+                _ = fields.insert("id".into(), json!(input.id));
+                if let Some(tier) = input.additional_fields.get("syntheticTier") {
+                    _ = fields.insert(
+                        "syntheticTier".into(),
+                        json!(format!("custom:{}", tier.as_str().unwrap())),
+                    );
+                }
+                _ = fields.insert("syntheticSecret".into(), json!("custom-private"));
+                _ = fields.insert("unknownApplication".into(), json!("must-not-escape"));
+                Ok(fields)
+            }));
+        }
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .plugin(plugin)
+            .build()
+            .await?;
+        for supplied in [true, false] {
+            seen.lock().unwrap().clear();
+            let mut input = json!({"name":"Submitted fields","email":"synthetic-fields-owner@example.test","password":PASSWORD,"unknownApplication":"unregistered"});
+            if supplied {
+                input["syntheticTier"] = json!(" GOLD ");
+                input["syntheticSecret"] = json!("submitted-private");
+            }
+            let response = call(
+                &auth,
+                request("/sign-up/email", Some(input), &cookies(&foreign)),
+                200,
+            )
+            .await;
+            let returned = body(&response);
+            assert!(returned["token"].is_null());
+            assert!(cookies(&response).is_empty());
+            assert_eq!(returned["user"]["name"], "Submitted fields");
+            assert_ne!(returned["user"]["id"], body(&owner)["user"]["id"]);
+            assert_eq!(
+                returned["user"]["syntheticTier"],
+                if supplied {
+                    json!(if custom {
+                        "custom:parsed:gold"
+                    } else {
+                        "parsed:gold"
+                    })
+                } else {
+                    Value::Null
+                }
+            );
+            assert_eq!(returned["user"]["syntheticLocale"], "en");
+            assert!(
+                returned["user"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("syntheticNote")
+            );
+            assert!(returned["user"]["syntheticNote"].is_null());
+            for secret in ["syntheticSecret", "unknownApplication", "password"] {
+                assert!(returned["user"].get(secret).is_none());
+            }
+            let expected = if supplied {
+                json!({"syntheticTier":"parsed:gold","syntheticSecret":"submitted-private","syntheticLocale":"en"})
+            } else {
+                json!({"syntheticLocale":"en"})
+            };
+            assert_eq!(
+                *seen.lock().unwrap(),
+                if custom {
+                    vec![expected]
+                } else {
+                    Vec::<Value>::new()
+                }
+            );
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions", "verifications"])
+                    .await?,
+                before
+            );
+        }
+    }
+    authenticated(
+        &setup,
+        &cookies(&owner),
+        "synthetic-fields-owner@example.test",
+    )
+    .await;
+    authenticated(
+        &setup,
+        &cookies(&foreign),
+        "synthetic-fields-foreign@example.test",
     )
     .await;
     B::close(connection).await
