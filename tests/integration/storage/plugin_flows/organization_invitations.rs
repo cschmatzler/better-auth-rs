@@ -16,7 +16,8 @@ backend_tests!(
     organization_invitation_policy,
     organization_anonymous_and_failures,
     organization_invitation_stamps,
-    processed_invitation_cancellation_keeps_members_and_original_callback_status
+    processed_invitation_cancellation_keeps_members_and_original_callback_status,
+    organization_invitation_reset_write_failure
 );
 
 #[derive(Debug, Default)]
@@ -713,4 +714,187 @@ async fn processed_invitation_cancellation_keeps_members_and_original_callback_s
         B::close(connection).await?;
     }
     Ok(())
+}
+
+async fn organization_invitation_reset_write_failure<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        OrganizationInvitationAcceptanceContext, OrganizationInvitationAcceptanceHooks,
+    };
+    #[derive(Debug, Default)]
+    struct Receipt(Mutex<usize>);
+    #[async_trait::async_trait]
+    impl OrganizationInvitationAcceptanceHooks for Receipt {
+        async fn before_accept_invitation(
+            &self,
+            _: &OrganizationInvitationAcceptanceContext,
+        ) -> AuthResult<()> {
+            *self.0.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let receipt = Arc::new(Receipt::default());
+    let organization = OrganizationConfig {
+        teams: TeamsConfig {
+            enabled: true,
+            create_default_team: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(OrganizationPlugin::with_config(organization))
+        .build()
+        .await?;
+    let owner = signup(&auth, "staged-invitation-owner@example.test").await;
+    let target = signup(&auth, "staged-invitation-target@example.test").await;
+    let foreign = signup(&auth, "staged-invitation-foreign@example.test").await;
+    let sibling = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"staged-invitation-target@example.test","password":PASSWORD})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    let created = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Stage","slug":"invitation-stage"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let org = body(&created)["id"].as_str().unwrap().to_owned();
+    let jar = merge(&cookies(&owner), &cookies(&created));
+
+    let created_team = call(
+        &auth,
+        request(
+            "/organization/create-team",
+            Some(json!({"organizationId":org,"name":"Invited team"})),
+            &jar,
+        ),
+        200,
+    )
+    .await;
+    let team = body(&created_team)["id"].as_str().unwrap().to_owned();
+    let invited=call(&auth,request("/organization/invite-member",Some(json!({"organizationId":org,"email":"staged-invitation-target@example.test","role":"member","teamId":team})),&jar),200).await;
+    let invitation = body(&invited)["id"].as_str().unwrap().to_owned();
+
+    let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            invitation_acceptance_hooks: Some(receipt.clone()),
+            teams: TeamsConfig {
+                enabled: true,
+                create_default_team: false,
+                maximum_members_per_team: Some(0.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    _ = db.execute("CREATE TRIGGER fail_invitation_reset BEFORE UPDATE ON invitation WHEN OLD.status='accepted' AND NEW.status='pending' BEGIN SELECT RAISE(ABORT,'reset denied'); END",&[]).await?;
+    let before = db
+        .tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "team",
+            "team_member",
+        ])
+        .await?;
+    let mut expected = auth
+        .store()
+        .get_invitation_by_id(&invitation)
+        .await?
+        .unwrap();
+    expected.status = alibi::InvitationStatus::Accepted;
+    let rejected = call(
+        &auth,
+        request(
+            "/organization/accept-invitation",
+            Some(json!({"invitationId":invitation})),
+            &cookies(&target),
+        ),
+        500,
+    )
+    .await;
+    assert!(rejected.body.is_empty());
+    assert!(cookies(&rejected).is_empty());
+    assert_eq!(
+        auth.store()
+            .get_invitation_by_id(&invitation)
+            .await?
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        db.tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "team",
+            "team_member"
+        ])
+        .await?,
+        before
+    );
+    assert_eq!(*receipt.0.lock().unwrap(), 1);
+    let replay = call(
+        &auth,
+        request(
+            "/organization/accept-invitation",
+            Some(json!({"invitationId":invitation})),
+            &cookies(&target),
+        ),
+        400,
+    )
+    .await;
+    assert_eq!(body(&replay)["code"], "INVITATION_NOT_FOUND");
+    assert_eq!(*receipt.0.lock().unwrap(), 1);
+    assert_eq!(
+        db.tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "team",
+            "team_member"
+        ])
+        .await?,
+        before
+    );
+    _ = db
+        .execute("DROP TRIGGER fail_invitation_reset", &[])
+        .await?;
+    authenticated(
+        &auth,
+        &cookies(&foreign),
+        "staged-invitation-foreign@example.test",
+    )
+    .await;
+    authenticated(
+        &auth,
+        &cookies(&sibling),
+        "staged-invitation-target@example.test",
+    )
+    .await;
+    B::close(connection).await
 }
