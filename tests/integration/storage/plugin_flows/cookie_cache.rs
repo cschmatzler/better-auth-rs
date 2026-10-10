@@ -23,7 +23,8 @@ backend_tests!(
     managed_jwt_signer_issues_and_verifies_cache_tokens,
     update_user_refreshes_the_cache_and_invalid_sessions_clear_every_cookie_family,
     pending_factor_challenge_clears_cache_cookies_including_incoming_chunks,
-    published_snapshot_exposes_public_views_to_response_hooks
+    published_snapshot_exposes_public_views_to_response_hooks,
+    cache_version_issuance_failure_preserves_anonymous_principal
 );
 postgres_tests!(
     every_strategy_serves_reads_from_the_cookie_and_rejects_tampering,
@@ -482,5 +483,143 @@ async fn published_snapshot_exposes_public_views_to_response_hooks<B: Backend>(
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0]["email"], "observer@example.test");
     assert_eq!(seen[0]["token"], body(&issued)["token"]);
+    Ok(())
+}
+
+async fn cache_version_issuance_failure_preserves_anonymous_principal<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::plugins::AnonymousPlugin;
+    use alibi::plugins::anonymous::{AnonymousConfig, AnonymousLink, LinkAnonymousAccount};
+    use alibi::{
+        AuthError, CacheVersionContext, CacheVersionSource, CookieCacheVersion,
+        CookieCacheVersionResolver,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    struct Version {
+        armed: AtomicBool,
+        api: bool,
+    }
+    #[async_trait]
+    impl CookieCacheVersionResolver for Version {
+        async fn resolve(&self, c: &CacheVersionContext) -> AuthResult<String> {
+            if self.armed.load(Ordering::SeqCst)
+                && c.source() == CacheVersionSource::Created
+                && c.user().is_anonymous != Some(true)
+            {
+                if self.api {
+                    return Err(AuthError::Api {
+                        status: 500,
+                        code: Some("APPLICATION_CACHE_DENIED".into()),
+                        message: "Configured cache version rejected issuance".into(),
+                    });
+                }
+                return Err(AuthError::internal("application publication outage"));
+            }
+            Ok("v1".into())
+        }
+    }
+    struct Link(AtomicUsize);
+    #[async_trait]
+    impl LinkAnonymousAccount for Link {
+        async fn link(&self, _: &AnonymousLink, _: &AuthRequest) -> AuthResult<()> {
+            _ = self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    for api in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let version = Arc::new(Version {
+            armed: AtomicBool::new(false),
+            api,
+        });
+        let link = Arc::new(Link(AtomicUsize::new(0)));
+        let config = AuthConfig::new(SECRET)
+            .base_url(ORIGIN)
+            .session_cookie_cache(CookieCacheConfig {
+                enabled: true,
+                version: Some(CookieCacheVersion::Resolver(version.clone())),
+                ..Default::default()
+            });
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(AnonymousPlugin::with_config(AnonymousConfig {
+                on_link_account: Some(link.clone()),
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let anonymous = call(
+            &auth,
+            request("/sign-in/anonymous", Some(json!({})), ""),
+            200,
+        )
+        .await;
+        let jar = cookies(&anonymous);
+        let before = db
+            .tables(&["users", "accounts", "sessions", "verifications"])
+            .await?;
+        version.armed.store(true, Ordering::SeqCst);
+        let rejected=call(&auth,request("/sign-up/email",Some(json!({"email":"cache-denied-replacement@example.test","password":PASSWORD,"name":"Replacement"})),&jar),500).await;
+        if api {
+            assert_eq!(
+                body(&rejected),
+                json!({"code":"APPLICATION_CACHE_DENIED","message":"Configured cache version rejected issuance"})
+            );
+        } else {
+            assert!(rejected.body.is_empty());
+        }
+        assert_eq!(
+            rejected
+                .headers
+                .get_all("set-cookie")
+                .any(|v| v.starts_with("better-auth.session_token=")),
+            api
+        );
+        assert!(
+            !rejected
+                .headers
+                .get_all("set-cookie")
+                .any(|v| v.starts_with("better-auth.session_data="))
+        );
+        assert_eq!(link.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM users WHERE email=$1",
+                &["cache-denied-replacement@example.test"]
+            )
+            .await?,
+            0
+        );
+        let old = call(&auth, request("/get-session", None, &jar), 200).await;
+        assert_eq!(body(&old)["user"]["id"], body(&anonymous)["user"]["id"]);
+        let update = cookies(&rejected);
+        let actual_jar = if update.is_empty() {
+            jar.clone()
+        } else {
+            merged(&jar, &update)
+        };
+        let actual = call(&auth, request("/get-session", None, &actual_jar), 200).await;
+        if api {
+            assert_eq!(body(&actual), Value::Null);
+        } else {
+            assert_eq!(body(&actual)["user"]["id"], body(&anonymous)["user"]["id"]);
+        }
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+        B::close(connection).await?;
+    }
     Ok(())
 }
