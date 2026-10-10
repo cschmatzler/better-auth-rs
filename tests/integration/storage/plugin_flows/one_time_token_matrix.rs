@@ -15,7 +15,8 @@ backend_tests!(
     one_time_token_server_endpoints_publish_cached_identity,
     ott_new_session_callback_failures_preserve_committed_authentication,
     ott_redemption_hasher_retry,
-    ott_generator_real_endpoint_context
+    ott_generator_real_endpoint_context,
+    ott_verification_cancellation_result
 );
 
 struct Generator(&'static str);
@@ -586,5 +587,116 @@ async fn ott_generator_real_endpoint_context<B: Backend>(db: Db) -> TestResult {
     }
     assert_eq!(db.table("sessions").await?, sessions);
     assert_eq!(db.count("verifications").await?, 0);
+    B::close(connection).await
+}
+
+async fn ott_verification_cancellation_result<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{DatabaseHookContext, DatabaseHooks, HookBackend, HookControl};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    #[derive(Clone)]
+    struct Veto {
+        cancel: Arc<AtomicBool>,
+        seen: Arc<Mutex<Vec<(String, String)>>>,
+    }
+    #[async_trait]
+    impl<S: AuthSchema, H: HookBackend> DatabaseHooks<S, H> for Veto {
+        async fn before_create_verification(
+            &self,
+            v: &mut alibi::CreateVerification,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<HookControl> {
+            if v.identifier.starts_with("one-time-token:") {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((v.identifier.clone(), v.value.clone()));
+                if self.cancel.load(Ordering::SeqCst) {
+                    return Ok(HookControl::Cancel);
+                }
+            }
+            Ok(HookControl::Continue)
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let veto = Arc::new(Veto {
+        cancel: Arc::new(AtomicBool::new(true)),
+        seen: Arc::new(Mutex::new(Vec::new())),
+    });
+    let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::hook(
+            B::store(Arc::new(config), &connection),
+            veto.as_ref().clone(),
+        ))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(OneTimeTokenPlugin::new())
+        .build()
+        .await?;
+    let owner = signup(&auth, "cancel-owner@example.test").await;
+    let foreign = signup(&auth, "cancel-foreign@example.test").await;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "verifications"])
+        .await?;
+    let issued = call(
+        &auth,
+        request("/one-time-token/generate", None, &cookies(&owner)),
+        200,
+    )
+    .await;
+    let token = body(&issued)["token"].as_str().unwrap().to_owned();
+    assert!(!token.is_empty());
+    assert_eq!(
+        *veto.seen.lock().unwrap(),
+        [(
+            format!("one-time-token:{token}"),
+            body(&owner)["token"].as_str().unwrap().to_owned()
+        )]
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "verifications"])
+            .await?,
+        before
+    );
+    let denied = call(
+        &auth,
+        request(
+            "/one-time-token/verify",
+            Some(json!({"token":token})),
+            &cookies(&foreign),
+        ),
+        400,
+    )
+    .await;
+    assert_eq!(body(&denied)["message"], "Invalid token");
+    assert!(!denied.headers.contains_key("set-cookie"));
+    veto.cancel.store(false, Ordering::SeqCst);
+    let live = call(
+        &auth,
+        request("/one-time-token/generate", None, &cookies(&owner)),
+        200,
+    )
+    .await;
+    let live = body(&live)["token"].as_str().unwrap().to_owned();
+    assert_eq!(db.count("verifications").await?, 1);
+    let accepted = call(
+        &auth,
+        request("/one-time-token/verify", Some(json!({"token":live})), ""),
+        200,
+    )
+    .await;
+    assert_eq!(body(&accepted)["session"]["token"], body(&owner)["token"]);
+    _ = call(
+        &auth,
+        request("/one-time-token/verify", Some(json!({"token":live})), ""),
+        400,
+    )
+    .await;
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "verifications"])
+            .await?,
+        before
+    );
     B::close(connection).await
 }
