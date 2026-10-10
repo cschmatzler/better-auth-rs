@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 backend_tests!(
     identity_policy_admits_mutations_and_isolates_concurrent_requests,
     provider_admission_distinguishes_creation_returning_and_linking,
-    verification_identifier_policy_preserves_logical_access_and_failure_atomicity
+    verification_identifier_policy_preserves_logical_access_and_failure_atomicity,
+    verification_find_cleanup_snapshot
 );
 postgres_tests!(
     identity_policy_admits_mutations_and_isolates_concurrent_requests,
@@ -465,4 +466,112 @@ async fn provider_admission_distinguishes_creation_returning_and_linking<B: Back
         ]
     );
     B::close(connection).await
+}
+
+async fn verification_find_cleanup_snapshot<B: Backend>(db: Db) -> TestResult {
+    use alibi::AuthVerification;
+    use alibi::store::{DatabaseHookContext, DatabaseHooks, HookBackend, HookControl};
+    use alibi::verification::VerificationCreation;
+    struct Events(Arc<Mutex<Vec<(bool, String)>>>);
+    #[async_trait]
+    impl<S: AuthSchema, H: HookBackend> DatabaseHooks<S, H> for Events {
+        async fn before_delete_verification(
+            &self,
+            row: &S::Verification,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<HookControl> {
+            self.0.lock().unwrap().push((false, row.id().into_owned()));
+            Ok(HookControl::Continue)
+        }
+        async fn after_delete_verification(
+            &self,
+            row: &S::Verification,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<()> {
+            self.0.lock().unwrap().push((true, row.id().into_owned()));
+            Ok(())
+        }
+    }
+    for mode in [0, 1, 2] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut config = AuthConfig::new(SECRET);
+        config.verification.disable_cleanup = mode == 1;
+        if mode == 2 {
+            config.advanced.database.default_find_many_limit = 2;
+        }
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::hook(
+                B::store(Arc::new(config), &connection),
+                Events(events.clone()),
+            ))
+            .build()
+            .await?;
+        for index in 0..4 {
+            _ = auth
+                .context()
+                .verifications()
+                .create(VerificationCreation {
+                    id: Some(format!("expired-{index}")),
+                    identifier: if index < 2 {
+                        "cleanup-owner".into()
+                    } else {
+                        format!("expired-other-{index}")
+                    },
+                    value: format!("proof-{index}"),
+                    expires_at: chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")?
+                        .with_timezone(&chrono::Utc),
+                    created_at: chrono::DateTime::parse_from_rfc3339(&format!(
+                        "2020-01-0{}T00:00:00Z",
+                        index + 1
+                    ))?
+                    .with_timezone(&chrono::Utc),
+                    updated_at: chrono::Utc::now(),
+                })
+                .await?;
+        }
+        _ = auth
+            .store()
+            .create_verification(CreateVerification {
+                identifier: "live-other".into(),
+                value: "untouched".into(),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
+            })
+            .await?;
+        let before = db.table("verifications").await?;
+        let selected = auth
+            .context()
+            .verifications()
+            .find("cleanup-owner")
+            .await?
+            .unwrap();
+        assert_eq!(selected.id(), Some("expired-1"));
+        assert_eq!(selected.value()?, "proof-1");
+        assert!(selected.is_expired());
+        assert_eq!(
+            db.count("verifications").await?,
+            if mode == 1 { 5 } else { 1 }
+        );
+        if mode == 1 {
+            assert_eq!(db.table("verifications").await?, before);
+            assert!(events.lock().unwrap().is_empty());
+        } else {
+            let receipts = events.lock().unwrap().clone();
+            let count = if mode == 2 { 2 } else { 4 };
+            assert_eq!(receipts.iter().filter(|(after, _)| !after).count(), count);
+            assert_eq!(receipts.iter().filter(|(after, _)| *after).count(), count);
+        }
+        assert_eq!(
+            db.text(
+                "SELECT value FROM verifications WHERE identifier=$1",
+                &["live-other"]
+            )
+            .await?
+            .as_deref(),
+            Some("untouched")
+        );
+        B::close(connection).await?;
+    }
+    Ok(())
 }
