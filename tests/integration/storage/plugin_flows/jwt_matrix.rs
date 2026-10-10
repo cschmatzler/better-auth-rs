@@ -19,7 +19,8 @@ backend_tests!(
     jwt_server_keyring_preserves_absent_request_and_virtual_endpoint,
     jwt_application_keyring_concurrent_initial_discovery_retains_both_signing_keys,
     jwt_configured_expiration_precision,
-    jwt_compact_revoked_principal_signing
+    jwt_compact_revoked_principal_signing,
+    jwt_server_claim_override_replacement
 );
 
 #[derive(Default)]
@@ -1160,5 +1161,102 @@ async fn jwt_compact_revoked_principal_signing<B: Backend>(db: Db) -> TestResult
             .as_deref(),
         Some("Durable rename")
     );
+    B::close(connection).await
+}
+
+async fn jwt_server_claim_override_replacement<B: Backend>(db: Db) -> TestResult {
+    use alibi::endpoint::EndpointOptions;
+    struct Claims(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl DefineJwtPayload for Claims {
+        async fn define_payload(&self, _: &JwtSession) -> AuthResult<Map<String, Value>> {
+            _ = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Map::new())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let jwt = JwtPlugin::with_config(JwtPluginConfig {
+        claims: JwtClaimsConfig {
+            issuer: Some("configured-issuer".into()),
+            audience: Some(JwtAudience::One("configured-audience".into())),
+            expiration: JwtExpiration::AfterSeconds(10800.0),
+        },
+        define_payload: Some(Arc::new(Claims(calls.clone()))),
+        ..Default::default()
+    });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(jwt)
+        .build()
+        .await?;
+    let keys: jsonwebtoken::jwk::JwkSet =
+        serde_json::from_value(body(&call(&auth, request("/jwks", None, ""), 200).await))?;
+    let before = db.table("jwks").await?;
+    for (overrides, payload, issuer, audience, expiry) in [
+        (
+            None,
+            json!({"iat":100,"sub":"service"}),
+            "configured-issuer",
+            json!("configured-audience"),
+            10900,
+        ),
+        (
+            Some(json!({"jwt":{"issuer":"partial-issuer"}})),
+            json!({"iat":100,"sub":"service"}),
+            "partial-issuer",
+            json!(ORIGIN),
+            1000,
+        ),
+        (
+            Some(
+                json!({"jwt":{"issuer":"full-issuer","audience":["one","two"],"expirationTime":"2 hours"}}),
+            ),
+            json!({"iat":100,"sub":"service"}),
+            "full-issuer",
+            json!(["one", "two"]),
+            7300,
+        ),
+        (
+            Some(json!({"jwt":{"issuer":"ignored"}})),
+            json!({"iat":100,"sub":"service","iss":"payload-issuer","aud":"payload-audience","exp":4102444800_u64}),
+            "payload-issuer",
+            json!("payload-audience"),
+            4102444800_i64,
+        ),
+        (
+            None,
+            json!({"iat":100,"sub":"restored"}),
+            "configured-issuer",
+            json!("configured-audience"),
+            10900,
+        ),
+    ] {
+        let mut input = json!({"payload":payload});
+        if let Some(overrides) = overrides {
+            input["overrideOptions"] = overrides;
+        }
+        let endpoint = JwtPlugin::sign_endpoint(parse_value("{}")?)
+            .with_body_value(parse_value(&input.to_string())?);
+        let token = auth
+            .dispatch_endpoint(endpoint, EndpointOptions::default())
+            .await?
+            .decode()?
+            .token;
+        let h = jsonwebtoken::decode_header(&token)?;
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
+        validation.validate_exp = false;
+        validation.validate_aud = false;
+        let claims = jsonwebtoken::decode::<Value>(
+            &token,
+            &jsonwebtoken::DecodingKey::from_jwk(keys.find(h.kid.as_deref().unwrap()).unwrap())?,
+            &validation,
+        )?
+        .claims;
+        assert_eq!(claims["iss"], issuer);
+        assert_eq!(claims["aud"], audience);
+        assert_eq!(claims["exp"], expiry);
+        assert_eq!(db.table("jwks").await?, before);
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     B::close(connection).await
 }
