@@ -20,7 +20,8 @@ backend_tests!(
     organization_invitation_raw_quota,
     organization_invitation_raw_expiry,
     organization_invitation_delivery_await_policy,
-    organization_invitation_page_before_expiry
+    organization_invitation_page_before_expiry,
+    organization_invitation_first_reinvite_cancellation
 );
 
 #[derive(Debug, Default)]
@@ -1268,6 +1269,160 @@ async fn organization_invitation_page_before_expiry<B: Backend>(db: Db) -> TestR
             "accounts",
             "sessions",
             "member",
+            "team",
+            "team_member"
+        ])
+        .await?,
+        before
+    );
+    authenticated(
+        &auth,
+        &cookies(&foreign),
+        "invitation-life-foreign@example.test",
+    )
+    .await;
+    authenticated(
+        &auth,
+        &cookies(&target),
+        "invitation-life-target@example.test",
+    )
+    .await;
+    B::close(connection).await
+}
+
+async fn organization_invitation_first_reinvite_cancellation<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::InvitationLimit;
+    let organization = OrganizationConfig {
+        invitation_limit: Some(InvitationLimit::Fixed(1.0)),
+        cancel_pending_invitations_on_reinvite: true,
+        ..Default::default()
+    };
+
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(OrganizationPlugin::with_config(organization))
+        .build()
+        .await?;
+    let owner = signup(&auth, "invitation-life-owner@example.test").await;
+    let foreign = signup(&auth, "invitation-life-foreign@example.test").await;
+    let target = signup(&auth, "invitation-life-target@example.test").await;
+    let created = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Life","slug":"invitation-life"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let org = body(&created)["id"].as_str().unwrap().to_owned();
+    let jar = merge(&cookies(&owner), &cookies(&created));
+
+    let mut seeded = Vec::new();
+    for expired in [true, false, false] {
+        seeded.push(
+            auth.store()
+                .create_invitation(alibi::CreateInvitation::new(
+                    &org,
+                    "reinvite-recipient@example.test",
+                    "member",
+                    body(&owner)["user"]["id"].as_str().unwrap(),
+                    chrono::Utc::now() + chrono::Duration::days(if expired { -1 } else { 1 }),
+                ))
+                .await?,
+        );
+    }
+    let before = db
+        .tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "organization",
+            "team",
+            "team_member",
+        ])
+        .await?;
+    let input =
+        json!({"organizationId":org,"email":"reinvite-recipient@example.test","role":"member"});
+    let denied = call(
+        &auth,
+        request("/organization/invite-member", Some(input.clone()), &jar),
+        403,
+    )
+    .await;
+    assert_eq!(body(&denied)["code"], "INVITATION_LIMIT_REACHED");
+    assert_eq!(db.count("invitation").await?, 3);
+    assert_eq!(
+        auth.store()
+            .get_invitation_by_id(&seeded[0].id)
+            .await?
+            .unwrap(),
+        seeded[0]
+    );
+    assert_eq!(
+        auth.store()
+            .get_invitation_by_id(&seeded[2].id)
+            .await?
+            .unwrap(),
+        seeded[2]
+    );
+    let first = auth
+        .store()
+        .get_invitation_by_id(&seeded[1].id)
+        .await?
+        .unwrap();
+    assert_eq!(first.status, alibi::InvitationStatus::Canceled);
+    let mut expected = seeded[1].clone();
+    expected.status = alibi::InvitationStatus::Canceled;
+    assert_eq!(first, expected);
+    let retry = call(
+        &auth,
+        request("/organization/invite-member", Some(input), &jar),
+        200,
+    )
+    .await;
+    assert!(
+        seeded
+            .iter()
+            .all(|r| r.id != body(&retry)["id"].as_str().unwrap())
+    );
+    assert_eq!(db.count("invitation").await?, 4);
+    assert_eq!(
+        auth.store()
+            .get_invitation_by_id(&seeded[0].id)
+            .await?
+            .unwrap(),
+        seeded[0]
+    );
+    assert_eq!(
+        auth.store()
+            .get_invitation_by_id(&seeded[1].id)
+            .await?
+            .unwrap(),
+        expected
+    );
+    expected = seeded[2].clone();
+    expected.status = alibi::InvitationStatus::Canceled;
+    assert_eq!(
+        auth.store()
+            .get_invitation_by_id(&seeded[2].id)
+            .await?
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        db.tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "organization",
             "team",
             "team_member"
         ])
