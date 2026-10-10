@@ -20,7 +20,8 @@ backend_tests!(
     organization_plugin_helpers,
     organization_trusted_addition_preserves_literal_role_arrays_and_session_scope,
     fractional_organization_membership_limit_uses_actual_physical_count,
-    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results
+    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results,
+    organization_last_owner_adapter_page
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -891,5 +892,85 @@ async fn organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_r
     );
     assert_eq!(policy.seen.lock().unwrap().len(), count);
     assert_eq!(db.count("member").await?, 2);
+    B::close(connection).await
+}
+
+async fn organization_last_owner_adapter_page<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::types::OrganizationResponse;
+    #[derive(Debug)]
+    struct Policy(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl OrganizationMembershipLimitResolver for Policy {
+        async fn maximum_members(&self, _: &UserView, _: &OrganizationResponse) -> AuthResult<f64> {
+            _ = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(alibi::AuthError::internal("admission policy outage"))
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let setup = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::new())
+        .build()
+        .await?;
+    let mut owner = account(&setup, "owner-page-first@example.test").await;
+    let second = account(&setup, "owner-page-second@example.test").await;
+    let foreign = account(&setup, "owner-page-foreign@example.test").await;
+    let org = organization(&setup, &mut owner, "owner-page").await;
+    let added = add(&setup, &org, &second.id, "owner").await;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    let policy = Arc::new(Policy(std::sync::atomic::AtomicUsize::new(0)));
+    for admission in [
+        MembershipLimit::Fixed(1.0),
+        MembershipLimit::Resolver(policy.clone()),
+    ] {
+        let restricted = matches!(admission, MembershipLimit::Fixed(_));
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                membership_limit: Some(admission),
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let response = call(
+            &auth,
+            request(
+                "/organization/remove-member",
+                Some(json!({"organizationId":org,"memberIdOrEmail":added["id"]})),
+                &owner.cookie,
+            ),
+            if restricted { 400 } else { 200 },
+        )
+        .await;
+        if restricted {
+            assert_eq!(
+                body(&response)["code"],
+                "YOU_CANNOT_LEAVE_THE_ORGANIZATION_AS_THE_ONLY_OWNER"
+            );
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                    .await?,
+                before
+            );
+        } else {
+            assert_eq!(body(&response)["member"]["id"], added["id"]);
+            assert_eq!(
+                db.count_where(
+                    "SELECT COUNT(*) FROM member WHERE id=$1",
+                    &[added["id"].as_str().unwrap()]
+                )
+                .await?,
+                0
+            );
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions", "organization"])
+                    .await?,
+                before[..4]
+            );
+        }
+    }
+    assert_eq!(policy.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    authenticated(&setup, &second.cookie, "owner-page-second@example.test").await;
+    authenticated(&setup, &foreign.cookie, "owner-page-foreign@example.test").await;
     B::close(connection).await
 }
