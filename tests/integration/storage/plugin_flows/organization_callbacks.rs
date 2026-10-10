@@ -23,7 +23,8 @@ backend_tests!(
     organization_team_delete_callback_failure,
     organization_team_add_member_callback_failure,
     organization_team_remove_member_callback_failure,
-    organization_default_team_factory_failure
+    organization_default_team_factory_failure,
+    organization_orphan_delete_selection
 );
 postgres_tests!(
     organization_lifecycle_callbacks_preserve_patch_authority_and_committed_phases,
@@ -3250,5 +3251,99 @@ async fn organization_default_team_factory_failure<B: Backend>(db: Db) -> TestRe
     );
     let session = body(&call(&auth, request("/get-session", None, &cookie), 200).await);
     assert_eq!(session["session"]["activeOrganizationId"], selected_id);
+    B::close(connection).await
+}
+
+async fn organization_orphan_delete_selection<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            teams: TeamsConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let owner = signup(&auth, "orphan-org-owner@example.test").await;
+    let cookie = cookies(&owner);
+    let created = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Legacy orphan","slug":"legacy-orphan"})),
+            &cookie,
+        ),
+        200,
+    )
+    .await;
+    let id = body(&created)["id"].as_str().unwrap().to_owned();
+    let sibling = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"orphan-org-owner@example.test","password":PASSWORD})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    _ = call(
+        &auth,
+        request(
+            "/organization/set-active",
+            Some(json!({"organizationId":id})),
+            &cookies(&sibling),
+        ),
+        200,
+    )
+    .await;
+    let token = body(&owner)["token"].as_str().unwrap().to_owned();
+    _ = db.execute("PRAGMA foreign_keys=OFF", &[]).await?;
+    _ = db
+        .execute("DELETE FROM organization WHERE id=$1", &[&id])
+        .await?;
+    _ = db.execute("PRAGMA foreign_keys=ON", &[]).await?;
+    let stable = db
+        .tables(&["users", "accounts", "member", "team", "team_member"])
+        .await?;
+    let before: Vec<Value> = serde_json::from_str(&db.table("sessions").await?)?;
+    let rejected = call(
+        &auth,
+        request(
+            "/organization/delete",
+            Some(json!({"organizationId":id})),
+            &cookie,
+        ),
+        400,
+    )
+    .await;
+    assert!(rejected.body.is_empty());
+    assert!(cookies(&rejected).is_empty());
+    let after: Vec<Value> = serde_json::from_str(&db.table("sessions").await?)?;
+    assert_eq!(after.len(), before.len());
+    for row in before {
+        let actual = after
+            .iter()
+            .find(|candidate| candidate["id"] == row["id"])
+            .unwrap();
+        if row["token"] == token {
+            assert!(actual["active_organization_id"].is_null());
+            assert_eq!(actual["active_team_id"], row["active_team_id"]);
+            for field in ["token", "user_id", "expires_at", "created_at"] {
+                assert_eq!(actual[field], row[field]);
+            }
+        } else {
+            assert_eq!(actual, &row);
+        }
+    }
+    assert_eq!(
+        db.tables(&["users", "accounts", "member", "team", "team_member"])
+            .await?,
+        stable
+    );
+    authenticated(&auth, &cookie, "orphan-org-owner@example.test").await;
+    authenticated(&auth, &cookies(&sibling), "orphan-org-owner@example.test").await;
     B::close(connection).await
 }
