@@ -27,7 +27,8 @@ backend_tests!(
     two_factor_pending_session_cancellation_retirement,
     two_factor_authenticated_totp_failed_rotation_retry,
     two_factor_expired_pending_factor_stage_policy,
-    two_factor_configured_proof_cookie_lifetimes
+    two_factor_configured_proof_cookie_lifetimes,
+    two_factor_trust_syntax_before_cleanup
 );
 
 #[derive(Default)]
@@ -2335,4 +2336,132 @@ async fn two_factor_configured_proof_cookie_lifetimes<B: Backend>(db: Db) -> Tes
         B::close(connection).await?;
     }
     Ok(())
+}
+
+async fn two_factor_trust_syntax_before_cleanup<B: Backend>(db: Db) -> TestResult {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use hkdf::hmac::{Hmac, KeyInit, Mac};
+    let sign = |value: &str| {
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(SECRET.as_bytes()).unwrap();
+        mac.update(value.as_bytes());
+        url::form_urlencoded::byte_serialize(
+            format!("{value}.{}", STANDARD.encode(mac.finalize().into_bytes())).as_bytes(),
+        )
+        .collect::<String>()
+    };
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(TwoFactorPlugin::with_config(TwoFactorConfig {
+            skip_verification_on_enable: true,
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let signed = signup(&auth, "syntax@example.test").await;
+    let id = body(&signed)["user"]["id"].as_str().unwrap().to_owned();
+    let (totp, _, _) = enroll(&auth, &cookies(&signed)).await;
+    let pending = sign_in(&auth, "syntax@example.test", json!({}), "").await;
+    let done = call(
+        &auth,
+        request(
+            "/two-factor/verify-totp",
+            Some(json!({"code":totp.generate_current().to_string(),"trustDevice":true})),
+            &cookies(&pending),
+        ),
+        200,
+    )
+    .await;
+    let real = cookies(&done)
+        .split("; ")
+        .find(|x| x.starts_with("better-auth.trust_device="))
+        .unwrap()
+        .to_owned();
+    let key = db
+        .text(
+            "SELECT identifier FROM verifications WHERE identifier LIKE 'trust-device-%'",
+            &[],
+        )
+        .await?
+        .unwrap();
+    let _ = auth
+        .store()
+        .create_verification(alibi::CreateVerification {
+            identifier: "unrelated-expired-syntax".into(),
+            value: id.clone(),
+            expires_at: chrono::Utc::now() - chrono::Duration::days(1),
+        })
+        .await?;
+    let principals = db
+        .tables(&["two_factor", "users", "accounts", "sessions"])
+        .await?;
+    let issued = db
+        .text(
+            "SELECT value FROM verifications WHERE identifier=$1",
+            &[&key],
+        )
+        .await?;
+    for (value, clear) in [
+        ("plain".into(), false),
+        (sign(""), false),
+        (sign("unstructured"), true),
+        (sign(&format!("wrong!{key}")), true),
+        (sign(&format!("!{key}")), true),
+        (sign("token!"), true),
+    ] {
+        let pending = sign_in(
+            &auth,
+            "syntax@example.test",
+            json!({}),
+            &format!("better-auth.trust_device={value}"),
+        )
+        .await;
+        assert_eq!(body(&pending)["twoFactorRedirect"], true);
+        assert_eq!(
+            db.tables(&["two_factor", "users", "accounts", "sessions"])
+                .await?,
+            principals
+        );
+        assert_eq!(
+            pending
+                .headers
+                .get_all("set-cookie")
+                .any(|x| x.starts_with("better-auth.trust_device=") && x.contains("Max-Age=0")),
+            clear
+        );
+        assert_eq!(
+            db.text(
+                "SELECT value FROM verifications WHERE identifier=$1",
+                &[&key]
+            )
+            .await?,
+            issued
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM verifications WHERE identifier='unrelated-expired-syntax'",
+                &[]
+            )
+            .await?,
+            1
+        );
+    }
+    let control = sign_in(&auth, "syntax@example.test", json!({}), &real).await;
+    assert_eq!(body(&control)["user"]["id"], id);
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM verifications WHERE identifier='unrelated-expired-syntax'",
+            &[]
+        )
+        .await?,
+        0
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM verifications WHERE identifier=$1",
+            &[&key]
+        )
+        .await?,
+        0
+    );
+    B::close(connection).await
 }
