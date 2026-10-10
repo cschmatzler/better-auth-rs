@@ -16,7 +16,8 @@ backend_tests!(
     organization_invitation_policy,
     organization_anonymous_and_failures,
     organization_invitation_stamps,
-    processed_invitation_cancellation_keeps_members_and_original_callback_status
+    processed_invitation_cancellation_keeps_members_and_original_callback_status,
+    organization_invitation_delivery_await_policy
 );
 
 #[derive(Debug, Default)]
@@ -710,6 +711,212 @@ async fn processed_invitation_cancellation_keeps_members_and_original_callback_s
         );
         assert_eq!(db.count("member").await?, if accepted { 2 } else { 1 });
         authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn organization_invitation_delivery_await_policy<B: Backend>(db: Db) -> TestResult {
+    #[derive(Debug, Default)]
+    struct Delivery {
+        events: Mutex<Vec<&'static str>>,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        done: tokio::sync::Notify,
+        observer_error: bool,
+        delivery_error: bool,
+    }
+    impl alibi::BackgroundTaskHandler for Delivery {
+        fn handle(&self, completion: alibi::BackgroundTaskCompletion) -> AuthResult<()> {
+            self.events.lock().unwrap().push("observer");
+            drop(completion);
+            if self.observer_error {
+                Err(alibi::AuthError::internal("observer failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl OrganizationInvitationEmailSender for Delivery {
+        async fn send_invitation_email(
+            &self,
+            c: &OrganizationInvitationDelivery,
+            callback: &alibi::CallbackContext,
+        ) -> AuthResult<()> {
+            assert_eq!(c.invitation.organization_id, c.organization.id);
+            assert_eq!(c.inviter.user_id, c.user.id);
+            assert_eq!(
+                callback.request.as_ref().unwrap().path(),
+                "/api/auth/organization/invite-member"
+            );
+            self.events.lock().unwrap().push("delivery-start");
+            self.started.notify_one();
+            self.release.notified().await;
+            self.events.lock().unwrap().push("delivery-end");
+            self.done.notify_one();
+            if self.delivery_error {
+                Err(alibi::AuthError::internal("delivery failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl OrganizationInvitationHooks for Delivery {
+        async fn before_create_invitation(
+            &self,
+            _: &OrganizationInvitationCreationContext,
+        ) -> AuthResult<Option<OrganizationInvitationCreatePatch>> {
+            self.events.lock().unwrap().push("before");
+            Ok(None)
+        }
+        async fn after_create_invitation(
+            &self,
+            _: &alibi::plugins::organization::OrganizationInvitationContext,
+        ) -> AuthResult<()> {
+            self.events.lock().unwrap().push("after");
+            Ok(())
+        }
+    }
+    for (background, observer_error, delivery_error) in [
+        (false, false, false),
+        (false, false, true),
+        (true, false, false),
+        (true, true, true),
+    ] {
+        let db = db.fresh().await?;
+        let delivery = Arc::new(Delivery {
+            observer_error,
+            delivery_error,
+            ..Default::default()
+        });
+        let organization = OrganizationConfig {
+            invitation_hooks: Some(delivery.clone()),
+            send_invitation_email: Some(delivery.clone()),
+            ..Default::default()
+        };
+
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let config = {
+            let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+            if background {
+                config.background_tasks = Some(delivery.clone());
+            }
+            config
+        };
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(OrganizationPlugin::with_config(organization))
+            .build()
+            .await?;
+        let owner = signup(&auth, "invitation-life-owner@example.test").await;
+        let foreign = signup(&auth, "invitation-life-foreign@example.test").await;
+        let target = signup(&auth, "invitation-life-target@example.test").await;
+        let created = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Life","slug":"invitation-life"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+        let org = body(&created)["id"].as_str().unwrap().to_owned();
+        let jar = merge(&cookies(&owner), &cookies(&created));
+
+        let before = db
+            .tables(&[
+                "users",
+                "accounts",
+                "sessions",
+                "member",
+                "team",
+                "team_member",
+            ])
+            .await?;
+        let auth = Arc::new(auth);
+        let running = auth.clone();
+        let invitation_org = org.clone();
+        let mut pending = tokio::spawn(async move {
+            call(&running,request("/organization/invite-member",Some(json!({"organizationId":invitation_org,"email":"delivery-recipient@example.test","role":"member"})),&jar),200).await
+        });
+        tokio::select! {
+            biased;
+            () = delivery.started.notified() => {},
+            result = &mut pending => {
+                _ = result?;
+                panic!("invitation completed before sender entry");
+            }
+        }
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM invitation WHERE organization_id=$1",
+                &[&org]
+            )
+            .await?,
+            1
+        );
+        if background {
+            let response = pending.await?;
+            assert_eq!(body(&response)["email"], "delivery-recipient@example.test");
+            assert_eq!(
+                *delivery.events.lock().unwrap(),
+                vec!["before", "delivery-start", "observer", "after"]
+            );
+            delivery.release.notify_one();
+            delivery.done.notified().await;
+            assert_eq!(
+                *delivery.events.lock().unwrap(),
+                vec![
+                    "before",
+                    "delivery-start",
+                    "observer",
+                    "after",
+                    "delivery-end"
+                ]
+            );
+        } else {
+            assert!(!pending.is_finished());
+            assert_eq!(
+                *delivery.events.lock().unwrap(),
+                vec!["before", "delivery-start"]
+            );
+            delivery.release.notify_one();
+            _ = pending.await?;
+            delivery.done.notified().await;
+            assert_eq!(
+                *delivery.events.lock().unwrap(),
+                vec!["before", "delivery-start", "delivery-end", "after"]
+            );
+        }
+        assert_eq!(
+            db.tables(&[
+                "users",
+                "accounts",
+                "sessions",
+                "member",
+                "team",
+                "team_member"
+            ])
+            .await?,
+            before
+        );
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "invitation-life-foreign@example.test",
+        )
+        .await;
+        authenticated(
+            &auth,
+            &cookies(&target),
+            "invitation-life-target@example.test",
+        )
+        .await;
         B::close(connection).await?;
     }
     Ok(())
