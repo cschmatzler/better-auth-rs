@@ -24,7 +24,8 @@ backend_tests!(
     organization_team_add_member_callback_failure,
     organization_team_remove_member_callback_failure,
     organization_default_team_factory_failure,
-    organization_orphan_delete_selection
+    organization_orphan_delete_selection,
+    organization_removal_original_target_snapshots
 );
 postgres_tests!(
     organization_lifecycle_callbacks_preserve_patch_authority_and_committed_phases,
@@ -3346,4 +3347,194 @@ async fn organization_orphan_delete_selection<B: Backend>(db: Db) -> TestResult 
     authenticated(&auth, &cookie, "orphan-org-owner@example.test").await;
     authenticated(&auth, &cookies(&sibling), "orphan-org-owner@example.test").await;
     B::close(connection).await
+}
+
+async fn organization_removal_original_target_snapshots<B: Backend>(db: Db) -> TestResult {
+    struct Hooks<S: AuthSchema> {
+        store: Arc<dyn alibi::AuthStore<S>>,
+        delete: bool,
+        before: Mutex<Vec<OrganizationMemberRemovalContext>>,
+        after: Mutex<Vec<OrganizationMemberRemovalContext>>,
+    }
+    impl<S: AuthSchema> std::fmt::Debug for Hooks<S> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("RemovalIndependentWrites")
+        }
+    }
+    #[async_trait]
+    impl<S: AuthSchema> OrganizationMemberRemovalHooks for Hooks<S> {
+        async fn before_remove(&self, c: &OrganizationMemberRemovalContext) -> AuthResult<()> {
+            self.before.lock().unwrap().push(c.clone());
+            if self.delete {
+                self.store.delete_member(&c.member.member.id).await?;
+            } else {
+                _ = self
+                    .store
+                    .update_user(
+                        &c.user.id,
+                        alibi::UpdateUser {
+                            name: Some("Changed Target".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                _ = self
+                    .store
+                    .update_member_role(&c.member.member.id, "admin")
+                    .await?;
+            }
+            Ok(())
+        }
+        async fn after_remove(&self, c: &OrganizationMemberRemovalContext) -> AuthResult<()> {
+            self.after.lock().unwrap().push(c.clone());
+            Ok(())
+        }
+    }
+    for delete in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, store) = db.migrated::<B>(SECRET).await?;
+        let hooks = Arc::new(Hooks {
+            store: Arc::new(store),
+            delete,
+            before: Mutex::new(Vec::new()),
+            after: Mutex::new(Vec::new()),
+        });
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                member_removal_hooks: Some(hooks.clone()),
+                teams: TeamsConfig {
+                    enabled: true,
+                    create_default_team: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+
+        let owner = signup(&auth, "owner@example.test").await;
+        let target = signup(&auth, "target@example.test").await;
+        let foreign = signup(&auth, "foreign@example.test").await;
+        let target_id = body(&target)["user"]["id"].as_str().unwrap().to_owned();
+        let owner_id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+        let org=body(&call(&auth,request("/organization/create",Some(json!({"name":"Original Organization","slug":"owned","metadata":{"original":true}})),&cookies(&owner)),200).await);
+        let other = body(
+            &call(
+                &auth,
+                request(
+                    "/organization/create",
+                    Some(json!({"name":"Foreign Organization","slug":"foreign"})),
+                    &cookies(&foreign),
+                ),
+                200,
+            )
+            .await,
+        );
+        let mut members = Vec::new();
+        let mut teams = Vec::new();
+        for (organization, actor) in [(&org, &owner), (&other, &foreign)] {
+            let member=auth.dispatch_endpoint(OrganizationPlugin::add_member_endpoint(&serde_json::from_value(json!({"organizationId":organization["id"],"userId":target_id,"role":"member"}))?)?,alibi::endpoint::EndpointOptions::default()).await?.decode()?;
+            members.push(member);
+            let team = body(
+                &call(
+                    &auth,
+                    request(
+                        "/organization/create-team",
+                        Some(json!({"organizationId":organization["id"],"name":"Seat"})),
+                        &cookies(actor),
+                    ),
+                    200,
+                )
+                .await,
+            );
+            let _=call(&auth,request("/organization/add-team-member",Some(json!({"organizationId":organization["id"],"teamId":team["id"],"userId":target_id})),&cookies(actor)),200).await;
+            teams.push(team);
+        }
+        let original = members.first().unwrap();
+        let own_team = teams.first().unwrap()["id"].as_str().unwrap().to_owned();
+        let foreign_team = teams.last().unwrap()["id"].as_str().unwrap().to_owned();
+
+        let stable = db.tables(&["accounts", "sessions", "organization"]).await?;
+        let removed = call(
+            &auth,
+            request(
+                "/organization/remove-member",
+                Some(json!({"organizationId":org["id"],"memberIdOrEmail":original.id})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(body(&removed)["member"]["id"], original.id);
+        assert_eq!(body(&removed)["member"]["role"], "member");
+        for c in hooks
+            .before
+            .lock()
+            .unwrap()
+            .iter()
+            .chain(hooks.after.lock().unwrap().iter())
+        {
+            assert_eq!(c.member.member.id, original.id);
+            assert_eq!(c.member.member.role, "member");
+            assert_eq!(c.user.id, target_id);
+            assert_eq!(
+                c.user.name.as_deref(),
+                body(&target)["user"]["name"].as_str()
+            );
+            assert_eq!(c.organization.id, org["id"].as_str().unwrap());
+            assert_eq!(c.organization.name, "Original Organization");
+        }
+        assert_eq!(hooks.before.lock().unwrap().len(), 1);
+        assert_eq!(hooks.after.lock().unwrap().len(), 1);
+        assert_eq!(
+            db.count_where("SELECT COUNT(*) FROM member WHERE id=$1", &[&original.id])
+                .await?,
+            0
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM team_member WHERE team_id=$1 AND user_id=$2",
+                &[&own_team, &target_id]
+            )
+            .await?,
+            0
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM team_member WHERE team_id=$1 AND user_id=$2",
+                &[&foreign_team, &target_id]
+            )
+            .await?,
+            1
+        );
+        assert_eq!(
+            db.count_where("SELECT member_count FROM team WHERE id=$1", &[&own_team])
+                .await?,
+            0
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT member_count FROM team WHERE id=$1",
+                &[&foreign_team]
+            )
+            .await?,
+            1
+        );
+        assert_eq!(
+            db.tables(&["accounts", "sessions", "organization"]).await?,
+            stable
+        );
+        assert_eq!(
+            db.text("SELECT name FROM users WHERE id=$1", &[&target_id])
+                .await?,
+            if delete {
+                body(&target)["user"]["name"].as_str().map(str::to_owned)
+            } else {
+                Some("Changed Target".to_owned())
+            }
+        );
+        let _ = owner_id;
+        B::close(connection).await?;
+    }
+    Ok(())
 }
