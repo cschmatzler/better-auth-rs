@@ -19,7 +19,8 @@ backend_tests!(
     verification_cache_before_veto,
     verification_reservation_logical_primary,
     verification_find_cleanup_snapshot,
-    verification_update_sibling_authority
+    verification_update_sibling_authority,
+    verification_publication_transaction_rollback
 );
 postgres_tests!(
     identity_policy_admits_mutations_and_isolates_concurrent_requests,
@@ -1194,4 +1195,110 @@ async fn verification_update_sibling_authority<B: Backend>(db: Db) -> TestResult
             .is_none()
     );
     B::close(connection).await
+}
+
+async fn verification_publication_transaction_rollback<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{
+        CacheAdapter, DatabaseHookContext, DatabaseHooks, HookBackend, MemoryCacheAdapter,
+    };
+    use alibi::verification::VerificationSnapshot;
+    struct After(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait]
+    impl<S: AuthSchema, H: HookBackend> DatabaseHooks<S, H> for After {
+        async fn after_create_verification_record(
+            &self,
+            _: &VerificationSnapshot,
+            c: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<()> {
+            assert!(c.tx.is_none());
+            _ = self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    for rollback in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let cache = Arc::new(MemoryCacheAdapter::new());
+        let after = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let published = Arc::new(Mutex::new(None));
+        let mut config = AuthConfig::new(SECRET);
+        config.verification.secondary_storage = Some(cache.clone());
+        config.verification.store_in_database = true;
+        config.verification.store_identifier.default = VerificationIdentifierStrategy::Custom(
+            Arc::new(IdentifierHasher(Arc::new(AtomicBool::new(false)))),
+        );
+        let auth = Arc::new(
+            AuthBuilder::new(config.clone())
+                .store(B::hook(
+                    B::store(Arc::new(config), &connection),
+                    After(after.clone()),
+                ))
+                .build()
+                .await?,
+        );
+        let inner = auth.clone();
+        let inner_cache = cache.clone();
+        let inner_after = after.clone();
+        let inner_published = published.clone();
+        let result = auth
+            .store()
+            .transaction_boxed(Box::new(move |tx| {
+                Box::pin(async move {
+                    let actual = inner
+                        .context()
+                        .verifications()
+                        .create_in_transaction(
+                            tx,
+                            CreateVerification {
+                                identifier: "transaction-owner".into(),
+                                value: "transaction-proof".into(),
+                                expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
+                            },
+                        )
+                        .await?
+                        .unwrap();
+                    let raw = inner_cache
+                        .get("verification:application:transaction-owner")
+                        .await?
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&raw)?,
+                        serde_json::to_value(actual.data())?
+                    );
+                    assert_eq!(inner_after.load(Ordering::SeqCst), 0);
+                    *inner_published.lock().unwrap() = Some(raw);
+                    if rollback {
+                        return Err(AuthError::internal("deliberate rollback after publication"));
+                    }
+                    Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+                })
+            }))
+            .await;
+        assert_eq!(result.is_err(), rollback);
+        assert_eq!(db.count("verifications").await?, i64::from(!rollback));
+        assert_eq!(after.load(Ordering::SeqCst), usize::from(!rollback));
+        assert_eq!(
+            cache
+                .get("verification:application:transaction-owner")
+                .await?,
+            *published.lock().unwrap()
+        );
+        let replay = auth
+            .context()
+            .verifications()
+            .consume("transaction-owner")
+            .await?;
+        assert_eq!(replay.is_some(), !rollback);
+        assert_eq!(db.count("verifications").await?, 0);
+        if rollback {
+            assert!(
+                cache
+                    .get("verification:application:transaction-owner")
+                    .await?
+                    .is_some()
+            );
+        }
+        B::close(connection).await?;
+    }
+    Ok(())
 }
