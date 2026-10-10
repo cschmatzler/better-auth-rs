@@ -15,6 +15,8 @@ backend_tests!(
     two_factor_otp_budget_and_session_choices,
     two_factor_numeric_options_and_damaged_factor,
     two_factor_otp_resends_are_consumed_once_across_real_requests,
+    two_factor_reenrollment_retains_row_policy,
+    two_factor_pending_unverified_totp_backup_recovery,
     two_factor_account_lock_pending_only_scope
 );
 
@@ -757,6 +759,161 @@ async fn two_factor_otp_resends_are_consumed_once_across_real_requests<B: Backen
     );
     authenticated(&auth, &cookie, "owner@example.test").await;
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn two_factor_reenrollment_retains_row_policy<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(TwoFactorPlugin::new())
+        .build()
+        .await?;
+    let signed = signup(&auth, "generation@example.test").await;
+    let id = body(&signed)["user"]["id"].as_str().unwrap().to_owned();
+    let jar = cookies(&signed);
+    let (_, first, _) = enroll(&auth, &jar).await;
+    _ = db
+        .execute(
+            "UPDATE two_factor SET failed_verification_count = 0.5 WHERE user_id = $1",
+            &[&id],
+        )
+        .await?;
+    let original = auth.store().get_two_factor_by_user_id(&id).await?.unwrap();
+    let principals = db.tables(&["users", "accounts", "sessions"]).await?;
+    let (totp, second, _) = enroll(&auth, &jar).await;
+    let next = auth.store().get_two_factor_by_user_id(&id).await?.unwrap();
+    assert_eq!(next.id, original.id);
+    assert_eq!(next.failed_verification_count, Some(0.5));
+    assert_eq!(next.locked_until, original.locked_until);
+    assert_eq!(next.verified, Some(false));
+    assert_ne!(next.secret, original.secret);
+    assert_ne!(first["backupCodes"], second["backupCodes"]);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        principals
+    );
+    let activated = call(
+        &auth,
+        request(
+            "/two-factor/verify-totp",
+            Some(json!({"code":totp.generate_current().to_string()})),
+            &jar,
+        ),
+        200,
+    )
+    .await;
+    let verified = auth.store().get_two_factor_by_user_id(&id).await?.unwrap();
+    assert_eq!(verified.id, original.id);
+    assert_eq!(verified.secret, next.secret);
+    assert_eq!(verified.backup_codes, next.backup_codes);
+    assert_eq!(verified.failed_verification_count, Some(0.5));
+    assert_eq!(verified.verified, Some(true));
+    let before = db.table("two_factor").await?;
+    let denied = call(
+        &auth,
+        request(
+            "/two-factor/enable",
+            Some(json!({"password":PASSWORD})),
+            &cookies(&activated),
+        ),
+        400,
+    )
+    .await;
+    assert_eq!(body(&denied)["code"], "TOTP_ALREADY_ENABLED");
+    assert_eq!(db.table("two_factor").await?, before);
+    B::close(connection).await
+}
+
+async fn two_factor_pending_unverified_totp_backup_recovery<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let outbox = Arc::new(Outbox::default());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(TwoFactorPlugin::with_config(TwoFactorConfig {
+            send_otp: Some(outbox),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let signed = signup(&auth, "unverified@example.test").await;
+    let id = body(&signed)["user"]["id"].as_str().unwrap().to_owned();
+    let (totp, enrollment, _) = enroll(&auth, &cookies(&signed)).await;
+    let _ = call(
+        &auth,
+        request(
+            "/two-factor/verify-totp",
+            Some(json!({"code":totp.generate_current().to_string()})),
+            &cookies(&signed),
+        ),
+        200,
+    )
+    .await;
+    _ = db.execute("UPDATE two_factor SET verified = false, failed_verification_count = 2.5 WHERE user_id = $1", &[&id]).await?;
+    let pending = sign_in(&auth, "unverified@example.test", json!({}), "").await;
+    assert_eq!(body(&pending)["twoFactorMethods"], json!(["otp"]));
+    let before = db
+        .tables(&[
+            "two_factor",
+            "verifications",
+            "sessions",
+            "users",
+            "accounts",
+        ])
+        .await?;
+    let denied = call(
+        &auth,
+        request(
+            "/two-factor/verify-totp",
+            Some(json!({"code":totp.generate_current().to_string()})),
+            &cookies(&pending),
+        ),
+        400,
+    )
+    .await;
+    assert_eq!(body(&denied)["code"], "TOTP_NOT_ENABLED");
+    assert_eq!(
+        db.tables(&[
+            "two_factor",
+            "verifications",
+            "sessions",
+            "users",
+            "accounts"
+        ])
+        .await?,
+        before
+    );
+    let completed = call(
+        &auth,
+        request(
+            "/two-factor/verify-backup-code",
+            Some(json!({"code":enrollment["backupCodes"][0]})),
+            &cookies(&pending),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&completed)["user"]["id"], id);
+    authenticated(&auth, &cookies(&completed), "unverified@example.test").await;
+    let factor = auth.store().get_two_factor_by_user_id(&id).await?.unwrap();
+    assert_eq!(factor.verified, Some(false));
+    assert_eq!(factor.failed_verification_count, Some(0.0));
+    let stable = db
+        .tables(&["two_factor", "verifications", "sessions"])
+        .await?;
+    let _ = call(
+        &auth,
+        request(
+            "/two-factor/verify-backup-code",
+            Some(json!({"code":enrollment["backupCodes"][0]})),
+            &cookies(&pending),
+        ),
+        401,
+    )
+    .await;
+    assert_eq!(
+        db.tables(&["two_factor", "verifications", "sessions"])
+            .await?,
+        stable
+    );
     B::close(connection).await
 }
 
