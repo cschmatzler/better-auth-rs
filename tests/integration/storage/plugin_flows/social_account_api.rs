@@ -8,7 +8,8 @@ use alibi::plugins::oauth::{OAuthAccountApi, OAuthAccountSelection};
 
 backend_tests!(
     account_endpoints_validate_selection_authentication_and_refresh,
-    automatic_refresh_uses_access_expiry_without_refresh_lifetime_veto
+    automatic_refresh_uses_access_expiry_without_refresh_lifetime_veto,
+    corrupt_imported_oauth_ciphertexts_reject_before_transport_or_writes
 );
 
 async fn account_endpoints_validate_selection_authentication_and_refresh<B: Backend>(
@@ -237,5 +238,132 @@ async fn automatic_refresh_uses_access_expiry_without_refresh_lifetime_veto<B: B
     }
     authenticated(&auth, &cookie, "social@example.com").await;
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn corrupt_imported_oauth_ciphertexts_reject_before_transport_or_writes<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::plugins::{
+        OAuthPlugin,
+        oauth::{GenericOAuthConfig, encryption::encrypt_token},
+    };
+    use alibi::{AuthAccount as _, CreateAccount};
+    async fn seed<S: AuthSchema>(auth: &Alibi<S>, user: &str) -> alibi::AuthResult<String> {
+        let account = auth
+            .context()
+            .database
+            .create_account(CreateAccount {
+                additional_fields: Default::default(),
+                user_id: user.into(),
+                account_id: "account-subject".into(),
+                provider_id: "generic".into(),
+                access_token: Some("old-access".into()),
+                refresh_token: Some("old-refresh".into()),
+                id_token: Some("old-id".into()),
+                access_token_expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+                refresh_token_expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+                scope: Some("calendar,drive".into()),
+                password: None,
+            })
+            .await?;
+        Ok(account.id().to_string())
+    }
+
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let remote = Provider::start("application/json", "{}").await;
+    let mut config = GenericOAuthConfig::new("native-client", "native-secret");
+    config.authorization_url = Some(remote.url.join("authorize")?.into());
+    config.token_url = Some(remote.url.join("token")?.into());
+    config.user_info_url = Some(remote.url.join("profile")?.into());
+    let cfg = AuthConfig::new(SECRET)
+        .base_url(ORIGIN)
+        .account(AccountConfig {
+            encrypt_oauth_tokens: true,
+            ..Default::default()
+        });
+    let auth = AuthBuilder::new(cfg.clone())
+        .store(B::store(Arc::new(cfg), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(
+            OAuthPlugin::new().add_provider("generic", config.resolve().await?.unwrap().provider),
+        )
+        .build()
+        .await?;
+    let owner = signup(&auth, "cipher-owner@example.test").await;
+    let foreign = signup(&auth, "cipher-foreign@example.test").await;
+    let id = seed(&auth, body(&owner)["user"]["id"].as_str().unwrap()).await?;
+    db.set_timestamp(
+        "accounts",
+        "access_token_expires_at",
+        ("id", &id),
+        chrono::Utc::now() + chrono::Duration::hours(1),
+    )
+    .await?;
+    let valid = encrypt_token("imported-access", SECRET)?;
+    let wrong = encrypt_token("imported-access", "wrong-key-material-at-least-32")?;
+    let mut tampered = valid.clone();
+    let replacement = if tampered.ends_with('0') { '1' } else { '0' };
+    _ = tampered.pop();
+    tampered.push(replacement);
+    for (stored, expected) in [
+        (valid.clone(), Some("imported-access")),
+        (valid.to_uppercase(), Some("imported-access")),
+        (wrong.clone(), None),
+        (tampered.clone(), None),
+        ("00".into(), None),
+        ("legacy-plaintext".into(), Some("legacy-plaintext")),
+        ("abc".into(), Some("abc")),
+    ] {
+        _ = db
+            .execute(
+                "UPDATE accounts SET access_token=$1 WHERE id=$2",
+                &[&stored, &id],
+            )
+            .await?;
+        let before = db.tables(&["users", "accounts", "sessions"]).await?;
+        let response = call(
+            &auth,
+            request(
+                "/get-access-token",
+                Some(json!({"accountId":id})),
+                &cookies(&owner),
+            ),
+            if expected.is_some() { 200 } else { 400 },
+        )
+        .await;
+        if let Some(expected) = expected {
+            assert_eq!(body(&response)["accessToken"], expected);
+        } else {
+            assert_eq!(body(&response)["code"], "FAILED_TO_GET_ACCESS_TOKEN");
+        }
+        assert!(remote.take().is_empty());
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    }
+    for stored in [wrong, tampered, "00".into()] {
+        _ = db
+            .execute(
+                "UPDATE accounts SET access_token=$1,refresh_token=$2 WHERE id=$3",
+                &[&valid, &stored, &id],
+            )
+            .await?;
+        let before = db.tables(&["users", "accounts", "sessions"]).await?;
+        let rejected = call(
+            &auth,
+            request(
+                "/refresh-token",
+                Some(json!({"accountId":id})),
+                &cookies(&owner),
+            ),
+            400,
+        )
+        .await;
+        assert_eq!(body(&rejected)["code"], "FAILED_TO_REFRESH_ACCESS_TOKEN");
+        assert!(remote.take().is_empty());
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    }
+    authenticated(&auth, &cookies(&foreign), "cipher-foreign@example.test").await;
     B::close(connection).await
 }
