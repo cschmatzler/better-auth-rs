@@ -22,7 +22,8 @@ backend_tests!(
     two_factor_otp_account_budget_coupling,
     two_factor_pending_orphan_owner_proof_retention,
     two_factor_pending_newest_expired_snapshot,
-    two_factor_backup_view_exact_truthy_projection
+    two_factor_backup_view_exact_truthy_projection,
+    two_factor_backup_remainder_json_normalization
 );
 
 #[derive(Default)]
@@ -1661,5 +1662,114 @@ async fn two_factor_backup_view_exact_truthy_projection<B: Backend>(db: Db) -> T
             before
         );
     }
+    B::close(connection).await
+}
+
+async fn two_factor_backup_remainder_json_normalization<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(TwoFactorPlugin::with_config(TwoFactorConfig {
+            backup_storage: TwoFactorBackupStorage::Plain,
+            skip_verification_on_enable: true,
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let signed = signup(&auth, "remainder@example.test").await;
+    let id = body(&signed)["user"]["id"].as_str().unwrap().to_owned();
+    let initial_jar = cookies(&signed);
+    let (_, enrollment, jar) = enroll(&auth, &initial_jar).await;
+    let issued = enrollment["backupCodes"][0].as_str().unwrap();
+    let stored = format!(
+        r#"[{0},{0},{{"keep":"2025-02-30T00:00:00Z"}},"9999-12-31T24:00:00Z","2025-01-02T03:04:05.123456Z",1e400,-1e400,9007199254740993,"+275760-09-13T00:00:00.000Z","2025-02-32T00:00:00Z","2025-01-02T03:04:60Z"]"#,
+        serde_json::to_string(issued)?
+    );
+    _ = db
+        .execute(
+            "UPDATE two_factor SET backup_codes=$1 WHERE user_id=$2",
+            &[&stored, &id],
+        )
+        .await?;
+    let factor = auth.store().get_two_factor_by_user_id(&id).await?.unwrap();
+    let principals = db.tables(&["users", "accounts", "sessions"]).await?;
+    let before = db.table("two_factor").await?;
+    let _ = call(
+        &auth,
+        request(
+            "/two-factor/verify-backup-code",
+            Some(json!({"code":"9999-12-31T24:00:00Z"})),
+            &jar,
+        ),
+        401,
+    )
+    .await;
+    assert_eq!(db.table("two_factor").await?, before);
+    let done = call(
+        &auth,
+        request(
+            "/two-factor/verify-backup-code",
+            Some(json!({"code":issued})),
+            &jar,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&done)["user"]["id"], id);
+    let next = auth.store().get_two_factor_by_user_id(&id).await?.unwrap();
+    assert_eq!(
+        next.backup_codes,
+        r#"[{"keep":"2025-03-02T00:00:00.000Z"},"+010000-01-01T00:00:00.000Z","2025-01-02T03:04:05.123Z",null,null,9007199254740992,"+275760-09-13T00:00:00.000Z","2025-02-32T00:00:00Z","2025-01-02T03:04:60Z"]"#
+    );
+    assert_eq!(
+        (
+            next.id,
+            next.secret,
+            next.failed_verification_count,
+            next.verified
+        ),
+        (
+            factor.id,
+            factor.secret,
+            factor.failed_verification_count,
+            factor.verified
+        )
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        principals
+    );
+    let _ = call(
+        &auth,
+        request(
+            "/two-factor/verify-backup-code",
+            Some(json!({"code":issued})),
+            &jar,
+        ),
+        401,
+    )
+    .await;
+    let expanded = call(
+        &auth,
+        request(
+            "/two-factor/verify-backup-code",
+            Some(json!({"code":"+275760-09-13T00:00:00.000Z"})),
+            &jar,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&expanded)["user"]["id"], id);
+    assert_eq!(
+        auth.store()
+            .get_two_factor_by_user_id(&id)
+            .await?
+            .unwrap()
+            .backup_codes,
+        r#"[{"keep":"2025-03-02T00:00:00.000Z"},"+010000-01-01T00:00:00.000Z","2025-01-02T03:04:05.123Z",null,null,9007199254740992,"2025-02-32T00:00:00Z","2025-01-02T03:04:60Z"]"#
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        principals
+    );
     B::close(connection).await
 }
