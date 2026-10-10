@@ -20,7 +20,8 @@ backend_tests!(
     organization_plugin_helpers,
     organization_trusted_addition_preserves_literal_role_arrays_and_session_scope,
     fractional_organization_membership_limit_uses_actual_physical_count,
-    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results
+    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results,
+    organization_quota_callback_write_order
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -891,5 +892,118 @@ async fn organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_r
     );
     assert_eq!(policy.seen.lock().unwrap().len(), count);
     assert_eq!(db.count("member").await?, 2);
+    B::close(connection).await
+}
+
+async fn organization_quota_callback_write_order<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::extensions::TeamLimitContext;
+    struct Policy<S: AuthSchema> {
+        store: Arc<dyn alibi::AuthStore<S>>,
+        events: Mutex<Vec<&'static str>>,
+    }
+    impl<S: AuthSchema> std::fmt::Debug for Policy<S> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("Application quota policy")
+        }
+    }
+    #[async_trait::async_trait]
+    impl<S: AuthSchema> OrganizationLimitResolver for Policy<S> {
+        async fn maximum_teams(&self, c: &TeamLimitContext) -> AuthResult<Option<f64>> {
+            assert!(c.request.as_ref().unwrap().path.ends_with("create-team"));
+            assert!(c.session.is_some());
+            self.events.lock().unwrap().push("team");
+            for index in 0..2 {
+                _ = self
+                    .store
+                    .create_team(alibi::CreateTeam {
+                        organization_id: c.organization_id.clone(),
+                        name: format!("Independent team {index}"),
+                        updated_at: None,
+                    })
+                    .await?;
+            }
+            Ok(Some(1.5))
+        }
+        async fn maximum_roles(&self, org: &str) -> AuthResult<Option<f64>> {
+            self.events.lock().unwrap().push("role");
+            for index in 0..2 {
+                _ = self
+                    .store
+                    .create_organization_role(alibi::types::CreateOrganizationRole {
+                        organization_id: org.into(),
+                        role: format!("independent-role-{index}"),
+                        permission: Default::default(),
+                    })
+                    .await?;
+            }
+            Ok(Some(1.5))
+        }
+    }
+    let (connection, store) = db.migrated::<B>(SECRET).await?;
+    let policy = Arc::new(Policy::<B::Schema> {
+        store: Arc::new(store),
+        events: Mutex::new(Vec::new()),
+    });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            teams: TeamsConfig {
+                enabled: true,
+                create_default_team: false,
+                limit_resolver: Some(policy.clone()),
+                ..Default::default()
+            },
+            access_control: Some(default_organization_statements()),
+            dynamic_access_control: DynamicAccessControlConfig {
+                enabled: true,
+                limit_resolver: Some(policy.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let mut owner = account(&auth, "quota-write-owner@example.test").await;
+    let org = organization(&auth, &mut owner, "quota-write").await;
+    let protected = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    let team = call(
+        &auth,
+        request(
+            "/organization/create-team",
+            Some(json!({"organizationId":org,"name":"Original team"})),
+            &owner.cookie,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&team)["name"], "Original team");
+    assert_eq!(db.count("team").await?, 3);
+    let role = call(
+        &auth,
+        request(
+            "/organization/create-role",
+            Some(json!({"organizationId":org,"role":"original-role","permission":{}})),
+            &owner.cookie,
+        ),
+        400,
+    )
+    .await;
+    assert_eq!(body(&role)["code"], "TOO_MANY_ROLES");
+    assert_eq!(db.count("organization_role").await?, 2);
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM organization_role WHERE role='original-role'",
+            &[]
+        )
+        .await?,
+        0
+    );
+    assert_eq!(*policy.events.lock().unwrap(), ["team", "role"]);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?,
+        protected
+    );
     B::close(connection).await
 }
