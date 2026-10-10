@@ -16,7 +16,11 @@ backend_tests!(
     multi_session_raw_capacity_controls_proofs_without_evicting_durable_sessions,
     multi_session_repeated_genuine_proofs_retire_before_fractional_capacity,
     multi_session_without_database_preserves_order_fallback_and_cache_replay_limits,
-    parallel_sibling_revocation_retains_owned_deletes_after_rejection
+    parallel_sibling_revocation_retains_owned_deletes_after_rejection,
+    bearer_browser_header_precedence,
+    bearer_completed_issuance_header_receipt,
+    bearer_configured_cookie_authority,
+    bearer_real_hmac_padding_alias
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -870,4 +874,381 @@ async fn parallel_sibling_revocation_retains_owned_deletes_after_rejection<B: Ba
     authenticated(&auth, &cookies(&owner), "parallel-owner@example.test").await;
     authenticated(&auth, &cookies(&foreign), "parallel-foreign@example.test").await;
     Ok(())
+}
+
+async fn bearer_browser_header_precedence<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::bearer::BearerConfig;
+    for signature_required in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(BearerPlugin::with_config(BearerConfig {
+                require_signature: signature_required,
+            }))
+            .build()
+            .await?;
+        let owner = signup(&auth, "header-owner@example.test").await;
+        let foreign = signup(&auth, "header-foreign@example.test").await;
+        let jar = cookies(&foreign);
+        let own = cookies(&owner);
+        let encoded = own
+            .split("; ")
+            .find_map(|v| v.strip_prefix("better-auth.session_token="))
+            .unwrap();
+        let query = format!("v={encoded}");
+        let signed = url::form_urlencoded::parse(query.as_bytes())
+            .next()
+            .unwrap()
+            .1
+            .into_owned();
+        let before = db.tables(&["users", "accounts", "sessions"]).await?;
+        for route in ["/get-session", "/list-sessions"] {
+            let mut input = request(route, None, &jar);
+            _ = input
+                .headers
+                .insert("authorization".into(), format!("Bearer {signed}"));
+            let response = call(&auth, input, 200).await;
+            if route == "/get-session" {
+                assert_eq!(body(&response)["user"]["id"], body(&owner)["user"]["id"]);
+                assert_eq!(body(&response)["session"]["token"], body(&owner)["token"]);
+            } else {
+                let records = body(&response);
+                let sessions = records.as_array().unwrap();
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(sessions[0]["userId"], body(&owner)["user"]["id"]);
+                assert_eq!(sessions[0]["token"], body(&owner)["token"]);
+            }
+        }
+        let mut rejected = request("/get-session", None, &jar);
+        _ = rejected.headers.insert(
+            "authorization".into(),
+            format!("Bearer {}.invalid", body(&owner)["token"].as_str().unwrap()),
+        );
+        let fallback = call(&auth, rejected, 200).await;
+        assert_eq!(body(&fallback)["user"]["id"], body(&foreign)["user"]["id"]);
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+        let mut logout = request("/sign-out", Some(json!({})), &jar);
+        _ = logout
+            .headers
+            .insert("authorization".into(), format!("Bearer {signed}"));
+        _ = call(&auth, logout, 200).await;
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM sessions WHERE token=$1",
+                &[body(&owner)["token"].as_str().unwrap()]
+            )
+            .await?,
+            0
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM sessions WHERE token=$1",
+                &[body(&foreign)["token"].as_str().unwrap()]
+            )
+            .await?,
+            1
+        );
+        assert_eq!(db.tables(&["users", "accounts"]).await?, before[..2]);
+        authenticated(&auth, &jar, "header-foreign@example.test").await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn bearer_completed_issuance_header_receipt<B: Backend>(db: Db) -> TestResult {
+    struct Exposure;
+    #[async_trait::async_trait]
+    impl<S: AuthSchema> alibi::AuthPlugin<S> for Exposure {
+        async fn on_request(
+            &self,
+            _: &AuthRequest,
+            _: &alibi::AuthContext<S>,
+        ) -> AuthResult<Option<AuthResponse>> {
+            Ok(None)
+        }
+        fn name(&self) -> &'static str {
+            "application-exposure"
+        }
+        fn routes(&self) -> Vec<alibi::AuthRoute> {
+            Vec::new()
+        }
+        async fn after_request(
+            &self,
+            _: &AuthRequest,
+            _: &AuthContext<S>,
+            mut response: AuthResponse,
+        ) -> AuthResult<AuthResponse> {
+            _ = response.headers.insert(
+                "access-control-expose-headers",
+                "X-First, X-First, X-Second",
+            );
+            Ok(response)
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(Exposure)
+        .plugin(BearerPlugin::new())
+        .build()
+        .await?;
+    let owner = signup(&auth, "receipt-owner@example.test").await;
+    let signed = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"receipt-owner@example.test","password":PASSWORD})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    for response in [&owner, &signed] {
+        let raw = response
+            .headers
+            .get_all("set-cookie")
+            .filter(|v| v.starts_with("better-auth.session_token=") && !v.contains("Max-Age=0"))
+            .last()
+            .unwrap();
+        let encoded = raw.split(';').next().unwrap().split_once('=').unwrap().1;
+        let query = format!("v={encoded}");
+        let value = url::form_urlencoded::parse(query.as_bytes())
+            .next()
+            .unwrap()
+            .1
+            .into_owned();
+        assert_eq!(response.headers.get("set-auth-token"), Some(&value));
+        assert_ne!(value, body(response)["token"].as_str().unwrap());
+        assert!(value.starts_with(&format!("{}.", body(response)["token"].as_str().unwrap())));
+        assert_eq!(
+            response
+                .headers
+                .get("access-control-expose-headers")
+                .map(String::as_str),
+            Some("X-First, X-Second, set-auth-token")
+        );
+        let mut read = request("/get-session", None, "");
+        _ = read
+            .headers
+            .insert("authorization".into(), format!("Bearer {value}"));
+        let actual = call(&auth, read, 200).await;
+        assert_eq!(body(&actual)["session"]["token"], body(response)["token"]);
+        assert_eq!(body(&actual)["user"]["id"], body(response)["user"]["id"]);
+    }
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    let failed = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"receipt-owner@example.test","password":"incorrect-password"})),
+            "",
+        ),
+        401,
+    )
+    .await;
+    assert!(!failed.headers.contains_key("set-auth-token"));
+    assert_eq!(
+        failed
+            .headers
+            .get("access-control-expose-headers")
+            .map(String::as_str),
+        Some("X-First, X-First, X-Second")
+    );
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    let logout = call(
+        &auth,
+        request("/sign-out", Some(json!({})), &cookies(&signed)),
+        200,
+    )
+    .await;
+    assert!(!logout.headers.contains_key("set-auth-token"));
+    assert_eq!(
+        logout
+            .headers
+            .get("access-control-expose-headers")
+            .map(String::as_str),
+        Some("X-First, X-First, X-Second")
+    );
+    authenticated(&auth, &cookies(&owner), "receipt-owner@example.test").await;
+    B::close(connection).await
+}
+
+async fn bearer_configured_cookie_authority<B: Backend>(db: Db) -> TestResult {
+    use alibi::config::CookieOverride;
+    for secure in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        let name = if secure {
+            config.advanced.use_secure_cookies = Some(true);
+            config.advanced.cookie_prefix = Some("bearer-app".into());
+            "__Secure-bearer-app.session_token"
+        } else {
+            _ = config.advanced.cookies.insert(
+                "session_token".into(),
+                CookieOverride {
+                    name: Some("configured-bearer-token".into()),
+                    attributes: Default::default(),
+                },
+            );
+            "configured-bearer-token"
+        };
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(BearerPlugin::new())
+            .build()
+            .await?;
+        let owner = signup(&auth, "named-header-owner@example.test").await;
+        let foreign = signup(&auth, "named-header-foreign@example.test").await;
+        let jar = cookies(&owner);
+        assert_eq!(
+            owner
+                .headers
+                .get_all("set-cookie")
+                .filter(|v| v.starts_with(&format!("{name}=")))
+                .count(),
+            1
+        );
+        assert!(
+            !owner
+                .headers
+                .get_all("set-cookie")
+                .any(|v| v.starts_with("better-auth.session_token="))
+        );
+        let encoded = jar
+            .split("; ")
+            .find_map(|v| v.strip_prefix(&format!("{name}=")))
+            .unwrap();
+        let query = format!("v={encoded}");
+        let signed = url::form_urlencoded::parse(query.as_bytes())
+            .next()
+            .unwrap()
+            .1
+            .into_owned();
+        assert_eq!(owner.headers.get("set-auth-token"), Some(&signed));
+        authenticated(&auth, &jar, "named-header-owner@example.test").await;
+        let before = db.tables(&["users", "accounts", "sessions"]).await?;
+        for token in [body(&owner)["token"].as_str().unwrap(), signed.as_str()] {
+            let mut input = request("/get-session", None, &cookies(&foreign));
+            _ = input
+                .headers
+                .insert("authorization".into(), format!("Bearer {token}"));
+            let read = call(&auth, input, 200).await;
+            assert_eq!(body(&read)["session"]["token"], body(&owner)["token"]);
+            assert_eq!(body(&read)["user"]["id"], body(&owner)["user"]["id"]);
+        }
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+        let mut input = request("/sign-out", Some(json!({})), &cookies(&foreign));
+        _ = input
+            .headers
+            .insert("authorization".into(), format!("Bearer {signed}"));
+        let logout = call(&auth, input, 200).await;
+        assert!(
+            logout
+                .headers
+                .get_all("set-cookie")
+                .any(|v| v.starts_with(&format!("{name}=")) && v.contains("Max-Age=0"))
+        );
+        assert!(!logout.headers.contains_key("set-auth-token"));
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM sessions WHERE token=$1",
+                &[body(&owner)["token"].as_str().unwrap()]
+            )
+            .await?,
+            0
+        );
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "named-header-foreign@example.test",
+        )
+        .await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn bearer_real_hmac_padding_alias<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::bearer::BearerConfig;
+    use base64::{
+        Engine, alphabet,
+        engine::{GeneralPurpose, GeneralPurposeConfig},
+    };
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(BearerPlugin::with_config(BearerConfig {
+            require_signature: true,
+        }))
+        .build()
+        .await?;
+    let owner = signup(&auth, "padding-owner@example.test").await;
+    let foreign = signup(&auth, "padding-foreign@example.test").await;
+    let jar = cookies(&owner);
+    let encoded = jar
+        .split("; ")
+        .find_map(|v| v.strip_prefix("better-auth.session_token="))
+        .unwrap();
+    let query = format!("v={encoded}");
+    let signed = url::form_urlencoded::parse(query.as_bytes())
+        .next()
+        .unwrap()
+        .1
+        .into_owned();
+    let (payload, signature) = signed.rsplit_once('.').unwrap();
+    assert!(signature.ends_with('='));
+    let alphabet_bytes = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut chars = signature.as_bytes().to_vec();
+    let position = chars.len() - 2;
+    let index = alphabet_bytes
+        .iter()
+        .position(|c| *c == chars[position])
+        .unwrap();
+    chars[position] = alphabet_bytes[index ^ 1];
+    let alias = String::from_utf8(chars.clone())?;
+    let engine = GeneralPurpose::new(
+        &alphabet::STANDARD,
+        GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true),
+    );
+    assert_eq!(engine.decode(&alias)?, engine.decode(signature)?);
+    chars[position] = alphabet_bytes[index ^ 4];
+    let corrupt = String::from_utf8(chars)?;
+    assert_ne!(engine.decode(&corrupt)?, engine.decode(signature)?);
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    for (value, cookie, expected) in [
+        (alias.as_str(), String::new(), Some(&owner)),
+        (alias.as_str(), cookies(&foreign), Some(&owner)),
+        (corrupt.as_str(), cookies(&foreign), Some(&foreign)),
+        (corrupt.as_str(), String::new(), None),
+    ] {
+        let mut input = request("/get-session", None, &cookie);
+        _ = input
+            .headers
+            .insert("authorization".into(), format!("Bearer {payload}.{value}"));
+        let response = call(&auth, input, 200).await;
+        if let Some(expected) = expected {
+            assert_eq!(body(&response)["session"]["token"], body(expected)["token"]);
+            assert_eq!(body(&response)["user"]["id"], body(expected)["user"]["id"]);
+        } else {
+            assert_eq!(body(&response), Value::Null);
+        }
+    }
+    let mut list = request("/list-sessions", None, &cookies(&foreign));
+    _ = list
+        .headers
+        .insert("authorization".into(), format!("Bearer {payload}.{alias}"));
+    let response = call(&auth, list, 200).await;
+    assert_eq!(
+        body(&response)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["userId"].clone())
+            .collect::<Vec<_>>(),
+        [body(&owner)["user"]["id"].clone()]
+    );
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    B::close(connection).await
 }
