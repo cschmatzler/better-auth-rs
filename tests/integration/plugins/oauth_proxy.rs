@@ -359,11 +359,85 @@ fn open(sealed: &str, secret: &str, purpose: &str) -> Value {
     serde_json::from_slice(&plain).unwrap()
 }
 
+async fn raw_profile_max_age_controls_admission_before_state_consumption<B: Backend>(
+    db: Db,
+) -> TestResult {
+    for (max_age, age, accepts) in [
+        (0.125, 200, false),
+        (f64::NEG_INFINITY, 0, false),
+        (f64::NAN, 65_000, true),
+        (f64::INFINITY, 65_000, true),
+    ] {
+        let db = db.fresh().await?;
+        let mut fixture = Fixture::<B>::new(db).await;
+        let (authorization, _) = fixture.issue("/api/auth/sign-in/social", None).await;
+        let (_, mut bridge) = fixture.forward(&authorization).await;
+        let config = (*fixture.preview.context().config).clone();
+        let issuer = authorization.origin().ascii_serialization();
+        fixture.preview = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &fixture._connections.0))
+            .plugin(SessionManagementPlugin::new())
+            .plugin(OAuthPlugin::new().add_provider(
+                "gitlab",
+                OAuthProvider::gitlab_with_issuer("local-client", "local-secret", &issuer),
+            ))
+            .plugin(OAuthProxyPlugin::with_config(OAuthProxyConfig {
+                current_url: Some(PREVIEW.into()),
+                production_url: Some(PRODUCTION.into()),
+                max_age_seconds: max_age,
+                secret: Some(PROXY_SECRET.into()),
+            }))
+            .build()
+            .await?;
+        let profile = bridge
+            .query_pairs()
+            .find(|(k, _)| k == "profile")
+            .unwrap()
+            .1
+            .into_owned();
+        let mut payload = open(&profile, PROXY_SECRET, "oauth-proxy-profile");
+        _ = payload.as_object_mut().unwrap().insert(
+            "timestamp".into(),
+            json!(chrono::Utc::now().timestamp_millis() - age),
+        );
+        let sealed = seal(&payload.to_string(), PROXY_SECRET, "oauth-proxy-profile");
+        let pairs = bridge
+            .query_pairs()
+            .map(|(k, v)| {
+                let value = if k == "profile" {
+                    sealed.clone()
+                } else {
+                    v.into_owned()
+                };
+                (k.into_owned(), value)
+            })
+            .collect::<Vec<_>>();
+        _ = bridge.query_pairs_mut().clear().extend_pairs(pairs);
+        let before = rows(&fixture.preview_db).await;
+        let production = rows(&fixture.production_db).await;
+        let result = request(&fixture.preview, &target(&bridge), None, None).await;
+        if accepts {
+            assert_eq!(location(&result).as_str(), format!("{PREVIEW}/new-owner"));
+            assert_eq!(fixture.preview_db.count("sessions").await?, 1);
+            assert_eq!(fixture.preview_db.count("verifications").await?, 0);
+        } else {
+            assert!(location(&result).as_str().contains("error=payload_expired"));
+            assert_eq!(result.headers.get_all("set-cookie").count(), 0);
+            assert_eq!(rows(&fixture.preview_db).await, before);
+        }
+        assert_eq!(rows(&fixture.production_db).await, production);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
-    backend_tests!(production_exchange_preserves_rows_then_preview_consumes_state_and_issues_only_the_actual_owner,completion_rejects_foreign_origin_provider_tampering_and_expired_state_before_any_principal_write,crafted_profiles_and_forward_errors_redirect_without_principal_writes,proxied_link_social_links_the_signed_in_owner,cookie_state_completion_requires_the_originating_browser,proxied_link_with_a_different_email_redirects_with_the_link_error);
+    backend_tests!(
+    production_exchange_preserves_rows_then_preview_consumes_state_and_issues_only_the_actual_owner,completion_rejects_foreign_origin_provider_tampering_and_expired_state_before_any_principal_write,crafted_profiles_and_forward_errors_redirect_without_principal_writes,proxied_link_social_links_the_signed_in_owner,cookie_state_completion_requires_the_originating_browser,proxied_link_with_a_different_email_redirects_with_the_link_error,
+    raw_profile_max_age_controls_admission_before_state_consumption
+);
     postgres_tests!(production_exchange_preserves_rows_then_preview_consumes_state_and_issues_only_the_actual_owner,completion_rejects_foreign_origin_provider_tampering_and_expired_state_before_any_principal_write);
 
     #[expect(
