@@ -20,7 +20,8 @@ backend_tests!(
     organization_plugin_helpers,
     organization_trusted_addition_preserves_literal_role_arrays_and_session_scope,
     fractional_organization_membership_limit_uses_actual_physical_count,
-    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results
+    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results,
+    organization_legacy_role_loader_after_warm_cache
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -892,4 +893,136 @@ async fn organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_r
     assert_eq!(policy.seen.lock().unwrap().len(), count);
     assert_eq!(db.count("member").await?, 2);
     B::close(connection).await
+}
+
+async fn organization_legacy_role_loader_after_warm_cache<B: Backend>(db: Db) -> TestResult {
+    for literal in ["[\"create\"]", "null", "{\"team\":\"create\"}", "{bad"] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                access_control: Some(default_organization_statements()),
+                dynamic_access_control: DynamicAccessControlConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let mut owner = account(&auth, "warm-owner@example.test").await;
+        let member = account(&auth, "warm-member@example.test").await;
+        let foreign = account(&auth, "warm-foreign@example.test").await;
+        let org = organization(&auth, &mut owner, "warm-loader").await;
+        let membership = add(&auth, &org, &member.id, "member").await;
+        let policy = json!({"organizationId":org,"permissions":{"team":["create"]}});
+        let warm = call(
+            &auth,
+            request(
+                "/organization/has-permission",
+                Some(policy.clone()),
+                &owner.cookie,
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(body(&warm)["success"], true);
+        let role = auth
+            .store()
+            .create_organization_role(alibi::types::CreateOrganizationRole {
+                organization_id: org.clone(),
+                role: "legacy".into(),
+                permission: Default::default(),
+            })
+            .await?;
+        _ = db
+            .execute(
+                "UPDATE organization_role SET permission=$1 WHERE id=$2",
+                &[literal, &role.id],
+            )
+            .await?;
+        _ = db
+            .execute(
+                "UPDATE member SET role='legacy' WHERE id=$1",
+                &[membership["id"].as_str().unwrap()],
+            )
+            .await?;
+        let before = db
+            .tables(&[
+                "users",
+                "accounts",
+                "sessions",
+                "organization",
+                "member",
+                "organization_role",
+            ])
+            .await?;
+        for input in [
+            get(
+                "/organization/get-role",
+                &[("organizationId", &org), ("roleId", &role.id)],
+                &owner.cookie,
+            ),
+            get(
+                "/organization/list-roles",
+                &[("organizationId", &org)],
+                &owner.cookie,
+            ),
+            request(
+                "/organization/has-permission",
+                Some(policy.clone()),
+                &owner.cookie,
+            ),
+            request(
+                "/organization/update-role",
+                Some(json!({"organizationId":org,"roleId":role.id,"data":{"permission":{}}})),
+                &owner.cookie,
+            ),
+            request(
+                "/organization/delete-role",
+                Some(json!({"organizationId":org,"roleId":role.id})),
+                &owner.cookie,
+            ),
+            request("/organization/has-permission", Some(policy), &member.cookie),
+        ] {
+            let failed = call(&auth, input, 500).await;
+            if literal == "{bad" {
+                assert!(failed.body.is_empty());
+            } else {
+                assert_eq!(
+                    body(&failed),
+                    json!({"message":"Invalid permissions for role legacy"})
+                );
+            }
+            assert!(!failed.headers.contains_key("set-cookie"));
+        }
+        let denied = call(
+            &auth,
+            get(
+                "/organization/get-role",
+                &[("organizationId", &org), ("roleId", &role.id)],
+                &foreign.cookie,
+            ),
+            403,
+        )
+        .await;
+        assert_eq!(
+            body(&denied)["code"],
+            "YOU_ARE_NOT_A_MEMBER_OF_THIS_ORGANIZATION"
+        );
+        assert_eq!(
+            db.tables(&[
+                "users",
+                "accounts",
+                "sessions",
+                "organization",
+                "member",
+                "organization_role"
+            ])
+            .await?,
+            before
+        );
+        B::close(connection).await?;
+    }
+    Ok(())
 }
