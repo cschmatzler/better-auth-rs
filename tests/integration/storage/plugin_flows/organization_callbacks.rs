@@ -22,7 +22,8 @@ backend_tests!(
     organization_team_update_callback_failure,
     organization_team_delete_callback_failure,
     organization_team_add_member_callback_failure,
-    organization_team_remove_member_callback_failure
+    organization_team_remove_member_callback_failure,
+    organization_default_team_factory_failure
 );
 postgres_tests!(
     organization_lifecycle_callbacks_preserve_patch_authority_and_committed_phases,
@@ -3136,4 +3137,118 @@ async fn organization_team_remove_member_callback_failure<B: Backend>(db: Db) ->
         B::close(connection).await?;
     }
     Ok(())
+}
+
+async fn organization_default_team_factory_failure<B: Backend>(db: Db) -> TestResult {
+    #[derive(Debug)]
+    struct Factory(std::sync::atomic::AtomicBool);
+    #[async_trait]
+    impl DefaultTeamFactory for Factory {
+        async fn create(
+            &self,
+            org: &alibi::Organization,
+            c: &DefaultTeamContext,
+            store: &dyn alibi::store::TeamStore,
+        ) -> AuthResult<Option<alibi::Team>> {
+            assert!(
+                c.request
+                    .as_ref()
+                    .unwrap()
+                    .path
+                    .ends_with("/organization/create")
+            );
+            let team = store
+                .create_team(alibi::CreateTeam {
+                    name: format!("Factory:{}", org.name),
+                    organization_id: org.id.clone(),
+                    updated_at: None,
+                })
+                .await?;
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(AuthError::internal("private factory rejection"));
+            }
+            Ok(Some(team))
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let factory = Arc::new(Factory(std::sync::atomic::AtomicBool::new(false)));
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            teams: TeamsConfig {
+                enabled: true,
+                default_team_factory: Some(factory.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let owner = signup(&auth, "factory-owner@example.test").await;
+    let cookie = cookies(&owner);
+    let selected = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Existing","slug":"existing"})),
+            &cookie,
+        ),
+        200,
+    )
+    .await;
+    let selected_id = body(&selected)["id"].as_str().unwrap().to_owned();
+    let before = db
+        .tables(&["users", "accounts", "sessions", "team_member"])
+        .await?;
+    factory.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    let failed = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Factory error","slug":"factory-error"})),
+            &cookie,
+        ),
+        500,
+    )
+    .await;
+    assert!(failed.body.is_empty());
+    assert!(cookies(&failed).is_empty());
+    let failed_id = db
+        .text(
+            "SELECT id FROM organization WHERE slug='factory-error'",
+            &[],
+        )
+        .await?
+        .unwrap();
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM member WHERE organization_id=$1",
+            &[&failed_id]
+        )
+        .await?,
+        1
+    );
+    assert_eq!(db.count_where("SELECT COUNT(*) FROM team WHERE organization_id=$1 AND name='Factory:Factory error' AND member_count=0",&[&failed_id]).await?,1);
+    let team_id = db
+        .text(
+            "SELECT id FROM team WHERE organization_id=$1",
+            &[&failed_id],
+        )
+        .await?
+        .unwrap();
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM team_member WHERE team_id=$1",
+            &[&team_id]
+        )
+        .await?,
+        0
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "team_member"])
+            .await?,
+        before
+    );
+    let session = body(&call(&auth, request("/get-session", None, &cookie), 200).await);
+    assert_eq!(session["session"]["activeOrganizationId"], selected_id);
+    B::close(connection).await
 }
