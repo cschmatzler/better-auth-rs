@@ -12,7 +12,8 @@ backend_tests!(
     email_otp_issuance_and_request_validation,
     email_otp_change_email_policy,
     email_otp_hooks_and_reset_edges,
-    email_otp_configured_quota_blocks_delivery_and_resets_at_configured_window
+    email_otp_configured_quota_blocks_delivery_and_resets_at_configured_window,
+    after_email_change_rejection_retains_verified_owner_and_consumed_proof
 );
 
 #[derive(Default)]
@@ -418,4 +419,136 @@ async fn email_otp_configured_quota_blocks_delivery_and_resets_at_configured_win
     assert_eq!(db.count("verifications").await?, 3);
     assert_eq!(db.count("sessions").await?, 0);
     B::close(connection).await
+}
+
+async fn after_email_change_rejection_retains_verified_owner_and_consumed_proof<B: Backend>(
+    db: Db,
+) -> TestResult {
+    for coded in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let mailbox = Arc::new(Mailbox::default());
+        let failure = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let hook: alibi::plugins::email_verification::EmailVerificationHook = {
+            let failure = failure.clone();
+            let seen = seen.clone();
+            Arc::new(move |user| {
+                let context = alibi::hooks::current_request_hook_context().unwrap();
+                seen.lock()
+                    .unwrap()
+                    .push((serde_json::to_value(user).unwrap(), context.request));
+                let failure = failure.clone();
+                Box::pin(async move {
+                    if !failure.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    if coded {
+                        Err(AuthError::Upstream {
+                            status: 403,
+                            code: "EMAIL_CHANGE_HOOK_VETO",
+                            message: "Application verification hook rejected",
+                        })
+                    } else {
+                        Err(AuthError::internal("Private after hook failure"))
+                    }
+                })
+            })
+        };
+        let auth = fast_builder::<B>(&connection)
+            .plugin(plugin(
+                &mailbox,
+                EmailOtpConfig {
+                    change_email_enabled: true,
+                    after_email_verification: Some(hook),
+                    ..Default::default()
+                },
+            ))
+            .build()
+            .await?;
+        let owner = signup(&auth, "after-change-owner@example.test").await;
+        let foreign = signup(&auth, "after-change-foreign@example.test").await;
+        let id = body(&owner)["user"]["id"].clone();
+        _ = call(
+            &auth,
+            request(
+                "/email-otp/request-email-change",
+                Some(json!({"newEmail":"after-change-target@example.test"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+        let proof = mailbox.take();
+        let protected = db.tables(&["accounts", "sessions"]).await?;
+        let mut input = request(
+            "/email-otp/change-email",
+            Some(json!({"newEmail":proof.email,"otp":proof.otp})),
+            &cookies(&owner),
+        );
+        _ = input
+            .headers
+            .insert("x-email-change-marker".into(), "actual-change".into());
+        let denied = call(&auth, input.clone(), if coded { 403 } else { 500 }).await;
+        assert!(!denied.headers.contains_key("set-cookie"));
+        if coded {
+            assert_eq!(body(&denied)["code"], "EMAIL_CHANGE_HOOK_VETO");
+        } else {
+            assert!(denied.body.is_empty());
+        }
+        assert_eq!(db.count("verifications").await?, 0);
+        assert_eq!(db.tables(&["accounts", "sessions"]).await?, protected);
+        let events = seen.lock().unwrap().clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0["id"], id);
+        assert_eq!(events[0].0["email"], "after-change-target@example.test");
+        assert_eq!(events[0].0["emailVerified"], true);
+        assert_eq!(events[0].1.path, "/api/auth/email-otp/change-email");
+        assert_eq!(
+            events[0].1.headers["x-email-change-marker"],
+            "actual-change"
+        );
+        authenticated(&auth, &cookies(&owner), "after-change-target@example.test").await;
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "after-change-foreign@example.test",
+        )
+        .await;
+        let stable = db.tables(&["users", "accounts", "sessions"]).await?;
+        _ = call(&auth, input, 400).await;
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, stable);
+        failure.store(false, std::sync::atomic::Ordering::SeqCst);
+        _ = call(
+            &auth,
+            request(
+                "/email-otp/request-email-change",
+                Some(json!({"newEmail":"after-change-recovered@example.test"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+        let fresh = mailbox.take();
+        _ = call(
+            &auth,
+            request(
+                "/email-otp/change-email",
+                Some(json!({"newEmail":fresh.email,"otp":fresh.otp})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+        authenticated(
+            &auth,
+            &cookies(&owner),
+            "after-change-recovered@example.test",
+        )
+        .await;
+        assert_eq!(db.tables(&["accounts", "sessions"]).await?, protected);
+        B::close(connection).await?;
+    }
+    Ok(())
 }
