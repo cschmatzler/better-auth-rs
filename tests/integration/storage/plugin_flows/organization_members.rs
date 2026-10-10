@@ -32,7 +32,8 @@ backend_tests!(
     organization_duplicate_member_exact_id_cleanup,
     organization_physical_membership_pages,
     organization_concurrent_member_admission,
-    organization_member_role_js_whitespace
+    organization_member_role_js_whitespace,
+    organization_member_role_guest_validation
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -2261,5 +2262,94 @@ async fn organization_member_role_js_whitespace<B: Backend>(db: Db) -> TestResul
         protected
     );
     authenticated(&auth, &foreign.cookie, "space-foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn organization_member_role_guest_validation<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        OrganizationMemberRoleContext, OrganizationMemberRoleHooks, OrganizationMemberRolePatch,
+    };
+    #[derive(Debug, Default)]
+    struct Hooks(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl OrganizationMemberRoleHooks for Hooks {
+        async fn before_update(
+            &self,
+            _: &OrganizationMemberRoleContext,
+        ) -> AuthResult<Option<OrganizationMemberRolePatch>> {
+            _ = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let hooks = Arc::new(Hooks::default());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            member_role_hooks: Some(hooks.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let mut owner = account(&auth, "guest-role-owner@example.test").await;
+    let target = account(&auth, "guest-role-target@example.test").await;
+    let org = organization(&auth, &mut owner, "guest-role").await;
+    let member = add(&auth, &org, &target.id, "member").await;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    let mut cases = Vec::new();
+    for role in [Value::Null, json!(1), json!({}), json!([1])] {
+        cases.push((
+            json!({"organizationId":org,"memberId":member["id"],"role":role}),
+            "[body.role] Invalid input",
+        ));
+    }
+    cases.extend([(json!({}),"[body.role] Invalid input; [body.memberId] Invalid input: expected string, received undefined"),(json!({"role":true,"memberId":null,"organizationId":null}),"[body.role] Invalid input; [body.memberId] Invalid input: expected string, received null; [body.organizationId] Invalid input: expected string, received null"),(json!({"role":"admin","memberId":1,"organizationId":false}),"[body.memberId] Invalid input: expected string, received number; [body.organizationId] Invalid input: expected string, received boolean")]);
+    for (input, message) in cases {
+        let denied = call(
+            &auth,
+            request("/organization/update-member-role", Some(input), ""),
+            400,
+        )
+        .await;
+        assert_eq!(
+            body(&denied),
+            json!({"code":"VALIDATION_ERROR","message":message})
+        );
+        assert!(!denied.headers.contains_key("set-cookie"));
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                .await?,
+            before
+        );
+    }
+    let valid =
+        json!({"organizationId":org,"memberId":member["id"],"role":"admin","userId":owner.id});
+    let guest = call(
+        &auth,
+        request("/organization/update-member-role", Some(valid.clone()), ""),
+        401,
+    )
+    .await;
+    assert_eq!(
+        body(&guest),
+        json!({"code":"UNAUTHORIZED","message":"Unauthorized"})
+    );
+    _ = call(
+        &auth,
+        request(
+            "/organization/update-member-role",
+            Some(valid),
+            &target.cookie,
+        ),
+        403,
+    )
+    .await;
+    assert_eq!(hooks.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?,
+        before
+    );
     B::close(connection).await
 }
