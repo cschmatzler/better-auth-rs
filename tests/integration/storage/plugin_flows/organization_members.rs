@@ -20,7 +20,8 @@ backend_tests!(
     organization_plugin_helpers,
     organization_trusted_addition_preserves_literal_role_arrays_and_session_scope,
     fractional_organization_membership_limit_uses_actual_physical_count,
-    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results
+    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results,
+    organization_full_member_user_page_split
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -891,5 +892,120 @@ async fn organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_r
     );
     assert_eq!(policy.seen.lock().unwrap().len(), count);
     assert_eq!(db.count("member").await?, 2);
+    B::close(connection).await
+}
+
+async fn organization_full_member_user_page_split<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::types::OrganizationResponse;
+    #[derive(Debug)]
+    struct Policy(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl OrganizationMembershipLimitResolver for Policy {
+        async fn maximum_members(&self, _: &UserView, _: &OrganizationResponse) -> AuthResult<f64> {
+            _ = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(alibi::AuthError::internal(
+                "admission must not run during reads",
+            ))
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let setup = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::new())
+        .build()
+        .await?;
+    let mut owner = account(&setup, "page-split-owner@example.test").await;
+    let target = account(&setup, "page-split-target@example.test").await;
+    let foreign = account(&setup, "page-split-foreign@example.test").await;
+    let org = organization(&setup, &mut owner, "split-pages").await;
+    _ = add(&setup, &org, &target.id, "member").await;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    let policy = Arc::new(Policy(std::sync::atomic::AtomicUsize::new(0)));
+    for (limit, page, list_count, full_count) in [
+        (Some(MembershipLimit::Fixed(1.0)), 100, 1, None),
+        (Some(MembershipLimit::Fixed(0.0)), 100, 2, Some(2)),
+        (Some(MembershipLimit::Fixed(f64::NAN)), 100, 2, Some(2)),
+        (
+            Some(MembershipLimit::Resolver(policy.clone())),
+            100,
+            2,
+            Some(2),
+        ),
+        (None, 1, 2, Some(1)),
+        (None, 0, 2, Some(0)),
+    ] {
+        let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        config.advanced.database.default_find_many_limit = page;
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                membership_limit: limit,
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let listed = call(
+            &auth,
+            get(
+                "/organization/list-members",
+                &[("organizationId", &org)],
+                &owner.cookie,
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(body(&listed)["total"], 2);
+        assert_eq!(
+            body(&listed)["members"].as_array().unwrap().len(),
+            list_count
+        );
+        let full = call(
+            &auth,
+            get(
+                "/organization/get-full-organization",
+                &[("organizationId", &org)],
+                &owner.cookie,
+            ),
+            if full_count.is_some() { 200 } else { 500 },
+        )
+        .await;
+        if let Some(count) = full_count {
+            assert_eq!(body(&full)["members"].as_array().unwrap().len(), count);
+        } else {
+            assert!(full.body.is_empty());
+            let limited = call(
+                &auth,
+                get(
+                    "/organization/get-full-organization",
+                    &[("organizationId", &org), ("membersLimit", "1")],
+                    &owner.cookie,
+                ),
+                200,
+            )
+            .await;
+            assert_eq!(body(&limited)["members"].as_array().unwrap().len(), 1);
+            let foreign_read = call(
+                &auth,
+                get(
+                    "/organization/get-full-organization",
+                    &[("organizationId", &org)],
+                    &foreign.cookie,
+                ),
+                500,
+            )
+            .await;
+            assert!(foreign_read.body.is_empty());
+        }
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                .await?,
+            before
+        );
+    }
+    assert_eq!(policy.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     B::close(connection).await
 }
