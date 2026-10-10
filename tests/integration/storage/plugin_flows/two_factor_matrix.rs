@@ -25,7 +25,8 @@ backend_tests!(
     two_factor_backup_view_exact_truthy_projection,
     two_factor_backup_remainder_json_normalization,
     two_factor_pending_session_cancellation_retirement,
-    two_factor_authenticated_totp_failed_rotation_retry
+    two_factor_authenticated_totp_failed_rotation_retry,
+    two_factor_expired_pending_factor_stage_policy
 );
 
 #[derive(Default)]
@@ -2100,6 +2101,118 @@ async fn two_factor_authenticated_totp_failed_rotation_retry<B: Backend>(db: Db)
         assert_eq!(db.table("sessions").await?, sessions);
         authenticated(&auth, &jar, "retry@example.test").await;
         B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn two_factor_expired_pending_factor_stage_policy<B: Backend>(db: Db) -> TestResult {
+    for disabled in [false, true] {
+        for kind in ["totp", "otp", "backup"] {
+            let db = db.fresh().await?;
+            let (connection, _) = db.migrated::<B>(SECRET).await?;
+            let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+            config.verification.disable_cleanup = disabled;
+            let outbox = Arc::new(Outbox::default());
+            let auth = AuthBuilder::new(config.clone())
+                .store(B::store(Arc::new(config), &connection))
+                .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+                .plugin(super::auth_probe::fast_password())
+                .plugin(TwoFactorPlugin::with_config(TwoFactorConfig {
+                    skip_verification_on_enable: true,
+                    send_otp: Some(outbox.clone()),
+                    ..Default::default()
+                }))
+                .build()
+                .await?;
+            let signed = signup(&auth, "expired@example.test").await;
+            let id = body(&signed)["user"]["id"].as_str().unwrap().to_owned();
+            let (totp, enrollment, _) = enroll(&auth, &cookies(&signed)).await;
+            let pending = sign_in(&auth, "expired@example.test", json!({}), "").await;
+            let key=db.text("SELECT identifier FROM verifications WHERE value=$1 AND identifier LIKE '2fa-%' AND identifier NOT LIKE '2fa-attempts-%'",&[&id]).await?.unwrap();
+            _ = db
+                .execute("UPDATE two_factor SET failed_verification_count=3", &[])
+                .await?;
+            let old = "2020-01-01T00:00:00Z".parse()?;
+            db.set_timestamp("verifications", "expires_at", ("identifier", &key), old)
+                .await?;
+            db.set_timestamp(
+                "verifications",
+                "expires_at",
+                ("identifier", &format!("2fa-attempts-{key}")),
+                old,
+            )
+            .await?;
+            let factor = auth.store().get_two_factor_by_user_id(&id).await?.unwrap();
+            let sessions = db.tables(&["users", "accounts", "sessions"]).await?;
+            let code = match kind {
+                "totp" => totp.generate_current().to_string(),
+                "backup" => enrollment["backupCodes"][0].as_str().unwrap().to_owned(),
+                _ => {
+                    let _ = call(
+                        &auth,
+                        request("/two-factor/send-otp", Some(json!({})), &cookies(&pending)),
+                        200,
+                    )
+                    .await;
+                    outbox.0.lock().unwrap().last().unwrap().clone()
+                }
+            };
+            let path = format!(
+                "/two-factor/verify-{}",
+                if kind == "backup" {
+                    "backup-code"
+                } else {
+                    kind
+                }
+            );
+            let denied = call(
+                &auth,
+                request(&path, Some(json!({"code":code})), &cookies(&pending)),
+                401,
+            )
+            .await;
+            assert_eq!(body(&denied)["code"], "INVALID_TWO_FACTOR_COOKIE");
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions"]).await?,
+                sessions
+            );
+            let next = auth.store().get_two_factor_by_user_id(&id).await?.unwrap();
+            assert_eq!(
+                (next.id, next.secret, next.backup_codes),
+                (factor.id, factor.secret, factor.backup_codes)
+            );
+            assert_eq!(
+                next.failed_verification_count,
+                Some(if disabled && kind == "otp" { 0.0 } else { 3.0 })
+            );
+            for (identifier, remains) in [
+                (&key, disabled && kind != "otp"),
+                (&format!("2fa-attempts-{key}"), disabled && kind == "otp"),
+                (&format!("2fa-otp-{key}"), !disabled && kind == "otp"),
+            ] {
+                assert_eq!(
+                    db.count_where(
+                        "SELECT COUNT(*) FROM verifications WHERE identifier=$1",
+                        &[identifier]
+                    )
+                    .await?,
+                    i64::from(remains)
+                );
+            }
+            let fresh = sign_in(&auth, "expired@example.test", json!({}), "").await;
+            let done = call(
+                &auth,
+                request(
+                    "/two-factor/verify-totp",
+                    Some(json!({"code":totp.generate_current().to_string()})),
+                    &cookies(&fresh),
+                ),
+                200,
+            )
+            .await;
+            authenticated(&auth, &cookies(&done), "expired@example.test").await;
+            B::close(connection).await?;
+        }
     }
     Ok(())
 }
