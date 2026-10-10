@@ -20,7 +20,8 @@ backend_tests!(
     organization_plugin_helpers,
     organization_trusted_addition_preserves_literal_role_arrays_and_session_scope,
     fractional_organization_membership_limit_uses_actual_physical_count,
-    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results
+    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results,
+    organization_concurrent_member_admission
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -891,5 +892,116 @@ async fn organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_r
     );
     assert_eq!(policy.seen.lock().unwrap().len(), count);
     assert_eq!(db.count("member").await?, 2);
+    B::close(connection).await
+}
+
+async fn organization_concurrent_member_admission<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        OrganizationMemberAddedContext, OrganizationMemberAdditionContext,
+    };
+    struct Hooks {
+        gate: tokio::sync::Barrier,
+        raw: super::super::Raw,
+        before: std::sync::atomic::AtomicUsize,
+        after: Mutex<Vec<String>>,
+    }
+    impl std::fmt::Debug for Hooks {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("ConcurrentAdmission")
+        }
+    }
+    #[async_trait::async_trait]
+    impl OrganizationMemberAdditionHooks for Hooks {
+        async fn before_add_member(
+            &self,
+            c: &OrganizationMemberAdditionContext,
+        ) -> AuthResult<Option<OrganizationMemberCreatePatch>> {
+            let count = self
+                .raw
+                .count_where(
+                    "SELECT COUNT(*) FROM member WHERE organization_id=$1 AND user_id=$2",
+                    &[&c.member.organization_id, &c.user.id],
+                )
+                .await
+                .map_err(|e| alibi::AuthError::internal(e.to_string()))?;
+            assert_eq!(count, 0);
+            _ = self
+                .before
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            _ = self.gate.wait().await;
+            Ok(None)
+        }
+        async fn after_add_member(&self, c: &OrganizationMemberAddedContext) -> AuthResult<()> {
+            self.after.lock().unwrap().push(c.member.id.clone());
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let hooks = Arc::new(Hooks {
+        gate: tokio::sync::Barrier::new(2),
+        raw: db.raw.clone(),
+        before: std::sync::atomic::AtomicUsize::new(0),
+        after: Mutex::new(Vec::new()),
+    });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            member_addition_hooks: Some(hooks.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let mut owner = account(&auth, "concurrent-owner@example.test").await;
+    let target = account(&auth, "concurrent-target@example.test").await;
+    let org = organization(&auth, &mut owner, "concurrent-admission").await;
+    let protected = db.tables(&["users", "accounts", "sessions"]).await?;
+    let endpoint = || {
+        OrganizationPlugin::add_member_endpoint(
+            &serde_json::from_value(
+                json!({"organizationId":org,"userId":target.id,"role":"member"}),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    let (left, right) = tokio::join!(
+        Box::pin(auth.dispatch_endpoint(endpoint(), EndpointOptions::default())),
+        Box::pin(auth.dispatch_endpoint(endpoint(), EndpointOptions::default()))
+    );
+    let left = left?.decode()?;
+    let right = right?.decode()?;
+    assert_ne!(left.id, right.id);
+    assert_eq!(left.user_id, target.id);
+    assert_eq!(right.user_id, target.id);
+    assert_eq!(hooks.before.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(hooks.after.lock().unwrap().len(), 2);
+    assert_eq!(db.count("member").await?, 3);
+    let duplicate = auth
+        .dispatch_endpoint(endpoint(), EndpointOptions::default())
+        .await
+        .unwrap_err();
+    assert_eq!(duplicate.error.status_code(), 400);
+    assert_eq!(hooks.before.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(hooks.after.lock().unwrap().len(), 2);
+    let listed = body(
+        &call(
+            &auth,
+            request("/organization/list", None, &target.cookie),
+            200,
+        )
+        .await,
+    );
+    assert_eq!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [org.as_str(), org.as_str()]
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        protected
+    );
     B::close(connection).await
 }
