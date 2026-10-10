@@ -18,6 +18,12 @@ backend_tests!(
     organization_creator_patch_retargeting_keeps_team_and_selection_actor,
     organization_addition_after_hook_keeps_original_target_after_user_write,
     organization_self_removal_after_rejection_clears_only_current_org_selection,
+    organization_team_create_callback_failure,
+    organization_team_update_callback_failure,
+    organization_team_delete_callback_failure,
+    organization_team_add_member_callback_failure,
+    organization_team_remove_member_callback_failure,
+    organization_default_team_factory_failure,
     organization_orphan_delete_selection
 );
 postgres_tests!(
@@ -2055,6 +2061,1196 @@ async fn organization_self_removal_after_rejection_clears_only_current_org_selec
         expected_team
     );
     authenticated(&auth, &cookies(&owner), "owner@example.test").await;
+    B::close(connection).await
+}
+
+async fn organization_team_create_callback_failure<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::extensions::TeamHookContext;
+    struct Hooks<S: AuthSchema> {
+        store: Arc<dyn alibi::AuthStore<S>>,
+        phase: std::sync::atomic::AtomicU8,
+        actor: Mutex<String>,
+        events: Mutex<Vec<u8>>,
+    }
+    impl<S: AuthSchema> std::fmt::Debug for Hooks<S> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("TeamBoundaryCallbacks")
+        }
+    }
+    impl<S: AuthSchema> Hooks<S> {
+        async fn hit(&self, phase: u8, c: &TeamHookContext) -> AuthResult<()> {
+            let armed = self.phase.load(std::sync::atomic::Ordering::SeqCst);
+            if armed == 0 {
+                return Ok(());
+            }
+            assert_eq!(c.user.as_ref().unwrap().id, *self.actor.lock().unwrap());
+            self.events.lock().unwrap().push(phase);
+            if armed == 3 && phase == 1 {
+                return Err(AuthError::Api {
+                    status: 400,
+                    code: Some("TEAM_HOOK_REJECTED".into()),
+                    message: "Rejected before-create".into(),
+                });
+            }
+            if armed != phase {
+                return Ok(());
+            }
+            _ = self
+                .store
+                .create_team(alibi::CreateTeam {
+                    name: format!("Independent:{phase}"),
+                    organization_id: c.organization.id.clone(),
+                    updated_at: None,
+                })
+                .await?;
+            Err(AuthError::internal("private team callback failure"))
+        }
+    }
+    #[async_trait]
+    impl<S: AuthSchema> OrganizationTeamHooks for Hooks<S> {
+        async fn before_create(
+            &self,
+            data: &mut alibi::CreateTeam,
+            c: &TeamHookContext,
+        ) -> AuthResult<()> {
+            if self.phase.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+                data.name = format!("Hook:{}", data.name);
+            }
+            self.hit(1, c).await
+        }
+        async fn after_create(&self, _: &alibi::Team, c: &TeamHookContext) -> AuthResult<()> {
+            self.hit(2, c).await
+        }
+    }
+    for phase in [1, 2, 3] {
+        let db = db.fresh().await?;
+        let (connection, store) = db.migrated::<B>(SECRET).await?;
+        let hooks = Arc::new(Hooks {
+            store: Arc::new(store),
+            phase: std::sync::atomic::AtomicU8::new(0),
+            actor: Mutex::new(String::new()),
+            events: Mutex::new(Vec::new()),
+        });
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                teams: TeamsConfig {
+                    enabled: true,
+                    create_default_team: false,
+                    allow_removing_all_teams: true,
+                    hooks: Some(hooks.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let owner = signup(&auth, "team-callback-owner@example.test").await;
+        let foreign = signup(&auth, "team-callback-foreign@example.test").await;
+        let owner_id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+        *hooks.actor.lock().unwrap() = owner_id.clone();
+        let cookie = cookies(&owner);
+        _ = call(
+            &auth,
+            request(
+                "/sign-in/email",
+                Some(json!({"email":"team-callback-owner@example.test","password":PASSWORD})),
+                "",
+            ),
+            200,
+        )
+        .await;
+        let org = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Owned","slug":"owned"})),
+                &cookie,
+            ),
+            200,
+        )
+        .await;
+        let org_id = body(&org)["id"].as_str().unwrap().to_owned();
+        let outside = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Foreign","slug":"foreign"})),
+                &cookies(&foreign),
+            ),
+            200,
+        )
+        .await;
+        let outside_id = body(&outside)["id"].as_str().unwrap().to_owned();
+        _ = auth
+            .store()
+            .create_team(alibi::CreateTeam {
+                name: "Foreign team".into(),
+                organization_id: outside_id.clone(),
+                updated_at: None,
+            })
+            .await?;
+
+        let before = db
+            .tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?;
+        let foreign_before: Vec<Value> =
+            serde_json::from_str::<Vec<Value>>(&db.table("team").await?)?
+                .into_iter()
+                .filter(|row| row["organization_id"] == outside_id)
+                .collect();
+        hooks
+            .phase
+            .store(phase, std::sync::atomic::Ordering::SeqCst);
+        let response = call(
+            &auth,
+            request(
+                "/organization/create-team",
+                Some(json!({"organizationId":org_id,"name":"Target"})),
+                &cookie,
+            ),
+            if phase == 3 { 400 } else { 500 },
+        )
+        .await;
+        assert!(cookies(&response).is_empty());
+        if phase == 3 {
+            assert_eq!(body(&response)["code"], "TEAM_HOOK_REJECTED");
+            assert_eq!(body(&response)["message"], "Rejected before-create");
+        } else {
+            assert!(response.body.is_empty());
+        }
+        assert_eq!(
+            *hooks.events.lock().unwrap(),
+            if phase == 2 { vec![1, 2] } else { vec![1] }
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM team WHERE organization_id=$1 AND name=$2",
+                &[&org_id, &format!("Independent:{phase}")]
+            )
+            .await?,
+            i64::from(phase != 3)
+        );
+
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM team WHERE organization_id=$1 AND name='Hook:Target'",
+                &[&org_id]
+            )
+            .await?,
+            i64::from(phase == 2)
+        );
+
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                .await?,
+            before
+        );
+        let foreign_after: Vec<Value> =
+            serde_json::from_str::<Vec<Value>>(&db.table("team").await?)?
+                .into_iter()
+                .filter(|row| row["organization_id"] == outside_id)
+                .collect();
+        assert_eq!(foreign_after, foreign_before);
+        authenticated(&auth, &cookie, "team-callback-owner@example.test").await;
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "team-callback-foreign@example.test",
+        )
+        .await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn organization_team_update_callback_failure<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::extensions::TeamHookContext;
+    struct Hooks<S: AuthSchema> {
+        store: Arc<dyn alibi::AuthStore<S>>,
+        phase: std::sync::atomic::AtomicU8,
+        actor: Mutex<String>,
+        events: Mutex<Vec<u8>>,
+    }
+    impl<S: AuthSchema> std::fmt::Debug for Hooks<S> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("TeamBoundaryCallbacks")
+        }
+    }
+    impl<S: AuthSchema> Hooks<S> {
+        async fn hit(&self, phase: u8, c: &TeamHookContext) -> AuthResult<()> {
+            let armed = self.phase.load(std::sync::atomic::Ordering::SeqCst);
+            if armed == 0 {
+                return Ok(());
+            }
+            assert_eq!(c.user.as_ref().unwrap().id, *self.actor.lock().unwrap());
+            self.events.lock().unwrap().push(phase);
+            if armed == 3 && phase == 1 {
+                return Err(AuthError::Api {
+                    status: 400,
+                    code: Some("TEAM_HOOK_REJECTED".into()),
+                    message: "Rejected before-create".into(),
+                });
+            }
+            if armed != phase {
+                return Ok(());
+            }
+            _ = self
+                .store
+                .create_team(alibi::CreateTeam {
+                    name: format!("Independent:{phase}"),
+                    organization_id: c.organization.id.clone(),
+                    updated_at: None,
+                })
+                .await?;
+            Err(AuthError::internal("private team callback failure"))
+        }
+    }
+    #[async_trait]
+    impl<S: AuthSchema> OrganizationTeamHooks for Hooks<S> {
+        async fn before_update(
+            &self,
+            _: &alibi::Team,
+            update: &mut alibi::UpdateTeam,
+            c: &TeamHookContext,
+        ) -> AuthResult<()> {
+            update.name = Some(format!("Hook:{}", update.name.as_deref().unwrap()));
+            self.hit(1, c).await
+        }
+        async fn after_update(&self, _: &alibi::Team, c: &TeamHookContext) -> AuthResult<()> {
+            self.hit(2, c).await
+        }
+    }
+    for phase in [1, 2] {
+        let db = db.fresh().await?;
+        let (connection, store) = db.migrated::<B>(SECRET).await?;
+        let hooks = Arc::new(Hooks {
+            store: Arc::new(store),
+            phase: std::sync::atomic::AtomicU8::new(0),
+            actor: Mutex::new(String::new()),
+            events: Mutex::new(Vec::new()),
+        });
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                teams: TeamsConfig {
+                    enabled: true,
+                    create_default_team: false,
+                    allow_removing_all_teams: true,
+                    hooks: Some(hooks.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let owner = signup(&auth, "team-callback-owner@example.test").await;
+        let foreign = signup(&auth, "team-callback-foreign@example.test").await;
+        let owner_id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+        *hooks.actor.lock().unwrap() = owner_id.clone();
+        let cookie = cookies(&owner);
+        _ = call(
+            &auth,
+            request(
+                "/sign-in/email",
+                Some(json!({"email":"team-callback-owner@example.test","password":PASSWORD})),
+                "",
+            ),
+            200,
+        )
+        .await;
+        let org = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Owned","slug":"owned"})),
+                &cookie,
+            ),
+            200,
+        )
+        .await;
+        let org_id = body(&org)["id"].as_str().unwrap().to_owned();
+        let outside = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Foreign","slug":"foreign"})),
+                &cookies(&foreign),
+            ),
+            200,
+        )
+        .await;
+        let outside_id = body(&outside)["id"].as_str().unwrap().to_owned();
+        _ = auth
+            .store()
+            .create_team(alibi::CreateTeam {
+                name: "Foreign team".into(),
+                organization_id: outside_id.clone(),
+                updated_at: None,
+            })
+            .await?;
+
+        let target = call(
+            &auth,
+            request(
+                "/organization/create-team",
+                Some(json!({"organizationId":org_id,"name":"Target"})),
+                &cookie,
+            ),
+            200,
+        )
+        .await;
+        let team_id = body(&target)["id"].as_str().unwrap().to_owned();
+
+        let before = db
+            .tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?;
+        let foreign_before: Vec<Value> =
+            serde_json::from_str::<Vec<Value>>(&db.table("team").await?)?
+                .into_iter()
+                .filter(|row| row["organization_id"] == outside_id)
+                .collect();
+        hooks
+            .phase
+            .store(phase, std::sync::atomic::Ordering::SeqCst);
+        let response = call(
+            &auth,
+            request(
+                "/organization/update-team",
+                Some(json!({"teamId":team_id,"data":{"organizationId":org_id,"name":"Updated"}})),
+                &cookie,
+            ),
+            if phase == 3 { 400 } else { 500 },
+        )
+        .await;
+        assert!(cookies(&response).is_empty());
+        if phase == 3 {
+            assert_eq!(body(&response)["code"], "TEAM_HOOK_REJECTED");
+            assert_eq!(body(&response)["message"], "Rejected before-create");
+        } else {
+            assert!(response.body.is_empty());
+        }
+        assert_eq!(
+            *hooks.events.lock().unwrap(),
+            if phase == 2 { vec![1, 2] } else { vec![1] }
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM team WHERE organization_id=$1 AND name=$2",
+                &[&org_id, &format!("Independent:{phase}")]
+            )
+            .await?,
+            i64::from(phase != 3)
+        );
+
+        assert_eq!(
+            db.text("SELECT name FROM team WHERE id=$1", &[&team_id])
+                .await?
+                .as_deref(),
+            Some(if phase == 2 { "Hook:Updated" } else { "Target" })
+        );
+
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                .await?,
+            before
+        );
+        let foreign_after: Vec<Value> =
+            serde_json::from_str::<Vec<Value>>(&db.table("team").await?)?
+                .into_iter()
+                .filter(|row| row["organization_id"] == outside_id)
+                .collect();
+        assert_eq!(foreign_after, foreign_before);
+        authenticated(&auth, &cookie, "team-callback-owner@example.test").await;
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "team-callback-foreign@example.test",
+        )
+        .await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn organization_team_delete_callback_failure<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::extensions::TeamHookContext;
+    struct Hooks<S: AuthSchema> {
+        store: Arc<dyn alibi::AuthStore<S>>,
+        phase: std::sync::atomic::AtomicU8,
+        actor: Mutex<String>,
+        events: Mutex<Vec<u8>>,
+    }
+    impl<S: AuthSchema> std::fmt::Debug for Hooks<S> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("TeamBoundaryCallbacks")
+        }
+    }
+    impl<S: AuthSchema> Hooks<S> {
+        async fn hit(&self, phase: u8, c: &TeamHookContext) -> AuthResult<()> {
+            let armed = self.phase.load(std::sync::atomic::Ordering::SeqCst);
+            if armed == 0 {
+                return Ok(());
+            }
+            assert_eq!(c.user.as_ref().unwrap().id, *self.actor.lock().unwrap());
+            self.events.lock().unwrap().push(phase);
+            if armed == 3 && phase == 1 {
+                return Err(AuthError::Api {
+                    status: 400,
+                    code: Some("TEAM_HOOK_REJECTED".into()),
+                    message: "Rejected before-create".into(),
+                });
+            }
+            if armed != phase {
+                return Ok(());
+            }
+            _ = self
+                .store
+                .create_team(alibi::CreateTeam {
+                    name: format!("Independent:{phase}"),
+                    organization_id: c.organization.id.clone(),
+                    updated_at: None,
+                })
+                .await?;
+            Err(AuthError::internal("private team callback failure"))
+        }
+    }
+    #[async_trait]
+    impl<S: AuthSchema> OrganizationTeamHooks for Hooks<S> {
+        async fn before_delete(&self, _: &alibi::Team, c: &TeamHookContext) -> AuthResult<()> {
+            self.hit(1, c).await
+        }
+        async fn after_delete(&self, _: &alibi::Team, c: &TeamHookContext) -> AuthResult<()> {
+            self.hit(2, c).await
+        }
+    }
+    for phase in [1, 2] {
+        let db = db.fresh().await?;
+        let (connection, store) = db.migrated::<B>(SECRET).await?;
+        let hooks = Arc::new(Hooks {
+            store: Arc::new(store),
+            phase: std::sync::atomic::AtomicU8::new(0),
+            actor: Mutex::new(String::new()),
+            events: Mutex::new(Vec::new()),
+        });
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                teams: TeamsConfig {
+                    enabled: true,
+                    create_default_team: false,
+                    allow_removing_all_teams: true,
+                    hooks: Some(hooks.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let owner = signup(&auth, "team-callback-owner@example.test").await;
+        let foreign = signup(&auth, "team-callback-foreign@example.test").await;
+        let owner_id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+        *hooks.actor.lock().unwrap() = owner_id.clone();
+        let cookie = cookies(&owner);
+        _ = call(
+            &auth,
+            request(
+                "/sign-in/email",
+                Some(json!({"email":"team-callback-owner@example.test","password":PASSWORD})),
+                "",
+            ),
+            200,
+        )
+        .await;
+        let org = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Owned","slug":"owned"})),
+                &cookie,
+            ),
+            200,
+        )
+        .await;
+        let org_id = body(&org)["id"].as_str().unwrap().to_owned();
+        let outside = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Foreign","slug":"foreign"})),
+                &cookies(&foreign),
+            ),
+            200,
+        )
+        .await;
+        let outside_id = body(&outside)["id"].as_str().unwrap().to_owned();
+        _ = auth
+            .store()
+            .create_team(alibi::CreateTeam {
+                name: "Foreign team".into(),
+                organization_id: outside_id.clone(),
+                updated_at: None,
+            })
+            .await?;
+
+        let target = call(
+            &auth,
+            request(
+                "/organization/create-team",
+                Some(json!({"organizationId":org_id,"name":"Target"})),
+                &cookie,
+            ),
+            200,
+        )
+        .await;
+        let team_id = body(&target)["id"].as_str().unwrap().to_owned();
+        _ = auth
+            .store()
+            .add_team_member(&team_id, &owner_id, None)
+            .await?;
+
+        let before = db
+            .tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?;
+        let foreign_before: Vec<Value> =
+            serde_json::from_str::<Vec<Value>>(&db.table("team").await?)?
+                .into_iter()
+                .filter(|row| row["organization_id"] == outside_id)
+                .collect();
+        hooks
+            .phase
+            .store(phase, std::sync::atomic::Ordering::SeqCst);
+        let response = call(
+            &auth,
+            request(
+                "/organization/remove-team",
+                Some(json!({"organizationId":org_id,"teamId":team_id})),
+                &cookie,
+            ),
+            if phase == 3 { 400 } else { 500 },
+        )
+        .await;
+        assert!(cookies(&response).is_empty());
+        if phase == 3 {
+            assert_eq!(body(&response)["code"], "TEAM_HOOK_REJECTED");
+            assert_eq!(body(&response)["message"], "Rejected before-create");
+        } else {
+            assert!(response.body.is_empty());
+        }
+        assert_eq!(
+            *hooks.events.lock().unwrap(),
+            if phase == 2 { vec![1, 2] } else { vec![1] }
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM team WHERE organization_id=$1 AND name=$2",
+                &[&org_id, &format!("Independent:{phase}")]
+            )
+            .await?,
+            i64::from(phase != 3)
+        );
+
+        assert_eq!(
+            db.count_where("SELECT COUNT(*) FROM team WHERE id=$1", &[&team_id])
+                .await?,
+            i64::from(phase == 1)
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM team_member WHERE team_id=$1",
+                &[&team_id]
+            )
+            .await?,
+            i64::from(phase == 1)
+        );
+
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                .await?,
+            before
+        );
+        let foreign_after: Vec<Value> =
+            serde_json::from_str::<Vec<Value>>(&db.table("team").await?)?
+                .into_iter()
+                .filter(|row| row["organization_id"] == outside_id)
+                .collect();
+        assert_eq!(foreign_after, foreign_before);
+        authenticated(&auth, &cookie, "team-callback-owner@example.test").await;
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "team-callback-foreign@example.test",
+        )
+        .await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn organization_team_add_member_callback_failure<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::extensions::TeamHookContext;
+    struct Hooks<S: AuthSchema> {
+        store: Arc<dyn alibi::AuthStore<S>>,
+        phase: std::sync::atomic::AtomicU8,
+        actor: Mutex<String>,
+        events: Mutex<Vec<u8>>,
+    }
+    impl<S: AuthSchema> std::fmt::Debug for Hooks<S> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("TeamBoundaryCallbacks")
+        }
+    }
+    impl<S: AuthSchema> Hooks<S> {
+        async fn hit(&self, phase: u8, c: &TeamHookContext) -> AuthResult<()> {
+            let armed = self.phase.load(std::sync::atomic::Ordering::SeqCst);
+            if armed == 0 {
+                return Ok(());
+            }
+            assert_eq!(c.user.as_ref().unwrap().id, *self.actor.lock().unwrap());
+            self.events.lock().unwrap().push(phase);
+            if armed == 3 && phase == 1 {
+                return Err(AuthError::Api {
+                    status: 400,
+                    code: Some("TEAM_HOOK_REJECTED".into()),
+                    message: "Rejected before-create".into(),
+                });
+            }
+            if armed != phase {
+                return Ok(());
+            }
+            _ = self
+                .store
+                .create_team(alibi::CreateTeam {
+                    name: format!("Independent:{phase}"),
+                    organization_id: c.organization.id.clone(),
+                    updated_at: None,
+                })
+                .await?;
+            Err(AuthError::internal("private team callback failure"))
+        }
+    }
+    #[async_trait]
+    impl<S: AuthSchema> OrganizationTeamHooks for Hooks<S> {
+        async fn before_add_member(
+            &self,
+            _: &alibi::Team,
+            _: &alibi::wire::UserView,
+            c: &TeamHookContext,
+        ) -> AuthResult<()> {
+            self.hit(1, c).await
+        }
+        async fn after_add_member(
+            &self,
+            member: &alibi::TeamMember,
+            _: &alibi::Team,
+            user: &alibi::wire::UserView,
+            c: &TeamHookContext,
+        ) -> AuthResult<()> {
+            assert_eq!(member.user_id, user.id);
+            self.hit(2, c).await
+        }
+    }
+    for phase in [1, 2] {
+        let db = db.fresh().await?;
+        let (connection, store) = db.migrated::<B>(SECRET).await?;
+        let hooks = Arc::new(Hooks {
+            store: Arc::new(store),
+            phase: std::sync::atomic::AtomicU8::new(0),
+            actor: Mutex::new(String::new()),
+            events: Mutex::new(Vec::new()),
+        });
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                teams: TeamsConfig {
+                    enabled: true,
+                    create_default_team: false,
+                    allow_removing_all_teams: true,
+                    hooks: Some(hooks.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let owner = signup(&auth, "team-callback-owner@example.test").await;
+        let foreign = signup(&auth, "team-callback-foreign@example.test").await;
+        let owner_id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+        *hooks.actor.lock().unwrap() = owner_id.clone();
+        let cookie = cookies(&owner);
+        _ = call(
+            &auth,
+            request(
+                "/sign-in/email",
+                Some(json!({"email":"team-callback-owner@example.test","password":PASSWORD})),
+                "",
+            ),
+            200,
+        )
+        .await;
+        let org = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Owned","slug":"owned"})),
+                &cookie,
+            ),
+            200,
+        )
+        .await;
+        let org_id = body(&org)["id"].as_str().unwrap().to_owned();
+        let outside = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Foreign","slug":"foreign"})),
+                &cookies(&foreign),
+            ),
+            200,
+        )
+        .await;
+        let outside_id = body(&outside)["id"].as_str().unwrap().to_owned();
+        _ = auth
+            .store()
+            .create_team(alibi::CreateTeam {
+                name: "Foreign team".into(),
+                organization_id: outside_id.clone(),
+                updated_at: None,
+            })
+            .await?;
+
+        let target = call(
+            &auth,
+            request(
+                "/organization/create-team",
+                Some(json!({"organizationId":org_id,"name":"Target"})),
+                &cookie,
+            ),
+            200,
+        )
+        .await;
+        let team_id = body(&target)["id"].as_str().unwrap().to_owned();
+
+        let before = db
+            .tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?;
+        let foreign_before: Vec<Value> =
+            serde_json::from_str::<Vec<Value>>(&db.table("team").await?)?
+                .into_iter()
+                .filter(|row| row["organization_id"] == outside_id)
+                .collect();
+        hooks
+            .phase
+            .store(phase, std::sync::atomic::Ordering::SeqCst);
+        let response = call(
+            &auth,
+            request(
+                "/organization/add-team-member",
+                Some(json!({"organizationId":org_id,"teamId":team_id,"userId":owner_id})),
+                &cookie,
+            ),
+            if phase == 3 { 400 } else { 500 },
+        )
+        .await;
+        assert!(cookies(&response).is_empty());
+        if phase == 3 {
+            assert_eq!(body(&response)["code"], "TEAM_HOOK_REJECTED");
+            assert_eq!(body(&response)["message"], "Rejected before-create");
+        } else {
+            assert!(response.body.is_empty());
+        }
+        assert_eq!(
+            *hooks.events.lock().unwrap(),
+            if phase == 2 { vec![1, 2] } else { vec![1] }
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM team WHERE organization_id=$1 AND name=$2",
+                &[&org_id, &format!("Independent:{phase}")]
+            )
+            .await?,
+            i64::from(phase != 3)
+        );
+
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM team_member WHERE team_id=$1 AND user_id=$2",
+                &[&team_id, &owner_id]
+            )
+            .await?,
+            i64::from(phase == 2)
+        );
+        assert_eq!(
+            db.text(
+                "SELECT CAST(member_count AS TEXT) FROM team WHERE id=$1",
+                &[&team_id]
+            )
+            .await?
+            .as_deref(),
+            Some(if phase == 2 { "1" } else { "0" })
+        );
+
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                .await?,
+            before
+        );
+        let foreign_after: Vec<Value> =
+            serde_json::from_str::<Vec<Value>>(&db.table("team").await?)?
+                .into_iter()
+                .filter(|row| row["organization_id"] == outside_id)
+                .collect();
+        assert_eq!(foreign_after, foreign_before);
+        authenticated(&auth, &cookie, "team-callback-owner@example.test").await;
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "team-callback-foreign@example.test",
+        )
+        .await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn organization_team_remove_member_callback_failure<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::extensions::TeamHookContext;
+    struct Hooks<S: AuthSchema> {
+        store: Arc<dyn alibi::AuthStore<S>>,
+        phase: std::sync::atomic::AtomicU8,
+        actor: Mutex<String>,
+        events: Mutex<Vec<u8>>,
+    }
+    impl<S: AuthSchema> std::fmt::Debug for Hooks<S> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("TeamBoundaryCallbacks")
+        }
+    }
+    impl<S: AuthSchema> Hooks<S> {
+        async fn hit(&self, phase: u8, c: &TeamHookContext) -> AuthResult<()> {
+            let armed = self.phase.load(std::sync::atomic::Ordering::SeqCst);
+            if armed == 0 {
+                return Ok(());
+            }
+            assert_eq!(c.user.as_ref().unwrap().id, *self.actor.lock().unwrap());
+            self.events.lock().unwrap().push(phase);
+            if armed == 3 && phase == 1 {
+                return Err(AuthError::Api {
+                    status: 400,
+                    code: Some("TEAM_HOOK_REJECTED".into()),
+                    message: "Rejected before-create".into(),
+                });
+            }
+            if armed != phase {
+                return Ok(());
+            }
+            _ = self
+                .store
+                .create_team(alibi::CreateTeam {
+                    name: format!("Independent:{phase}"),
+                    organization_id: c.organization.id.clone(),
+                    updated_at: None,
+                })
+                .await?;
+            Err(AuthError::internal("private team callback failure"))
+        }
+    }
+    #[async_trait]
+    impl<S: AuthSchema> OrganizationTeamHooks for Hooks<S> {
+        async fn before_remove_member(
+            &self,
+            member: &alibi::TeamMember,
+            _: &alibi::Team,
+            user: &alibi::wire::UserView,
+            c: &TeamHookContext,
+        ) -> AuthResult<()> {
+            assert_eq!(member.user_id, user.id);
+            self.hit(1, c).await
+        }
+        async fn after_remove_member(
+            &self,
+            member: &alibi::TeamMember,
+            _: &alibi::Team,
+            user: &alibi::wire::UserView,
+            c: &TeamHookContext,
+        ) -> AuthResult<()> {
+            assert_eq!(member.user_id, user.id);
+            self.hit(2, c).await
+        }
+    }
+    for phase in [1, 2] {
+        let db = db.fresh().await?;
+        let (connection, store) = db.migrated::<B>(SECRET).await?;
+        let hooks = Arc::new(Hooks {
+            store: Arc::new(store),
+            phase: std::sync::atomic::AtomicU8::new(0),
+            actor: Mutex::new(String::new()),
+            events: Mutex::new(Vec::new()),
+        });
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                teams: TeamsConfig {
+                    enabled: true,
+                    create_default_team: false,
+                    allow_removing_all_teams: true,
+                    hooks: Some(hooks.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let owner = signup(&auth, "team-callback-owner@example.test").await;
+        let foreign = signup(&auth, "team-callback-foreign@example.test").await;
+        let owner_id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+        *hooks.actor.lock().unwrap() = owner_id.clone();
+        let cookie = cookies(&owner);
+        _ = call(
+            &auth,
+            request(
+                "/sign-in/email",
+                Some(json!({"email":"team-callback-owner@example.test","password":PASSWORD})),
+                "",
+            ),
+            200,
+        )
+        .await;
+        let org = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Owned","slug":"owned"})),
+                &cookie,
+            ),
+            200,
+        )
+        .await;
+        let org_id = body(&org)["id"].as_str().unwrap().to_owned();
+        let outside = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Foreign","slug":"foreign"})),
+                &cookies(&foreign),
+            ),
+            200,
+        )
+        .await;
+        let outside_id = body(&outside)["id"].as_str().unwrap().to_owned();
+        _ = auth
+            .store()
+            .create_team(alibi::CreateTeam {
+                name: "Foreign team".into(),
+                organization_id: outside_id.clone(),
+                updated_at: None,
+            })
+            .await?;
+
+        let target = call(
+            &auth,
+            request(
+                "/organization/create-team",
+                Some(json!({"organizationId":org_id,"name":"Target"})),
+                &cookie,
+            ),
+            200,
+        )
+        .await;
+        let team_id = body(&target)["id"].as_str().unwrap().to_owned();
+        _ = auth
+            .store()
+            .add_team_member(&team_id, &owner_id, None)
+            .await?;
+
+        let before = db
+            .tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?;
+        let foreign_before: Vec<Value> =
+            serde_json::from_str::<Vec<Value>>(&db.table("team").await?)?
+                .into_iter()
+                .filter(|row| row["organization_id"] == outside_id)
+                .collect();
+        hooks
+            .phase
+            .store(phase, std::sync::atomic::Ordering::SeqCst);
+        let response = call(
+            &auth,
+            request(
+                "/organization/remove-team-member",
+                Some(json!({"organizationId":org_id,"teamId":team_id,"userId":owner_id})),
+                &cookie,
+            ),
+            if phase == 3 { 400 } else { 500 },
+        )
+        .await;
+        assert!(cookies(&response).is_empty());
+        if phase == 3 {
+            assert_eq!(body(&response)["code"], "TEAM_HOOK_REJECTED");
+            assert_eq!(body(&response)["message"], "Rejected before-create");
+        } else {
+            assert!(response.body.is_empty());
+        }
+        assert_eq!(
+            *hooks.events.lock().unwrap(),
+            if phase == 2 { vec![1, 2] } else { vec![1] }
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM team WHERE organization_id=$1 AND name=$2",
+                &[&org_id, &format!("Independent:{phase}")]
+            )
+            .await?,
+            i64::from(phase != 3)
+        );
+
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM team_member WHERE team_id=$1 AND user_id=$2",
+                &[&team_id, &owner_id]
+            )
+            .await?,
+            i64::from(phase == 1)
+        );
+        assert_eq!(
+            db.text(
+                "SELECT CAST(member_count AS TEXT) FROM team WHERE id=$1",
+                &[&team_id]
+            )
+            .await?
+            .as_deref(),
+            Some(if phase == 1 { "1" } else { "0" })
+        );
+
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                .await?,
+            before
+        );
+        let foreign_after: Vec<Value> =
+            serde_json::from_str::<Vec<Value>>(&db.table("team").await?)?
+                .into_iter()
+                .filter(|row| row["organization_id"] == outside_id)
+                .collect();
+        assert_eq!(foreign_after, foreign_before);
+        authenticated(&auth, &cookie, "team-callback-owner@example.test").await;
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "team-callback-foreign@example.test",
+        )
+        .await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn organization_default_team_factory_failure<B: Backend>(db: Db) -> TestResult {
+    #[derive(Debug)]
+    struct Factory(std::sync::atomic::AtomicBool);
+    #[async_trait]
+    impl DefaultTeamFactory for Factory {
+        async fn create(
+            &self,
+            org: &alibi::Organization,
+            c: &DefaultTeamContext,
+            store: &dyn alibi::store::TeamStore,
+        ) -> AuthResult<Option<alibi::Team>> {
+            assert!(
+                c.request
+                    .as_ref()
+                    .unwrap()
+                    .path
+                    .ends_with("/organization/create")
+            );
+            let team = store
+                .create_team(alibi::CreateTeam {
+                    name: format!("Factory:{}", org.name),
+                    organization_id: org.id.clone(),
+                    updated_at: None,
+                })
+                .await?;
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(AuthError::internal("private factory rejection"));
+            }
+            Ok(Some(team))
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let factory = Arc::new(Factory(std::sync::atomic::AtomicBool::new(false)));
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            teams: TeamsConfig {
+                enabled: true,
+                default_team_factory: Some(factory.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let owner = signup(&auth, "factory-owner@example.test").await;
+    let cookie = cookies(&owner);
+    let selected = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Existing","slug":"existing"})),
+            &cookie,
+        ),
+        200,
+    )
+    .await;
+    let selected_id = body(&selected)["id"].as_str().unwrap().to_owned();
+    let before = db
+        .tables(&["users", "accounts", "sessions", "team_member"])
+        .await?;
+    factory.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    let failed = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Factory error","slug":"factory-error"})),
+            &cookie,
+        ),
+        500,
+    )
+    .await;
+    assert!(failed.body.is_empty());
+    assert!(cookies(&failed).is_empty());
+    let failed_id = db
+        .text(
+            "SELECT id FROM organization WHERE slug='factory-error'",
+            &[],
+        )
+        .await?
+        .unwrap();
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM member WHERE organization_id=$1",
+            &[&failed_id]
+        )
+        .await?,
+        1
+    );
+    assert_eq!(db.count_where("SELECT COUNT(*) FROM team WHERE organization_id=$1 AND name='Factory:Factory error' AND member_count=0",&[&failed_id]).await?,1);
+    let team_id = db
+        .text(
+            "SELECT id FROM team WHERE organization_id=$1",
+            &[&failed_id],
+        )
+        .await?
+        .unwrap();
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM team_member WHERE team_id=$1",
+            &[&team_id]
+        )
+        .await?,
+        0
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "team_member"])
+            .await?,
+        before
+    );
+    let session = body(&call(&auth, request("/get-session", None, &cookie), 200).await);
+    assert_eq!(session["session"]["activeOrganizationId"], selected_id);
     B::close(connection).await
 }
 
