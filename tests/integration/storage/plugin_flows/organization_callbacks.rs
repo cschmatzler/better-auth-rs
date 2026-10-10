@@ -17,7 +17,8 @@ backend_tests!(
     organization_creation_retains_original_member_after_independent_role_write,
     organization_creator_patch_retargeting_keeps_team_and_selection_actor,
     organization_addition_after_hook_keeps_original_target_after_user_write,
-    organization_self_removal_after_rejection_clears_only_current_org_selection
+    organization_self_removal_after_rejection_clears_only_current_org_selection,
+    organization_deletion_before_await_boundary
 );
 postgres_tests!(
     organization_lifecycle_callbacks_preserve_patch_authority_and_committed_phases,
@@ -2054,5 +2055,192 @@ async fn organization_self_removal_after_rejection_clears_only_current_org_selec
         expected_team
     );
     authenticated(&auth, &cookies(&owner), "owner@example.test").await;
+    B::close(connection).await
+}
+
+async fn organization_deletion_before_await_boundary<B: Backend>(db: Db) -> TestResult {
+    use alibi::AuthSession;
+    #[derive(Debug, Default)]
+    struct Hooks {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        contexts: Mutex<Vec<OrganizationDeleteContext>>,
+    }
+    #[async_trait]
+    impl OrganizationDeletionHooks for Hooks {
+        async fn before_delete(&self, c: &OrganizationDeleteContext) -> AuthResult<()> {
+            self.contexts.lock().unwrap().push(c.clone());
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+        async fn after_delete(&self, c: &OrganizationDeleteContext) -> AuthResult<()> {
+            self.contexts.lock().unwrap().push(c.clone());
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let hooks = Arc::new(Hooks::default());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            deletion_hooks: Some(hooks.clone()),
+            teams: TeamsConfig {
+                enabled: true,
+                create_default_team: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+
+    let owner = signup(&auth, "owner@example.test").await;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let sibling = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"owner@example.test","password":PASSWORD})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    let org=body(&call(&auth,request("/organization/create",Some(json!({"name":"Original Organization","slug":"owned","metadata":{"original":true}})),&cookies(&owner)),200).await);
+    let _ = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Foreign Organization","slug":"foreign"})),
+            &cookies(&foreign),
+        ),
+        200,
+    )
+    .await;
+    let team = body(
+        &call(
+            &auth,
+            request(
+                "/organization/create-team",
+                Some(json!({"organizationId":org["id"],"name":"Selected"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await,
+    );
+    let _=call(&auth,request("/organization/add-team-member",Some(json!({"organizationId":org["id"],"teamId":team["id"],"userId":body(&owner)["user"]["id"]})),&cookies(&owner)),200).await;
+    for browser in [&owner, &sibling] {
+        let _ = call(
+            &auth,
+            request(
+                "/organization/set-active",
+                Some(json!({"organizationId":org["id"]})),
+                &cookies(browser),
+            ),
+            200,
+        )
+        .await;
+        let _ = call(
+            &auth,
+            request(
+                "/organization/set-active-team",
+                Some(json!({"teamId":team["id"]})),
+                &cookies(browser),
+            ),
+            200,
+        )
+        .await;
+    }
+    let _ = call(
+        &auth,
+        request(
+            "/organization/invite-member",
+            Some(
+                json!({"organizationId":org["id"],"email":"pending@example.test","role":"member"}),
+            ),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let token = body(&owner)["token"].as_str().unwrap().to_owned();
+    let sibling_token = body(&sibling)["token"].as_str().unwrap().to_owned();
+    let original_session = auth.store().get_session(&token).await?.unwrap();
+    let sibling_session = auth.store().get_session(&sibling_token).await?.unwrap();
+
+    let before = db
+        .tables(&[
+            "users",
+            "accounts",
+            "organization",
+            "member",
+            "invitation",
+            "team",
+            "team_member",
+        ])
+        .await?;
+    let pending = auth.handle_request(request(
+        "/organization/delete",
+        Some(json!({"organizationId":org["id"]})),
+        &cookies(&owner),
+    ));
+    tokio::pin!(pending);
+    tokio::time::timeout(std::time::Duration::from_secs(10),async {tokio::select! {biased;_=hooks.entered.notified()=>{},r=&mut pending=>panic!("deletion returned before hook release: {r:?}")}}).await?;
+    assert_eq!(hooks.contexts.lock().unwrap().len(), 1);
+    assert_eq!(
+        db.tables(&[
+            "users",
+            "accounts",
+            "organization",
+            "member",
+            "invitation",
+            "team",
+            "team_member"
+        ])
+        .await?,
+        before
+    );
+    let held = auth.store().get_session(&token).await?.unwrap();
+    assert_eq!(held.active_organization_id(), None);
+    assert_eq!(held.active_team_id(), original_session.active_team_id());
+    assert_eq!(
+        serde_json::to_value(auth.store().get_session(&sibling_token).await?.unwrap())?,
+        serde_json::to_value(&sibling_session)?
+    );
+    hooks.release.notify_one();
+    let deleted = pending.await?;
+    assert_eq!(deleted.status, 200);
+    assert_eq!(body(&deleted)["name"], "Original Organization");
+    assert_eq!(hooks.contexts.lock().unwrap().len(), 2);
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM organization WHERE id=$1",
+            &[org["id"].as_str().unwrap()]
+        )
+        .await?,
+        0
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM member WHERE organization_id=$1",
+            &[org["id"].as_str().unwrap()]
+        )
+        .await?,
+        0
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM invitation WHERE organization_id=$1",
+            &[org["id"].as_str().unwrap()]
+        )
+        .await?,
+        0
+    );
+    assert_eq!(
+        serde_json::to_value(auth.store().get_session(&sibling_token).await?.unwrap())?,
+        serde_json::to_value(sibling_session)?
+    );
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
 }
