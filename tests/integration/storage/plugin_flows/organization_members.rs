@@ -20,7 +20,8 @@ backend_tests!(
     organization_plugin_helpers,
     organization_trusted_addition_preserves_literal_role_arrays_and_session_scope,
     fractional_organization_membership_limit_uses_actual_physical_count,
-    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results
+    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results,
+    organization_creation_policy_error
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -892,4 +893,113 @@ async fn organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_r
     assert_eq!(policy.seen.lock().unwrap().len(), count);
     assert_eq!(db.count("member").await?, 2);
     B::close(connection).await
+}
+
+async fn organization_creation_policy_error<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::OrganizationCreationPolicy;
+    #[derive(Debug)]
+    struct Policy {
+        failure: &'static str,
+        events: Mutex<Vec<&'static str>>,
+    }
+    impl Policy {
+        fn phase(&self, phase: &'static str) -> AuthResult<()> {
+            self.events.lock().unwrap().push(phase);
+            if self.failure == phase {
+                Err(alibi::AuthError::Api {
+                    status: 403,
+                    code: Some(format!("CREATION_{}_REJECTED", phase.to_uppercase())),
+                    message: "Application creation policy rejected".into(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl OrganizationCreationPolicy for Policy {
+        async fn allow_creation(&self, _: &UserView) -> AuthResult<Option<bool>> {
+            self.phase("allow")?;
+            Ok(Some(true))
+        }
+        async fn limit_reached(&self, _: &UserView) -> AuthResult<Option<bool>> {
+            self.phase("limit")?;
+            Ok(Some(false))
+        }
+    }
+    for failure in ["allow", "limit"] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let policy = Arc::new(Policy {
+            failure,
+            events: Mutex::new(Vec::new()),
+        });
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                creation_policy: Some(policy.clone()),
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let owner = account(&auth, "creation-error-owner@example.test").await;
+        let foreign = account(&auth, "creation-error-foreign@example.test").await;
+        let before = db
+            .tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?;
+        let code = format!("CREATION_{}_REJECTED", failure.to_uppercase());
+        let expected = if failure == "allow" {
+            vec!["allow"]
+        } else {
+            vec!["allow", "limit"]
+        };
+        let denied = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Policy rejected","slug":"policy-rejected"})),
+                &owner.cookie,
+            ),
+            403,
+        )
+        .await;
+        assert_eq!(
+            body(&denied),
+            json!({"code":code,"message":"Application creation policy rejected"})
+        );
+        assert_eq!(*policy.events.lock().unwrap(), expected);
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                .await?,
+            before
+        );
+        policy.events.lock().unwrap().clear();
+        let result = Box::pin(auth.dispatch_endpoint(
+            OrganizationPlugin::create_endpoint(
+                &serde_json::from_value(
+                    json!({"name":"Trusted rejected","slug":"trusted-rejected","userId":owner.id}),
+                )?,
+                Some(&owner.id),
+            )?,
+            EndpointOptions::default(),
+        ))
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(result.error,alibi::AuthError::Api {status:403,code:Some(ref actual),ref message} if actual==&code && message=="Application creation policy rejected")
+        );
+        assert_eq!(*policy.events.lock().unwrap(), expected);
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                .await?,
+            before
+        );
+        authenticated(
+            &auth,
+            &foreign.cookie,
+            "creation-error-foreign@example.test",
+        )
+        .await;
+        B::close(connection).await?;
+    }
+    Ok(())
 }
