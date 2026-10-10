@@ -16,7 +16,8 @@ backend_tests!(
     organization_invitation_policy,
     organization_anonymous_and_failures,
     organization_invitation_stamps,
-    processed_invitation_cancellation_keeps_members_and_original_callback_status
+    processed_invitation_cancellation_keeps_members_and_original_callback_status,
+    organization_invitation_replacement_team
 );
 
 #[derive(Debug, Default)]
@@ -713,4 +714,217 @@ async fn processed_invitation_cancellation_keeps_members_and_original_callback_s
         B::close(connection).await?;
     }
     Ok(())
+}
+
+async fn organization_invitation_replacement_team<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        OrganizationInvitationAcceptanceContext, OrganizationInvitationAcceptanceHooks,
+        OrganizationInvitationAcceptedContext,
+    };
+    struct Replacement {
+        raw: crate::storage::Raw,
+        team: Mutex<String>,
+        receipts: Mutex<Vec<Value>>,
+    }
+    impl std::fmt::Debug for Replacement {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Replacement").finish_non_exhaustive()
+        }
+    }
+    #[async_trait::async_trait]
+    impl OrganizationInvitationAcceptanceHooks for Replacement {
+        async fn before_accept_invitation(
+            &self,
+            c: &OrganizationInvitationAcceptanceContext,
+        ) -> AuthResult<()> {
+            self.receipts
+                .lock()
+                .unwrap()
+                .push(json!({"phase":"before","invitation":c.invitation}));
+            let team = self.team.lock().unwrap().clone();
+            _ = self
+                .raw
+                .execute(
+                    "UPDATE invitation SET team_id=$1 WHERE id=$2",
+                    &[&team, &c.invitation.id],
+                )
+                .await
+                .map_err(|e| alibi::AuthError::internal(e.to_string()))?;
+            Ok(())
+        }
+        async fn after_accept_invitation(
+            &self,
+            c: &OrganizationInvitationAcceptedContext,
+        ) -> AuthResult<()> {
+            self.receipts
+                .lock()
+                .unwrap()
+                .push(json!({"phase":"after","invitation":c.invitation}));
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let replacement = Arc::new(Replacement {
+        raw: db.raw.clone(),
+        team: Mutex::new(String::new()),
+        receipts: Mutex::new(Vec::new()),
+    });
+    let organization = OrganizationConfig {
+        invitation_acceptance_hooks: Some(replacement.clone()),
+        teams: TeamsConfig {
+            enabled: true,
+            create_default_team: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(OrganizationPlugin::with_config(organization))
+        .build()
+        .await?;
+    let owner = signup(&auth, "staged-invitation-owner@example.test").await;
+    let target = signup(&auth, "staged-invitation-target@example.test").await;
+    let foreign = signup(&auth, "staged-invitation-foreign@example.test").await;
+    let sibling = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"staged-invitation-target@example.test","password":PASSWORD})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    let created = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Stage","slug":"invitation-stage"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let org = body(&created)["id"].as_str().unwrap().to_owned();
+    let jar = merge(&cookies(&owner), &cookies(&created));
+    let target_id = body(&target)["user"]["id"].as_str().unwrap().to_owned();
+
+    let created_team = call(
+        &auth,
+        request(
+            "/organization/create-team",
+            Some(json!({"organizationId":org,"name":"Invited team"})),
+            &jar,
+        ),
+        200,
+    )
+    .await;
+    let team = body(&created_team)["id"].as_str().unwrap().to_owned();
+    let invited=call(&auth,request("/organization/invite-member",Some(json!({"organizationId":org,"email":"staged-invitation-target@example.test","role":"member","teamId":team})),&jar),200).await;
+    let invitation = body(&invited)["id"].as_str().unwrap().to_owned();
+
+    let created_replacement = call(
+        &auth,
+        request(
+            "/organization/create-team",
+            Some(json!({"organizationId":org,"name":"Replacement"})),
+            &jar,
+        ),
+        200,
+    )
+    .await;
+    let next_team = body(&created_replacement)["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    *replacement.team.lock().unwrap() = next_team.clone();
+    let before = db.tables(&["users", "accounts"]).await?;
+    let original = auth
+        .store()
+        .get_invitation_by_id(&invitation)
+        .await?
+        .unwrap();
+    let accepted = call(
+        &auth,
+        request(
+            "/organization/accept-invitation",
+            Some(json!({"invitationId":invitation})),
+            &cookies(&target),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&accepted)["invitation"]["teamId"], next_team);
+    let receipts = replacement.receipts.lock().unwrap().clone();
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[0]["invitation"]["teamId"], team);
+    assert_eq!(receipts[0]["invitation"]["status"], "pending");
+    assert_eq!(receipts[1]["invitation"], body(&accepted)["invitation"]);
+    let mut expected = original;
+    expected.team_id = Some(next_team.clone());
+    expected.status = alibi::InvitationStatus::Accepted;
+    assert_eq!(
+        auth.store()
+            .get_invitation_by_id(&invitation)
+            .await?
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        db.text(
+            "SELECT team_id FROM team_member WHERE user_id=$1",
+            &[&target_id]
+        )
+        .await?
+        .as_deref(),
+        Some(next_team.as_str())
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM team_member WHERE team_id=$1",
+            &[&team]
+        )
+        .await?,
+        0
+    );
+    assert_eq!(
+        db.text(
+            "SELECT CAST(member_count AS TEXT) FROM team WHERE id=$1",
+            &[&team]
+        )
+        .await?
+        .as_deref(),
+        Some("0")
+    );
+    assert_eq!(
+        db.text(
+            "SELECT CAST(member_count AS TEXT) FROM team WHERE id=$1",
+            &[&next_team]
+        )
+        .await?
+        .as_deref(),
+        Some("1")
+    );
+    let current = call(&auth, request("/get-session", None, &cookies(&target)), 200).await;
+    assert_eq!(body(&current)["session"]["activeTeamId"], next_team);
+    let sibling_current = call(
+        &auth,
+        request("/get-session", None, &cookies(&sibling)),
+        200,
+    )
+    .await;
+    assert!(body(&sibling_current)["session"]["activeTeamId"].is_null());
+    assert_eq!(db.tables(&["users", "accounts"]).await?, before);
+    authenticated(
+        &auth,
+        &cookies(&foreign),
+        "staged-invitation-foreign@example.test",
+    )
+    .await;
+    B::close(connection).await
 }
