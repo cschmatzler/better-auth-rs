@@ -30,7 +30,8 @@ backend_tests!(
     organization_removal_callback_500_identity,
     organization_deletion_original_row_snapshot,
     organization_deletion_before_await_boundary,
-    organization_signed_team_helper_session_scope
+    organization_signed_team_helper_session_scope,
+    organization_member_team_policy_headers
 );
 postgres_tests!(
     organization_lifecycle_callbacks_preserve_patch_authority_and_committed_phases,
@@ -4458,5 +4459,197 @@ async fn organization_signed_team_helper_session_scope<B: Backend>(db: Db) -> Te
     _ = read.query.insert("teamId".into(), team.id.clone());
     let stale = call(&auth, read, 400).await;
     assert_eq!(body(&stale)["code"], "TEAM_NOT_FOUND");
+    B::close(connection).await
+}
+
+async fn organization_member_team_policy_headers<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::extensions::TeamLimitContext;
+    #[derive(Debug, Default)]
+    struct Hooks {
+        phases: Mutex<Vec<&'static str>>,
+        contexts: Mutex<Vec<TeamLimitContext>>,
+    }
+    #[async_trait]
+    impl OrganizationMemberAdditionHooks for Hooks {
+        async fn before_add_member(
+            &self,
+            _: &OrganizationMemberAdditionContext,
+        ) -> AuthResult<Option<OrganizationMemberCreatePatch>> {
+            self.phases.lock().unwrap().push("before");
+            Ok(None)
+        }
+        async fn after_add_member(&self, _: &OrganizationMemberAddedContext) -> AuthResult<()> {
+            self.phases.lock().unwrap().push("after");
+            Ok(())
+        }
+    }
+    #[async_trait]
+    impl OrganizationLimitResolver for Hooks {
+        async fn maximum_team_members(&self, c: &TeamLimitContext) -> AuthResult<Option<f64>> {
+            self.contexts.lock().unwrap().push(c.clone());
+            Ok(Some(2.0))
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let hooks = Arc::new(Hooks::default());
+    let config = OrganizationConfig {
+        member_addition_hooks: Some(hooks.clone()),
+        teams: TeamsConfig {
+            enabled: true,
+            create_default_team: false,
+            limit_resolver: Some(hooks.clone()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let helper = OrganizationPlugin::with_config(config.clone());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(config))
+        .build()
+        .await?;
+
+    let owner = signup(&auth, "owner@example.test").await;
+    let target = signup(&auth, "target@example.test").await;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let target_id = body(&target)["user"]["id"].as_str().unwrap().to_owned();
+    let foreign_id = body(&foreign)["user"]["id"].as_str().unwrap().to_owned();
+    let org = body(
+        &call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Owned","slug":"owned"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await,
+    );
+    let other = body(
+        &call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Foreign","slug":"foreign"})),
+                &cookies(&foreign),
+            ),
+            200,
+        )
+        .await,
+    );
+    let mut teams = Vec::new();
+    let mut own_member_id = String::new();
+    for (organization, actor) in [(&org, &owner), (&other, &foreign)] {
+        let member = auth
+            .dispatch_endpoint(
+                OrganizationPlugin::add_member_endpoint(&serde_json::from_value(
+                    json!({"organizationId":organization["id"],"userId":target_id,"role":"member"}),
+                )?)?,
+                alibi::endpoint::EndpointOptions::default(),
+            )
+            .await?
+            .decode()?;
+        if organization["id"] == org["id"] {
+            own_member_id = member.id;
+        }
+        let team = body(
+            &call(
+                &auth,
+                request(
+                    "/organization/create-team",
+                    Some(json!({"organizationId":organization["id"],"name":"Seat"})),
+                    &cookies(actor),
+                ),
+                200,
+            )
+            .await,
+        );
+        let _=call(&auth,request("/organization/add-team-member",Some(json!({"organizationId":organization["id"],"teamId":team["id"],"userId":target_id})),&cookies(actor)),200).await;
+        teams.push(team);
+    }
+    auth.store().delete_member(&own_member_id).await?;
+    let own_team = teams.first().unwrap()["id"].as_str().unwrap().to_owned();
+    let foreign_team = teams.last().unwrap()["id"].as_str().unwrap().to_owned();
+
+    hooks.phases.lock().unwrap().clear();
+    hooks.contexts.lock().unwrap().clear();
+    let stable = db
+        .tables(&["users", "accounts", "sessions", "organization"])
+        .await?;
+    let input = serde_json::from_value(
+        json!({"organizationId":org["id"],"userId":target_id,"role":"member","teamId":own_team}),
+    )?;
+    let rejected = helper
+        .add_member_with_headers(auth.context(), &std::collections::HashMap::new(), &input)
+        .await
+        .unwrap_err();
+    assert!(matches!(rejected, AuthError::Unauthenticated));
+    assert_eq!(*hooks.phases.lock().unwrap(), vec!["before"]);
+    assert!(hooks.contexts.lock().unwrap().is_empty());
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM member WHERE organization_id=$1 AND user_id=$2",
+            &[org["id"].as_str().unwrap(), &target_id]
+        )
+        .await?,
+        0
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM team_member WHERE team_id=$1 AND user_id=$2",
+            &[&own_team, &target_id]
+        )
+        .await?,
+        0
+    );
+    assert_eq!(
+        db.count_where("SELECT member_count FROM team WHERE id=$1", &[&own_team])
+            .await?,
+        0
+    );
+    let headers = std::collections::HashMap::from([("cookie".into(), cookies(&foreign))]);
+    let result = helper
+        .add_member_with_headers(auth.context(), &headers, &input)
+        .await?;
+    assert_eq!(result.user_id, target_id);
+    assert_eq!(result.organization_id, org["id"].as_str().unwrap());
+    assert_eq!(
+        *hooks.phases.lock().unwrap(),
+        vec!["before", "before", "after"]
+    );
+    let contexts = hooks.contexts.lock().unwrap().clone();
+    let c = contexts.first().unwrap();
+    assert_eq!(contexts.len(), 1);
+    assert_eq!(c.organization_id, org["id"].as_str().unwrap());
+    assert_eq!(c.team_id.as_deref(), Some(own_team.as_str()));
+    assert_eq!(c.user.as_ref().unwrap().id, foreign_id);
+    assert_eq!(
+        c.session.as_ref().unwrap().token,
+        body(&foreign)["token"].as_str().unwrap()
+    );
+    assert!(c.request.is_none());
+    drop(contexts);
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM team_member WHERE team_id=$1 AND user_id=$2",
+            &[&own_team, &target_id]
+        )
+        .await?,
+        1
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM team_member WHERE team_id=$1 AND user_id=$2",
+            &[&foreign_team, &target_id]
+        )
+        .await?,
+        1
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization"])
+            .await?,
+        stable
+    );
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
 }
