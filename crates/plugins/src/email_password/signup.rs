@@ -46,6 +46,7 @@ pub(super) async fn notify_existing(
 
 pub(super) fn synthetic_response(
     body: &SignUpRequest,
+    parsed_fields: &alibi_core::field_policy::FieldValues,
     config: &EmailPasswordConfig,
     context: &AuthContext<impl AuthSchema>,
 ) -> AuthResult<(SignUpResponse<Value>, Option<Vec<String>>)> {
@@ -60,17 +61,33 @@ pub(super) fn synthetic_response(
     ]);
     let input = SyntheticUserContext {
         core_fields,
-        additional_fields: Map::new(),
-        id: uuid::Uuid::new_v4().simple().to_string(),
+        additional_fields: parsed_fields
+            .iter()
+            .filter(|(name, _)| context.config.user.additional_fields.contains_key(*name))
+            .map(|(name, value)| Ok((name.clone(), serde_json::to_value(value)?)))
+            .collect::<Result<_, serde_json::Error>>()?,
+        id: context
+            .config
+            .advanced
+            .database
+            .generated_id("user")?
+            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string()),
     };
     let mut candidate = if let Some(customize) = &config.custom_synthetic_user {
         customize(input)?
     } else {
         let mut fields = input.core_fields;
         _ = fields.insert("id".into(), json!(input.id));
+        for (name, value) in parsed_fields {
+            _ = fields.insert(name.clone(), serde_json::to_value(value)?);
+        }
         if config.enable_username {
-            _ = fields.insert("username".into(), json!(body.username));
-            _ = fields.insert("displayUsername".into(), json!(body.display_username));
+            _ = fields
+                .entry("username")
+                .or_insert_with(|| json!(body.username));
+            _ = fields
+                .entry("displayUsername")
+                .or_insert_with(|| json!(body.display_username));
         }
         fields
     };
@@ -125,6 +142,25 @@ pub(super) fn synthetic_response(
     }
     for (field, default) in defaults {
         _ = result.insert(field.into(), candidate.remove(field).unwrap_or(default));
+    }
+    let registered = context
+        .extensions
+        .get::<alibi_core::field_policy::UserFields>();
+    let fields = registered
+        .as_ref()
+        .map_or(&context.config.user.additional_fields, |fields| &fields.0.0);
+    for (name, field) in fields {
+        if !field.returned {
+            _ = result.remove(name);
+        } else if let Some(value) = candidate.remove(name) {
+            _ = result.insert(name.clone(), value);
+        } else if !result.contains_key(name) {
+            if let Some(default) = &field.default {
+                _ = result.insert(name.clone(), serde_json::to_value(default.value())?);
+            } else if !field.required {
+                _ = result.insert(name.clone(), Value::Null);
+            }
+        }
     }
     Ok((
         SignUpResponse {
