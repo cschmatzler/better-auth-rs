@@ -21,6 +21,21 @@ backend_tests!(
     organization_trusted_addition_preserves_literal_role_arrays_and_session_scope,
     fractional_organization_membership_limit_uses_actual_physical_count,
     organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results,
+    organization_creation_raw_quota,
+    organization_creation_policy_principal,
+    organization_creation_policy_error,
+    organization_raw_team_count_quota,
+    organization_raw_team_seat_endpoint_policy,
+    organization_raw_role_count_quota,
+    organization_quota_callback_write_order,
+    organization_duplicate_member_authority,
+    organization_duplicate_member_exact_id_cleanup,
+    organization_physical_membership_pages,
+    organization_concurrent_member_admission,
+    organization_member_role_js_whitespace,
+    organization_member_role_guest_validation,
+    organization_legacy_role_read_without_ac,
+    organization_legacy_role_loader_after_warm_cache,
     organization_selected_role_permission_page
 );
 
@@ -893,6 +908,1810 @@ async fn organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_r
     assert_eq!(policy.seen.lock().unwrap().len(), count);
     assert_eq!(db.count("member").await?, 2);
     B::close(connection).await
+}
+
+async fn organization_creation_raw_quota<B: Backend>(db: Db) -> TestResult {
+    for (limit, allowed) in [
+        (1.5, false),
+        (-0.5, false),
+        (f64::NAN, true),
+        (f64::INFINITY, true),
+    ] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let setup = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(OrganizationPlugin::new())
+            .build()
+            .await?;
+        let mut owner = account(&setup, "creation-quota-owner@example.test").await;
+        let mut foreign = account(&setup, "creation-quota-foreign@example.test").await;
+        let own = organization(&setup, &mut owner, "quota-own").await;
+        let other = organization(&setup, &mut foreign, "quota-other").await;
+        _ = add(&setup, &other, &owner.id, "member").await;
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                organization_limit: Some(limit),
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let before = db
+            .tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?;
+        let response=call(&auth,request("/organization/create",Some(json!({"name":"Quota request","slug":if allowed {"quota-new"} else {"quota-own"},"userId":foreign.id})),&owner.cookie),if allowed {200} else {403}).await;
+        if allowed {
+            assert_eq!(body(&response)["members"][0]["userId"], owner.id);
+        } else {
+            assert_eq!(
+                body(&response)["code"],
+                "YOU_HAVE_REACHED_THE_MAXIMUM_NUMBER_OF_ORGANIZATIONS"
+            );
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                    .await?,
+                before
+            );
+        }
+        let before_trusted = db
+            .tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?;
+        let sessions = db.table("sessions").await?;
+        let result = Box::pin(auth.dispatch_endpoint(
+            OrganizationPlugin::create_endpoint(
+                &serde_json::from_value(
+                    json!({"name":"Trusted quota","slug":"quota-trusted","userId":owner.id}),
+                )?,
+                Some(&owner.id),
+            )?,
+            EndpointOptions::default(),
+        ))
+        .await;
+        if allowed {
+            let created = serde_json::to_value(result?.decode()?)?;
+            assert_eq!(created["members"][0]["userId"], owner.id);
+            assert_eq!(db.count("organization").await?, 4);
+            assert_eq!(db.table("sessions").await?, sessions);
+        } else {
+            assert_eq!(result.unwrap_err().error.status_code(), 403);
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                    .await?,
+                before_trusted
+            );
+        }
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM member WHERE organization_id=$1 AND user_id=$2",
+                &[&own, &owner.id]
+            )
+            .await?,
+            1
+        );
+        authenticated(
+            &auth,
+            &foreign.cookie,
+            "creation-quota-foreign@example.test",
+        )
+        .await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn organization_creation_policy_principal<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::OrganizationCreationPolicy;
+    #[derive(Debug)]
+    struct Policy {
+        reached: std::sync::atomic::AtomicBool,
+        events: Mutex<Vec<(&'static str, String)>>,
+    }
+    #[async_trait::async_trait]
+    impl OrganizationCreationPolicy for Policy {
+        async fn allow_creation(&self, user: &UserView) -> AuthResult<Option<bool>> {
+            self.events.lock().unwrap().push(("allow", user.id.clone()));
+            Ok(Some(user.name.as_deref() == Some("Paid")))
+        }
+        async fn limit_reached(&self, user: &UserView) -> AuthResult<Option<bool>> {
+            self.events.lock().unwrap().push(("limit", user.id.clone()));
+            Ok(Some(self.reached.load(std::sync::atomic::Ordering::SeqCst)))
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let policy = Arc::new(Policy {
+        reached: std::sync::atomic::AtomicBool::new(false),
+        events: Mutex::new(Vec::new()),
+    });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            creation_policy: Some(policy.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let free = account(&auth, "creation-free@example.test").await;
+    let paid = account(&auth, "creation-paid@example.test").await;
+    _ = db
+        .execute("UPDATE users SET name='Paid' WHERE id=$1", &[&paid.id])
+        .await?;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    assert_eq!(
+        body(
+            &call(
+                &auth,
+                request(
+                    "/organization/create",
+                    Some(json!({"name":"Free denied","slug":"free-denied","userId":paid.id})),
+                    &free.cookie
+                ),
+                403
+            )
+            .await
+        )["code"],
+        "YOU_ARE_NOT_ALLOWED_TO_CREATE_A_NEW_ORGANIZATION"
+    );
+    assert_eq!(*policy.events.lock().unwrap(), [("allow", free.id.clone())]);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?,
+        before
+    );
+    policy.events.lock().unwrap().clear();
+    let accepted = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Paid allowed","slug":"paid-allowed","userId":free.id})),
+            &paid.cookie,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&accepted)["members"][0]["userId"], paid.id);
+    assert_eq!(
+        *policy.events.lock().unwrap(),
+        [("allow", paid.id.clone()), ("limit", paid.id.clone())]
+    );
+    policy.events.lock().unwrap().clear();
+    policy
+        .reached
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let before = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    _ = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Paid capped","slug":"paid-capped"})),
+            &paid.cookie,
+        ),
+        403,
+    )
+    .await;
+    assert_eq!(
+        *policy.events.lock().unwrap(),
+        [("allow", paid.id.clone()), ("limit", paid.id.clone())]
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?,
+        before
+    );
+    policy
+        .reached
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    policy.events.lock().unwrap().clear();
+    let sessions = db.table("sessions").await?;
+    let input = serde_json::from_value(
+        json!({"name":"Trusted free","slug":"trusted-free","userId":free.id}),
+    )?;
+    let created = Box::pin(auth.dispatch_endpoint(
+        OrganizationPlugin::create_endpoint(&input, Some(&free.id))?,
+        EndpointOptions::default(),
+    ))
+    .await?
+    .decode()?;
+    assert_eq!(
+        serde_json::to_value(created)?["members"][0]["userId"],
+        free.id
+    );
+    assert_eq!(
+        *policy.events.lock().unwrap(),
+        [("allow", free.id.clone()), ("limit", free.id.clone())]
+    );
+    assert_eq!(db.table("sessions").await?, sessions);
+    policy
+        .reached
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let before = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    let rejected = Box::pin(auth.dispatch_endpoint(
+        OrganizationPlugin::create_endpoint(
+            &serde_json::from_value(
+                json!({"name":"Trusted capped","slug":"trusted-capped","userId":free.id}),
+            )?,
+            Some(&free.id),
+        )?,
+        EndpointOptions::default(),
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(rejected.error.status_code(), 403);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?,
+        before
+    );
+    B::close(connection).await
+}
+
+async fn organization_creation_policy_error<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::OrganizationCreationPolicy;
+    #[derive(Debug)]
+    struct Policy {
+        failure: &'static str,
+        events: Mutex<Vec<&'static str>>,
+    }
+    impl Policy {
+        fn phase(&self, phase: &'static str) -> AuthResult<()> {
+            self.events.lock().unwrap().push(phase);
+            if self.failure == phase {
+                Err(alibi::AuthError::Api {
+                    status: 403,
+                    code: Some(format!("CREATION_{}_REJECTED", phase.to_uppercase())),
+                    message: "Application creation policy rejected".into(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl OrganizationCreationPolicy for Policy {
+        async fn allow_creation(&self, _: &UserView) -> AuthResult<Option<bool>> {
+            self.phase("allow")?;
+            Ok(Some(true))
+        }
+        async fn limit_reached(&self, _: &UserView) -> AuthResult<Option<bool>> {
+            self.phase("limit")?;
+            Ok(Some(false))
+        }
+    }
+    for failure in ["allow", "limit"] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let policy = Arc::new(Policy {
+            failure,
+            events: Mutex::new(Vec::new()),
+        });
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                creation_policy: Some(policy.clone()),
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let owner = account(&auth, "creation-error-owner@example.test").await;
+        let foreign = account(&auth, "creation-error-foreign@example.test").await;
+        let before = db
+            .tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?;
+        let code = format!("CREATION_{}_REJECTED", failure.to_uppercase());
+        let expected = if failure == "allow" {
+            vec!["allow"]
+        } else {
+            vec!["allow", "limit"]
+        };
+        let denied = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Policy rejected","slug":"policy-rejected"})),
+                &owner.cookie,
+            ),
+            403,
+        )
+        .await;
+        assert_eq!(
+            body(&denied),
+            json!({"code":code,"message":"Application creation policy rejected"})
+        );
+        assert_eq!(*policy.events.lock().unwrap(), expected);
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                .await?,
+            before
+        );
+        policy.events.lock().unwrap().clear();
+        let result = Box::pin(auth.dispatch_endpoint(
+            OrganizationPlugin::create_endpoint(
+                &serde_json::from_value(
+                    json!({"name":"Trusted rejected","slug":"trusted-rejected","userId":owner.id}),
+                )?,
+                Some(&owner.id),
+            )?,
+            EndpointOptions::default(),
+        ))
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(result.error,alibi::AuthError::Api {status:403,code:Some(ref actual),ref message} if actual==&code && message=="Application creation policy rejected")
+        );
+        assert_eq!(*policy.events.lock().unwrap(), expected);
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                .await?,
+            before
+        );
+        authenticated(
+            &auth,
+            &foreign.cookie,
+            "creation-error-foreign@example.test",
+        )
+        .await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn organization_raw_team_count_quota<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::OrganizationTeamHooks;
+    use alibi::plugins::organization::extensions::TeamHookContext;
+    use alibi::plugins::organization::extensions::TeamLimitContext;
+    #[derive(Debug)]
+    struct Policy {
+        maximum: Option<f64>,
+        events: Mutex<Vec<&'static str>>,
+    }
+    #[async_trait::async_trait]
+    impl OrganizationLimitResolver for Policy {
+        async fn maximum_teams(&self, c: &TeamLimitContext) -> AuthResult<Option<f64>> {
+            assert_eq!(
+                c.session.as_ref().unwrap().user_id,
+                c.user.as_ref().unwrap().id
+            );
+            assert!(
+                c.request
+                    .as_ref()
+                    .unwrap()
+                    .path
+                    .ends_with("/organization/create-team")
+            );
+            self.events.lock().unwrap().push("quota");
+            Ok(self.maximum)
+        }
+    }
+    #[async_trait::async_trait]
+    impl OrganizationTeamHooks for Policy {
+        async fn before_create(
+            &self,
+            _: &mut alibi::CreateTeam,
+            c: &TeamHookContext,
+        ) -> AuthResult<()> {
+            assert!(c.user.is_some());
+            self.events.lock().unwrap().push("before");
+            Ok(())
+        }
+        async fn after_create(&self, _: &alibi::Team, _: &TeamHookContext) -> AuthResult<()> {
+            self.events.lock().unwrap().push("after");
+            Ok(())
+        }
+    }
+    for resolved in [false, true] {
+        for (maximum, allowed) in [
+            (Some(0.0), 3),
+            (Some(f64::NAN), 3),
+            (Some(1.5), 2),
+            (Some(-1.0), 0),
+            (Some(f64::NEG_INFINITY), 0),
+            (Some(f64::INFINITY), 3),
+            (None, 3),
+        ] {
+            let db = db.fresh().await?;
+            let (connection, _) = db.migrated::<B>(SECRET).await?;
+            let policy = Arc::new(Policy {
+                maximum,
+                events: Mutex::new(Vec::new()),
+            });
+            let auth = super::auth_probe::fast_builder::<B>(&connection)
+                .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                    teams: TeamsConfig {
+                        enabled: true,
+                        create_default_team: false,
+                        maximum_teams: maximum,
+                        limit_resolver: resolved
+                            .then(|| policy.clone() as Arc<dyn OrganizationLimitResolver>),
+                        hooks: Some(policy.clone()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }))
+                .build()
+                .await?;
+            let mut owner = account(&auth, "raw-team-owner@example.test").await;
+            let org = organization(&auth, &mut owner, "raw-team").await;
+            let protected = db
+                .tables(&["users", "accounts", "sessions", "organization", "member"])
+                .await?;
+            for index in 0..3 {
+                policy.events.lock().unwrap().clear();
+                let accepted = index < allowed;
+                let response = call(
+                    &auth,
+                    request(
+                        "/organization/create-team",
+                        Some(json!({"name":format!("Team {index}"),"organizationId":org})),
+                        &owner.cookie,
+                    ),
+                    if accepted { 200 } else { 400 },
+                )
+                .await;
+                if accepted {
+                    assert_eq!(body(&response)["organizationId"], org);
+                } else {
+                    assert_eq!(
+                        body(&response)["code"],
+                        "YOU_HAVE_REACHED_THE_MAXIMUM_NUMBER_OF_TEAMS"
+                    );
+                }
+                let mut expected = if resolved { vec!["quota"] } else { Vec::new() };
+                if accepted {
+                    expected.extend(["before", "after"]);
+                }
+                assert_eq!(*policy.events.lock().unwrap(), expected);
+                assert_eq!(
+                    db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                        .await?,
+                    protected
+                );
+            }
+            assert_eq!(db.count("team").await?, allowed);
+            B::close(connection).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn organization_raw_team_seat_endpoint_policy<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::OrganizationTeamHooks;
+    use alibi::plugins::organization::extensions::TeamHookContext;
+    use alibi::plugins::organization::extensions::TeamLimitContext;
+    #[derive(Debug)]
+    struct Policy {
+        maximum: Option<f64>,
+        events: Mutex<Vec<&'static str>>,
+    }
+    #[async_trait::async_trait]
+    impl OrganizationLimitResolver for Policy {
+        async fn maximum_team_members(&self, c: &TeamLimitContext) -> AuthResult<Option<f64>> {
+            assert!(c.team_id.is_some());
+            assert_eq!(
+                c.session.as_ref().unwrap().user_id,
+                c.user.as_ref().unwrap().id
+            );
+            self.events.lock().unwrap().push("quota");
+            Ok(self.maximum)
+        }
+    }
+    #[async_trait::async_trait]
+    impl OrganizationTeamHooks for Policy {
+        async fn before_add_member(
+            &self,
+            _: &alibi::Team,
+            _: &UserView,
+            c: &TeamHookContext,
+        ) -> AuthResult<()> {
+            assert!(c.user.is_some());
+            self.events.lock().unwrap().push("before");
+            Ok(())
+        }
+        async fn after_add_member(
+            &self,
+            _: &alibi::TeamMember,
+            _: &alibi::Team,
+            _: &UserView,
+            _: &TeamHookContext,
+        ) -> AuthResult<()> {
+            self.events.lock().unwrap().push("after");
+            Ok(())
+        }
+    }
+    for resolved in [false, true] {
+        for (maximum, allowed) in [
+            (Some(0.0), 0),
+            (Some(f64::NAN), 0),
+            (Some(1.5), 2),
+            (Some(-1.0), 0),
+            (Some(f64::NEG_INFINITY), 0),
+            (Some(f64::INFINITY), 3),
+            (None, 3),
+        ] {
+            let db = db.fresh().await?;
+            let (connection, _) = db.migrated::<B>(SECRET).await?;
+            let policy = Arc::new(Policy {
+                maximum,
+                events: Mutex::new(Vec::new()),
+            });
+            let auth = super::auth_probe::fast_builder::<B>(&connection)
+                .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                    teams: TeamsConfig {
+                        enabled: true,
+                        create_default_team: false,
+                        maximum_members_per_team: maximum,
+                        limit_resolver: resolved
+                            .then(|| policy.clone() as Arc<dyn OrganizationLimitResolver>),
+                        hooks: Some(policy.clone()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }))
+                .build()
+                .await?;
+            let mut owner = account(&auth, "raw-seat-owner@example.test").await;
+            let first = account(&auth, "raw-seat-first@example.test").await;
+            let second = account(&auth, "raw-seat-second@example.test").await;
+            let org = organization(&auth, &mut owner, "raw-seat").await;
+            _ = add(&auth, &org, &first.id, "member").await;
+            _ = add(&auth, &org, &second.id, "member").await;
+            let team = body(
+                &call(
+                    &auth,
+                    request(
+                        "/organization/create-team",
+                        Some(json!({"name":"Seat team","organizationId":org})),
+                        &owner.cookie,
+                    ),
+                    200,
+                )
+                .await,
+            )["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let protected = db
+                .tables(&["users", "accounts", "sessions", "organization", "member"])
+                .await?;
+            for (index, target) in [&owner.id, &first.id, &second.id, &owner.id]
+                .into_iter()
+                .enumerate()
+            {
+                policy.events.lock().unwrap().clear();
+                let accepted = index < usize::try_from(allowed)? || (index == 3 && allowed > 0);
+                let response = call(
+                    &auth,
+                    request(
+                        "/organization/add-team-member",
+                        Some(json!({"teamId":team,"userId":target,"organizationId":org})),
+                        &owner.cookie,
+                    ),
+                    if accepted { 200 } else { 403 },
+                )
+                .await;
+                if !accepted {
+                    assert_eq!(body(&response)["code"], "TEAM_MEMBER_LIMIT_REACHED");
+                }
+                let mut expected = vec!["before"];
+                if resolved {
+                    expected.push("quota");
+                }
+                if accepted {
+                    expected.push("after");
+                }
+                assert_eq!(*policy.events.lock().unwrap(), expected);
+                assert_eq!(
+                    db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                        .await?,
+                    protected
+                );
+            }
+            assert_eq!(db.count("team_member").await?, allowed);
+            assert_eq!(
+                db.text(
+                    "SELECT CAST(member_count AS TEXT) FROM team WHERE id=$1",
+                    &[&team]
+                )
+                .await?,
+                Some(allowed.to_string())
+            );
+            B::close(connection).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn organization_raw_role_count_quota<B: Backend>(db: Db) -> TestResult {
+    #[derive(Debug)]
+    struct Policy {
+        maximum: Option<f64>,
+        calls: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl OrganizationLimitResolver for Policy {
+        async fn maximum_roles(&self, org: &str) -> AuthResult<Option<f64>> {
+            self.calls.lock().unwrap().push(org.into());
+            Ok(self.maximum)
+        }
+    }
+    for resolved in [false, true] {
+        for (maximum, allowed) in [
+            (Some(0.0), 0),
+            (Some(f64::NAN), 3),
+            (Some(1.5), 2),
+            (Some(-1.0), 0),
+            (Some(f64::NEG_INFINITY), 0),
+            (Some(f64::INFINITY), 3),
+            (None, 3),
+        ] {
+            let db = db.fresh().await?;
+            let (connection, _) = db.migrated::<B>(SECRET).await?;
+            let policy = Arc::new(Policy {
+                maximum,
+                calls: Mutex::new(Vec::new()),
+            });
+            let auth = super::auth_probe::fast_builder::<B>(&connection)
+                .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                    access_control: Some(default_organization_statements()),
+                    dynamic_access_control: DynamicAccessControlConfig {
+                        enabled: true,
+                        maximum_roles_per_organization: maximum,
+                        limit_resolver: resolved
+                            .then(|| policy.clone() as Arc<dyn OrganizationLimitResolver>),
+                    },
+                    ..Default::default()
+                }))
+                .build()
+                .await?;
+            let mut owner = account(&auth, "raw-role-owner@example.test").await;
+            let org = organization(&auth, &mut owner, "raw-role").await;
+            let protected = db
+                .tables(&["users", "accounts", "sessions", "organization", "member"])
+                .await?;
+            for index in 0..3 {
+                let accepted = index < allowed;
+                let response=call(&auth,request("/organization/create-role",Some(json!({"organizationId":org,"role":format!("quota-role-{index}"),"permission":{}})),&owner.cookie),if accepted {200} else {400}).await;
+                if accepted {
+                    assert_eq!(body(&response)["roleData"]["organizationId"], org);
+                } else {
+                    assert_eq!(body(&response)["code"], "TOO_MANY_ROLES");
+                }
+                assert_eq!(
+                    db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                        .await?,
+                    protected
+                );
+            }
+            assert_eq!(
+                policy.calls.lock().unwrap().as_slice(),
+                if resolved {
+                    vec![org.clone(), org.clone(), org.clone()]
+                } else {
+                    vec![]
+                }
+                .as_slice()
+            );
+            assert_eq!(db.count("organization_role").await?, allowed);
+            B::close(connection).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn organization_quota_callback_write_order<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::extensions::TeamLimitContext;
+    struct Policy<S: AuthSchema> {
+        store: Arc<dyn alibi::AuthStore<S>>,
+        events: Mutex<Vec<&'static str>>,
+    }
+    impl<S: AuthSchema> std::fmt::Debug for Policy<S> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("Application quota policy")
+        }
+    }
+    #[async_trait::async_trait]
+    impl<S: AuthSchema> OrganizationLimitResolver for Policy<S> {
+        async fn maximum_teams(&self, c: &TeamLimitContext) -> AuthResult<Option<f64>> {
+            assert!(c.request.as_ref().unwrap().path.ends_with("create-team"));
+            assert!(c.session.is_some());
+            self.events.lock().unwrap().push("team");
+            for index in 0..2 {
+                _ = self
+                    .store
+                    .create_team(alibi::CreateTeam {
+                        organization_id: c.organization_id.clone(),
+                        name: format!("Independent team {index}"),
+                        updated_at: None,
+                    })
+                    .await?;
+            }
+            Ok(Some(1.5))
+        }
+        async fn maximum_roles(&self, org: &str) -> AuthResult<Option<f64>> {
+            self.events.lock().unwrap().push("role");
+            for index in 0..2 {
+                _ = self
+                    .store
+                    .create_organization_role(alibi::types::CreateOrganizationRole {
+                        organization_id: org.into(),
+                        role: format!("independent-role-{index}"),
+                        permission: Default::default(),
+                    })
+                    .await?;
+            }
+            Ok(Some(1.5))
+        }
+    }
+    let (connection, store) = db.migrated::<B>(SECRET).await?;
+    let policy = Arc::new(Policy::<B::Schema> {
+        store: Arc::new(store),
+        events: Mutex::new(Vec::new()),
+    });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            teams: TeamsConfig {
+                enabled: true,
+                create_default_team: false,
+                limit_resolver: Some(policy.clone()),
+                ..Default::default()
+            },
+            access_control: Some(default_organization_statements()),
+            dynamic_access_control: DynamicAccessControlConfig {
+                enabled: true,
+                limit_resolver: Some(policy.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let mut owner = account(&auth, "quota-write-owner@example.test").await;
+    let org = organization(&auth, &mut owner, "quota-write").await;
+    let protected = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    let team = call(
+        &auth,
+        request(
+            "/organization/create-team",
+            Some(json!({"organizationId":org,"name":"Original team"})),
+            &owner.cookie,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&team)["name"], "Original team");
+    assert_eq!(db.count("team").await?, 3);
+    let role = call(
+        &auth,
+        request(
+            "/organization/create-role",
+            Some(json!({"organizationId":org,"role":"original-role","permission":{}})),
+            &owner.cookie,
+        ),
+        400,
+    )
+    .await;
+    assert_eq!(body(&role)["code"], "TOO_MANY_ROLES");
+    assert_eq!(db.count("organization_role").await?, 2);
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM organization_role WHERE role='original-role'",
+            &[]
+        )
+        .await?,
+        0
+    );
+    assert_eq!(*policy.events.lock().unwrap(), ["team", "role"]);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?,
+        protected
+    );
+    B::close(connection).await
+}
+
+async fn organization_duplicate_member_authority<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        OrganizationMemberAddedContext, OrganizationMemberAdditionContext,
+    };
+    #[derive(Debug, Default)]
+    struct Patch {
+        target: Mutex<Option<String>>,
+        seen: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl OrganizationMemberAdditionHooks for Patch {
+        async fn before_add_member(
+            &self,
+            c: &OrganizationMemberAdditionContext,
+        ) -> AuthResult<Option<OrganizationMemberCreatePatch>> {
+            self.seen.lock().unwrap().push(c.user.id.clone());
+            Ok(self
+                .target
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|id| OrganizationMemberCreatePatch {
+                    user_id: Some(id.clone()),
+                    role: Some("admin".into()),
+                    ..Default::default()
+                }))
+        }
+        async fn after_add_member(&self, c: &OrganizationMemberAddedContext) -> AuthResult<()> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(format!("after:{}:{}", c.user.id, c.member.user_id));
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let patch = Arc::new(Patch::default());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            member_addition_hooks: Some(patch.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let mut owner = account(&auth, "duplicate-owner@example.test").await;
+    let target = account(&auth, "duplicate-target@example.test").await;
+    let candidate = account(&auth, "duplicate-candidate@example.test").await;
+    let mut foreign = account(&auth, "duplicate-foreign@example.test").await;
+    let own = organization(&auth, &mut owner, "duplicate-own").await;
+    let other = organization(&auth, &mut foreign, "duplicate-other").await;
+    let first = add(&auth, &own, &target.id, "member").await;
+    _ = add(&auth, &other, &target.id, "member").await;
+    let protected = db.tables(&["users", "accounts", "sessions"]).await?;
+    *patch.target.lock().unwrap() = Some(target.id.clone());
+    patch.seen.lock().unwrap().clear();
+    let duplicate = add(&auth, &own, &candidate.id, "member").await;
+    assert_eq!(duplicate["userId"], target.id);
+    assert_eq!(duplicate["role"], "admin");
+    assert_ne!(duplicate["id"], first["id"]);
+    assert_eq!(
+        *patch.seen.lock().unwrap(),
+        [
+            candidate.id.clone(),
+            format!("after:{}:{}", candidate.id, target.id)
+        ]
+    );
+    let role = call(
+        &auth,
+        get(
+            "/organization/get-active-member-role",
+            &[("organizationId", &own)],
+            &target.cookie,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&role)["role"], "member");
+    _ = call(
+        &auth,
+        request(
+            "/organization/update-member-role",
+            Some(json!({"organizationId":own,"memberId":first["id"],"role":"admin"})),
+            &target.cookie,
+        ),
+        403,
+    )
+    .await;
+    let listed = body(
+        &call(
+            &auth,
+            request("/organization/list", None, &target.cookie),
+            200,
+        )
+        .await,
+    );
+    let ids = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, [own.as_str(), other.as_str(), own.as_str()]);
+    assert_eq!(
+        db.text(
+            "SELECT role FROM member WHERE id=$1",
+            &[first["id"].as_str().unwrap()]
+        )
+        .await?
+        .as_deref(),
+        Some("member")
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM member WHERE organization_id=$1 AND user_id=$2",
+            &[&own, &target.id]
+        )
+        .await?,
+        2
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        protected
+    );
+    B::close(connection).await
+}
+
+async fn organization_duplicate_member_exact_id_cleanup<B: Backend>(db: Db) -> TestResult {
+    use alibi::{CreateMember, types::CreateTeam};
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            teams: TeamsConfig {
+                enabled: true,
+                create_default_team: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let mut owner = account(&auth, "exact-owner@example.test").await;
+    let target = account(&auth, "exact-target@example.test").await;
+    let mut foreign = account(&auth, "exact-foreign@example.test").await;
+    let own = organization(&auth, &mut owner, "exact-own").await;
+    let other = organization(&auth, &mut foreign, "exact-other").await;
+    let first = add(&auth, &own, &target.id, "member").await;
+    _ = add(&auth, &other, &target.id, "member").await;
+    let duplicate = auth
+        .store()
+        .create_member(CreateMember {
+            organization_id: own.clone(),
+            user_id: target.id.clone(),
+            role: "admin".into(),
+        })
+        .await?;
+    let own_team = auth
+        .store()
+        .create_team(CreateTeam {
+            organization_id: own.clone(),
+            name: "Own seats".into(),
+            updated_at: None,
+        })
+        .await?;
+    let other_team = auth
+        .store()
+        .create_team(CreateTeam {
+            organization_id: other.clone(),
+            name: "Foreign seats".into(),
+            updated_at: None,
+        })
+        .await?;
+    for (team, user) in [
+        (&own_team.id, &target.id),
+        (&own_team.id, &owner.id),
+        (&other_team.id, &target.id),
+    ] {
+        _ = auth.store().add_team_member(team, user, None).await?;
+    }
+    let protected = db
+        .tables(&["users", "accounts", "sessions", "organization"])
+        .await?;
+    let first_id = first["id"].as_str().unwrap();
+    let first_role = db
+        .text("SELECT role FROM member WHERE id=$1", &[first_id])
+        .await?;
+    _ = call(
+        &auth,
+        request(
+            "/organization/update-member-role",
+            Some(json!({"organizationId":own,"memberId":duplicate.id,"role":"member"})),
+            &owner.cookie,
+        ),
+        200,
+    )
+    .await;
+    _ = call(
+        &auth,
+        request(
+            "/organization/remove-member",
+            Some(json!({"organizationId":own,"memberIdOrEmail":duplicate.id})),
+            &owner.cookie,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM member WHERE id=$1", &[&duplicate.id])
+            .await?,
+        0
+    );
+    assert_eq!(
+        db.text("SELECT role FROM member WHERE id=$1", &[first_id])
+            .await?,
+        first_role
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM team_member WHERE team_id=$1 AND user_id=$2",
+            &[&own_team.id, &target.id]
+        )
+        .await?,
+        0
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM team_member WHERE team_id=$1 AND user_id=$2",
+            &[&other_team.id, &target.id]
+        )
+        .await?,
+        1
+    );
+    assert_eq!(
+        db.text(
+            "SELECT CAST(member_count AS TEXT) FROM team WHERE id=$1",
+            &[&own_team.id]
+        )
+        .await?
+        .as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        db.text(
+            "SELECT CAST(member_count AS TEXT) FROM team WHERE id=$1",
+            &[&other_team.id]
+        )
+        .await?
+        .as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization"])
+            .await?,
+        protected
+    );
+    _ = call(
+        &auth,
+        request(
+            "/organization/remove-member",
+            Some(json!({"organizationId":own,"memberIdOrEmail":duplicate.id})),
+            &owner.cookie,
+        ),
+        400,
+    )
+    .await;
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM member WHERE id=$1", &[first_id])
+            .await?,
+        1
+    );
+    B::close(connection).await
+}
+
+async fn organization_physical_membership_pages<B: Backend>(db: Db) -> TestResult {
+    use alibi::CreateMember;
+    for limit in [100, 2, 1, 0] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let setup = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(OrganizationPlugin::new())
+            .build()
+            .await?;
+        let mut older = account(&setup, "page-older@example.test").await;
+        let mut newer = account(&setup, "page-newer@example.test").await;
+        let target = account(&setup, "page-target@example.test").await;
+        let old = organization(&setup, &mut older, "page-old").await;
+        let new = organization(&setup, &mut newer, "page-new").await;
+        for org in [&new, &old, &new] {
+            _ = setup
+                .store()
+                .create_member(CreateMember {
+                    organization_id: org.clone(),
+                    user_id: target.id.clone(),
+                    role: "member".into(),
+                })
+                .await?;
+        }
+        let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        config.advanced.database.default_find_many_limit = limit;
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                organization_limit: Some(2.5),
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let listed = body(
+            &call(
+                &auth,
+                request("/organization/list", None, &target.cookie),
+                200,
+            )
+            .await,
+        );
+        let ids = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        let expected = [new.as_str(), old.as_str(), new.as_str()];
+        assert_eq!(ids, expected[..limit.min(3)]);
+        let before = db
+            .tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?;
+        let response = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Paged quota","slug":"page-quota"})),
+                &target.cookie,
+            ),
+            if limit == 100 { 403 } else { 200 },
+        )
+        .await;
+        if limit == 100 {
+            assert_eq!(
+                body(&response)["code"],
+                "YOU_HAVE_REACHED_THE_MAXIMUM_NUMBER_OF_ORGANIZATIONS"
+            );
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                    .await?,
+                before
+            );
+        } else {
+            assert_eq!(db.count("organization").await?, 3);
+            assert_eq!(db.count("member").await?, 6);
+            assert_eq!(body(&response)["members"][0]["userId"], target.id);
+        }
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn organization_concurrent_member_admission<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        OrganizationMemberAddedContext, OrganizationMemberAdditionContext,
+    };
+    struct Hooks {
+        gate: tokio::sync::Barrier,
+        raw: super::super::Raw,
+        before: std::sync::atomic::AtomicUsize,
+        after: Mutex<Vec<String>>,
+    }
+    impl std::fmt::Debug for Hooks {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("ConcurrentAdmission")
+        }
+    }
+    #[async_trait::async_trait]
+    impl OrganizationMemberAdditionHooks for Hooks {
+        async fn before_add_member(
+            &self,
+            c: &OrganizationMemberAdditionContext,
+        ) -> AuthResult<Option<OrganizationMemberCreatePatch>> {
+            let count = self
+                .raw
+                .count_where(
+                    "SELECT COUNT(*) FROM member WHERE organization_id=$1 AND user_id=$2",
+                    &[&c.member.organization_id, &c.user.id],
+                )
+                .await
+                .map_err(|e| alibi::AuthError::internal(e.to_string()))?;
+            assert_eq!(count, 0);
+            _ = self
+                .before
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            _ = self.gate.wait().await;
+            Ok(None)
+        }
+        async fn after_add_member(&self, c: &OrganizationMemberAddedContext) -> AuthResult<()> {
+            self.after.lock().unwrap().push(c.member.id.clone());
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let hooks = Arc::new(Hooks {
+        gate: tokio::sync::Barrier::new(2),
+        raw: db.raw.clone(),
+        before: std::sync::atomic::AtomicUsize::new(0),
+        after: Mutex::new(Vec::new()),
+    });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            member_addition_hooks: Some(hooks.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let mut owner = account(&auth, "concurrent-owner@example.test").await;
+    let target = account(&auth, "concurrent-target@example.test").await;
+    let org = organization(&auth, &mut owner, "concurrent-admission").await;
+    let protected = db.tables(&["users", "accounts", "sessions"]).await?;
+    let endpoint = || {
+        OrganizationPlugin::add_member_endpoint(
+            &serde_json::from_value(
+                json!({"organizationId":org,"userId":target.id,"role":"member"}),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    let (left, right) = tokio::join!(
+        Box::pin(auth.dispatch_endpoint(endpoint(), EndpointOptions::default())),
+        Box::pin(auth.dispatch_endpoint(endpoint(), EndpointOptions::default()))
+    );
+    let left = left?.decode()?;
+    let right = right?.decode()?;
+    assert_ne!(left.id, right.id);
+    assert_eq!(left.user_id, target.id);
+    assert_eq!(right.user_id, target.id);
+    assert_eq!(hooks.before.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(hooks.after.lock().unwrap().len(), 2);
+    assert_eq!(db.count("member").await?, 3);
+    let duplicate = auth
+        .dispatch_endpoint(endpoint(), EndpointOptions::default())
+        .await
+        .unwrap_err();
+    assert_eq!(duplicate.error.status_code(), 400);
+    assert_eq!(hooks.before.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(hooks.after.lock().unwrap().len(), 2);
+    let listed = body(
+        &call(
+            &auth,
+            request("/organization/list", None, &target.cookie),
+            200,
+        )
+        .await,
+    );
+    assert_eq!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [org.as_str(), org.as_str()]
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        protected
+    );
+    B::close(connection).await
+}
+
+async fn organization_member_role_js_whitespace<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        OrganizationMemberRoleContext, OrganizationMemberRoleHooks, OrganizationMemberRolePatch,
+        OrganizationMemberRoleUpdatedContext,
+    };
+    #[derive(Debug, Default)]
+    struct Hooks(Mutex<Vec<(bool, String)>>);
+    #[async_trait::async_trait]
+    impl OrganizationMemberRoleHooks for Hooks {
+        async fn before_update(
+            &self,
+            c: &OrganizationMemberRoleContext,
+        ) -> AuthResult<Option<OrganizationMemberRolePatch>> {
+            self.0.lock().unwrap().push((false, c.new_role.clone()));
+            Ok(None)
+        }
+        async fn after_update(&self, c: &OrganizationMemberRoleUpdatedContext) -> AuthResult<()> {
+            self.0.lock().unwrap().push((true, c.member.role.clone()));
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let hooks = Arc::new(Hooks::default());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            member_role_hooks: Some(hooks.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let mut owner = account(&auth, "space-owner@example.test").await;
+    let target = account(&auth, "space-target@example.test").await;
+    let foreign = account(&auth, "space-foreign@example.test").await;
+    let org = organization(&auth, &mut owner, "space-role").await;
+    let member = add(&auth, &org, &target.id, "member").await;
+    let protected = db.tables(&["users", "accounts", "sessions"]).await?;
+    let response=call(&auth,request("/organization/update-member-role",Some(json!({"organizationId":org,"memberId":member["id"],"role":["\u{feff}admin\u{feff}","\u{a0}member\u{3000}"," admin "]})),&owner.cookie),200).await;
+    assert_eq!(body(&response)["role"], "admin,member,admin");
+    assert_eq!(
+        *hooks.0.lock().unwrap(),
+        [
+            (false, "admin,member,admin".into()),
+            (true, "admin,member,admin".into())
+        ]
+    );
+    assert_eq!(
+        db.text(
+            "SELECT role FROM member WHERE id=$1",
+            &[member["id"].as_str().unwrap()]
+        )
+        .await?
+        .as_deref(),
+        Some("admin,member,admin")
+    );
+    hooks.0.lock().unwrap().clear();
+    let before = db.table("member").await?;
+    let whitespace = "\t\n\u{b}\u{c}\r \u{a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\u{feff}";
+    for role in [whitespace, "\u{85}", "\u{85}admin\u{85}"] {
+        let denied = call(
+            &auth,
+            request(
+                "/organization/update-member-role",
+                Some(json!({"organizationId":org,"memberId":member["id"],"role":role})),
+                &owner.cookie,
+            ),
+            400,
+        )
+        .await;
+        if role == whitespace {
+            assert!(denied.body.is_empty());
+        } else {
+            assert_eq!(
+                body(&denied),
+                json!({"code":"ROLE_NOT_FOUND","message":format!("ROLE_NOT_FOUND: {role}")})
+            );
+        }
+        assert!(hooks.0.lock().unwrap().is_empty());
+        assert_eq!(db.table("member").await?, before);
+    }
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        protected
+    );
+    authenticated(&auth, &foreign.cookie, "space-foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn organization_member_role_guest_validation<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        OrganizationMemberRoleContext, OrganizationMemberRoleHooks, OrganizationMemberRolePatch,
+    };
+    #[derive(Debug, Default)]
+    struct Hooks(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl OrganizationMemberRoleHooks for Hooks {
+        async fn before_update(
+            &self,
+            _: &OrganizationMemberRoleContext,
+        ) -> AuthResult<Option<OrganizationMemberRolePatch>> {
+            _ = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let hooks = Arc::new(Hooks::default());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            member_role_hooks: Some(hooks.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let mut owner = account(&auth, "guest-role-owner@example.test").await;
+    let target = account(&auth, "guest-role-target@example.test").await;
+    let org = organization(&auth, &mut owner, "guest-role").await;
+    let member = add(&auth, &org, &target.id, "member").await;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    let mut cases = Vec::new();
+    for role in [Value::Null, json!(1), json!({}), json!([1])] {
+        cases.push((
+            json!({"organizationId":org,"memberId":member["id"],"role":role}),
+            "[body.role] Invalid input",
+        ));
+    }
+    cases.extend([(json!({}),"[body.role] Invalid input; [body.memberId] Invalid input: expected string, received undefined"),(json!({"role":true,"memberId":null,"organizationId":null}),"[body.role] Invalid input; [body.memberId] Invalid input: expected string, received null; [body.organizationId] Invalid input: expected string, received null"),(json!({"role":"admin","memberId":1,"organizationId":false}),"[body.memberId] Invalid input: expected string, received number; [body.organizationId] Invalid input: expected string, received boolean")]);
+    for (input, message) in cases {
+        let denied = call(
+            &auth,
+            request("/organization/update-member-role", Some(input), ""),
+            400,
+        )
+        .await;
+        assert_eq!(
+            body(&denied),
+            json!({"code":"VALIDATION_ERROR","message":message})
+        );
+        assert!(!denied.headers.contains_key("set-cookie"));
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                .await?,
+            before
+        );
+    }
+    let valid =
+        json!({"organizationId":org,"memberId":member["id"],"role":"admin","userId":owner.id});
+    let guest = call(
+        &auth,
+        request("/organization/update-member-role", Some(valid.clone()), ""),
+        401,
+    )
+    .await;
+    assert_eq!(
+        body(&guest),
+        json!({"code":"UNAUTHORIZED","message":"Unauthorized"})
+    );
+    _ = call(
+        &auth,
+        request(
+            "/organization/update-member-role",
+            Some(valid),
+            &target.cookie,
+        ),
+        403,
+    )
+    .await;
+    assert_eq!(hooks.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?,
+        before
+    );
+    B::close(connection).await
+}
+
+async fn organization_legacy_role_read_without_ac<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            dynamic_access_control: DynamicAccessControlConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let mut owner = account(&auth, "no-ac-owner@example.test").await;
+    let member = account(&auth, "no-ac-member@example.test").await;
+    let foreign = account(&auth, "no-ac-foreign@example.test").await;
+    let org = organization(&auth, &mut owner, "raw-no-ac").await;
+    let member_row = add(&auth, &org, &member.id, "member").await;
+    let protected = db
+        .tables(&["users", "accounts", "sessions", "organization"])
+        .await?;
+    let mut roles = Vec::new();
+    for (i, literal) in [
+        " [\"create\"] ",
+        " \"grant\" ",
+        " 0 ",
+        " true ",
+        " false ",
+        " null ",
+        "{\"team\":\"create\"}",
+        "{\"invented\":[\"grant\"]}",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let role = auth
+            .store()
+            .create_organization_role(alibi::types::CreateOrganizationRole {
+                organization_id: org.clone(),
+                role: format!("legacy-{i}"),
+                permission: Default::default(),
+            })
+            .await?;
+        _ = db
+            .execute(
+                "UPDATE organization_role SET permission=$1 WHERE id=$2",
+                &[literal, &role.id],
+            )
+            .await?;
+        let read = call(
+            &auth,
+            get(
+                "/organization/get-role",
+                &[("organizationId", &org), ("roleId", &role.id)],
+                &owner.cookie,
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(
+            body(&read)["permission"],
+            serde_json::from_str::<Value>(literal)?
+        );
+        let row = db.table("organization_role").await?;
+        let denied = call(
+            &auth,
+            request(
+                "/organization/update-role",
+                Some(json!({"organizationId":org,"roleId":role.id,"data":{"permission":{}}})),
+                &owner.cookie,
+            ),
+            501,
+        )
+        .await;
+        assert_eq!(body(&denied)["code"], "MISSING_AC_INSTANCE");
+        assert_eq!(db.table("organization_role").await?, row);
+        roles.push((role, literal));
+    }
+    let list = call(
+        &auth,
+        get(
+            "/organization/list-roles",
+            &[("organizationId", &org)],
+            &owner.cookie,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(
+        body(&list)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["permission"].clone())
+            .collect::<Vec<_>>(),
+        roles
+            .iter()
+            .map(|(_, raw)| serde_json::from_str::<Value>(raw).unwrap())
+            .collect::<Vec<_>>()
+    );
+    _ = db
+        .execute(
+            "UPDATE member SET role=$1 WHERE id=$2",
+            &[&roles[0].0.role, member_row["id"].as_str().unwrap()],
+        )
+        .await?;
+    let permission = call(
+        &auth,
+        request(
+            "/organization/has-permission",
+            Some(json!({"organizationId":org,"permissions":{"team":["create"]}})),
+            &member.cookie,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&permission)["success"], false);
+    for (actor, code) in [
+        (&member, "YOU_ARE_NOT_ALLOWED_TO_READ_A_ROLE"),
+        (&foreign, "YOU_ARE_NOT_A_MEMBER_OF_THIS_ORGANIZATION"),
+    ] {
+        let denied = call(
+            &auth,
+            get(
+                "/organization/get-role",
+                &[("organizationId", &org), ("roleId", &roles[0].0.id)],
+                &actor.cookie,
+            ),
+            403,
+        )
+        .await;
+        assert_eq!(body(&denied)["code"], code);
+    }
+    let create = call(
+        &auth,
+        request(
+            "/organization/create-role",
+            Some(json!({"organizationId":org,"role":"new","permission":{}})),
+            &owner.cookie,
+        ),
+        501,
+    )
+    .await;
+    assert_eq!(body(&create)["code"], "MISSING_AC_INSTANCE");
+    _ = db
+        .execute(
+            "UPDATE member SET role='member' WHERE id=$1",
+            &[member_row["id"].as_str().unwrap()],
+        )
+        .await?;
+    for (role, _) in roles {
+        _ = call(
+            &auth,
+            request(
+                "/organization/delete-role",
+                Some(json!({"organizationId":org,"roleId":role.id})),
+                &owner.cookie,
+            ),
+            200,
+        )
+        .await;
+    }
+    assert_eq!(db.count("organization_role").await?, 0);
+    for literal in ["{bad", ""] {
+        let role = auth
+            .store()
+            .create_organization_role(alibi::types::CreateOrganizationRole {
+                organization_id: org.clone(),
+                role: "malformed".into(),
+                permission: Default::default(),
+            })
+            .await?;
+        _ = db
+            .execute(
+                "UPDATE organization_role SET permission=$1 WHERE id=$2",
+                &[literal, &role.id],
+            )
+            .await?;
+        let before = db.table("organization_role").await?;
+        for input in [
+            get(
+                "/organization/get-role",
+                &[("organizationId", &org), ("roleId", &role.id)],
+                &owner.cookie,
+            ),
+            get(
+                "/organization/list-roles",
+                &[("organizationId", &org)],
+                &owner.cookie,
+            ),
+            request(
+                "/organization/delete-role",
+                Some(json!({"organizationId":org,"roleId":role.id})),
+                &owner.cookie,
+            ),
+        ] {
+            let failed = call(&auth, input, 500).await;
+            assert!(failed.body.is_empty());
+        }
+        let denied = call(
+            &auth,
+            request(
+                "/organization/delete-role",
+                Some(json!({"organizationId":org,"roleId":role.id})),
+                &foreign.cookie,
+            ),
+            403,
+        )
+        .await;
+        assert_eq!(
+            body(&denied)["code"],
+            "YOU_ARE_NOT_A_MEMBER_OF_THIS_ORGANIZATION"
+        );
+        assert_eq!(db.table("organization_role").await?, before);
+        _ = db
+            .execute("DELETE FROM organization_role WHERE id=$1", &[&role.id])
+            .await?;
+    }
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization"])
+            .await?,
+        protected
+    );
+    B::close(connection).await
+}
+
+async fn organization_legacy_role_loader_after_warm_cache<B: Backend>(db: Db) -> TestResult {
+    for literal in ["[\"create\"]", "null", "{\"team\":\"create\"}", "{bad"] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                access_control: Some(default_organization_statements()),
+                dynamic_access_control: DynamicAccessControlConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let mut owner = account(&auth, "warm-owner@example.test").await;
+        let member = account(&auth, "warm-member@example.test").await;
+        let foreign = account(&auth, "warm-foreign@example.test").await;
+        let org = organization(&auth, &mut owner, "warm-loader").await;
+        let membership = add(&auth, &org, &member.id, "member").await;
+        let policy = json!({"organizationId":org,"permissions":{"team":["create"]}});
+        let warm = call(
+            &auth,
+            request(
+                "/organization/has-permission",
+                Some(policy.clone()),
+                &owner.cookie,
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(body(&warm)["success"], true);
+        let role = auth
+            .store()
+            .create_organization_role(alibi::types::CreateOrganizationRole {
+                organization_id: org.clone(),
+                role: "legacy".into(),
+                permission: Default::default(),
+            })
+            .await?;
+        _ = db
+            .execute(
+                "UPDATE organization_role SET permission=$1 WHERE id=$2",
+                &[literal, &role.id],
+            )
+            .await?;
+        _ = db
+            .execute(
+                "UPDATE member SET role='legacy' WHERE id=$1",
+                &[membership["id"].as_str().unwrap()],
+            )
+            .await?;
+        let before = db
+            .tables(&[
+                "users",
+                "accounts",
+                "sessions",
+                "organization",
+                "member",
+                "organization_role",
+            ])
+            .await?;
+        for input in [
+            get(
+                "/organization/get-role",
+                &[("organizationId", &org), ("roleId", &role.id)],
+                &owner.cookie,
+            ),
+            get(
+                "/organization/list-roles",
+                &[("organizationId", &org)],
+                &owner.cookie,
+            ),
+            request(
+                "/organization/has-permission",
+                Some(policy.clone()),
+                &owner.cookie,
+            ),
+            request(
+                "/organization/update-role",
+                Some(json!({"organizationId":org,"roleId":role.id,"data":{"permission":{}}})),
+                &owner.cookie,
+            ),
+            request(
+                "/organization/delete-role",
+                Some(json!({"organizationId":org,"roleId":role.id})),
+                &owner.cookie,
+            ),
+            request("/organization/has-permission", Some(policy), &member.cookie),
+        ] {
+            let failed = call(&auth, input, 500).await;
+            if literal == "{bad" {
+                assert!(failed.body.is_empty());
+            } else {
+                assert_eq!(
+                    body(&failed),
+                    json!({"message":"Invalid permissions for role legacy"})
+                );
+            }
+            assert!(!failed.headers.contains_key("set-cookie"));
+        }
+        let denied = call(
+            &auth,
+            get(
+                "/organization/get-role",
+                &[("organizationId", &org), ("roleId", &role.id)],
+                &foreign.cookie,
+            ),
+            403,
+        )
+        .await;
+        assert_eq!(
+            body(&denied)["code"],
+            "YOU_ARE_NOT_A_MEMBER_OF_THIS_ORGANIZATION"
+        );
+        assert_eq!(
+            db.tables(&[
+                "users",
+                "accounts",
+                "sessions",
+                "organization",
+                "member",
+                "organization_role"
+            ])
+            .await?,
+            before
+        );
+        B::close(connection).await?;
+    }
+    Ok(())
 }
 
 async fn organization_selected_role_permission_page<B: Backend>(db: Db) -> TestResult {
