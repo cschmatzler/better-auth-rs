@@ -18,7 +18,8 @@ backend_tests!(
     jwt_session_claim_failures_stop_before_keyring_and_preserve_sessions,
     jwt_server_keyring_preserves_absent_request_and_virtual_endpoint,
     jwt_application_keyring_concurrent_initial_discovery_retains_both_signing_keys,
-    jwt_configured_expiration_precision
+    jwt_configured_expiration_precision,
+    jwt_compact_revoked_principal_signing
 );
 
 #[derive(Default)]
@@ -1061,5 +1062,103 @@ async fn jwt_configured_expiration_precision<B: Backend>(db: Db) -> TestResult {
         assert_eq!(decode(&token)?["exp"], 4102444800_u64);
         assert_eq!(db.table("jwks").await?, before);
     }
+    B::close(connection).await
+}
+
+async fn jwt_compact_revoked_principal_signing<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let config = AuthConfig::new(SECRET)
+        .base_url(ORIGIN)
+        .session_cookie_cache(CookieCacheConfig {
+            enabled: true,
+            strategy: CookieCacheStrategy::Compact,
+            max_age: 300.0,
+            version: Some(CookieCacheVersion::Literal("1".into())),
+        });
+    let jwt = JwtPlugin::new();
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(jwt.clone())
+        .build()
+        .await?;
+    let owner = signup(&auth, "cached-jwt-owner@example.test").await;
+    let foreign = signup(&auth, "cached-jwt-foreign@example.test").await;
+    let id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+    let token = body(&owner)["token"].as_str().unwrap().to_owned();
+    let jar = cookies(&owner);
+    let original = body(&owner)["user"]["name"].clone();
+    let mut cleared_jar = jar.clone();
+    _ = auth
+        .store()
+        .update_user(
+            &id,
+            alibi::UpdateUser {
+                name: Some("Durable rename".into()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    for revoked in [false, true] {
+        if revoked {
+            auth.store().delete_session(&token).await?;
+        }
+        let signed = call(&auth, request("/token", None, &jar), 200).await;
+        let claims = jwt
+            .verify_jwt(
+                body(&signed)["token"].as_str().unwrap(),
+                None,
+                None,
+                auth.context(),
+            )
+            .await?
+            .unwrap();
+        assert_eq!(claims["sub"], id);
+        assert_eq!(claims["name"], original);
+        let session = call(&auth, request("/get-session", None, &jar), 200).await;
+        assert_eq!(body(&session)["user"]["name"], original);
+        let signed = session.headers.get("set-auth-jwt").unwrap();
+        let claims = jwt
+            .verify_jwt(signed, None, None, auth.context())
+            .await?
+            .unwrap();
+        assert_eq!(claims["sub"], id);
+        assert_eq!(claims["name"], original);
+        let mut bypass = request("/get-session", None, &jar);
+        bypass.set_query_pairs([("disableCookieCache", "true"), ("disableRefresh", "true")]);
+        let durable = call(&auth, bypass, 200).await;
+        if revoked {
+            assert_eq!(body(&durable), Value::Null);
+            for header in durable.headers.get_all("set-cookie") {
+                let name = header.split('=').next().unwrap();
+                if header.contains("Max-Age=0") {
+                    cleared_jar = cleared_jar
+                        .split("; ")
+                        .filter(|p| p.split_once('=').is_none_or(|(key, _)| key != name))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                }
+            }
+            assert!(
+                durable
+                    .headers
+                    .get_all("set-cookie")
+                    .any(|v| v.contains("session_data") && v.contains("Max-Age=0"))
+            );
+        } else {
+            assert_eq!(body(&durable)["user"]["name"], "Durable rename");
+        }
+    }
+    _ = call(&auth, request("/token", None, &cleared_jar), 401).await;
+    authenticated(&auth, &cookies(&foreign), "cached-jwt-foreign@example.test").await;
+    assert_eq!(db.count("sessions").await?, 1);
+    assert_eq!(
+        db.text("SELECT name FROM users WHERE id=$1", &[&id])
+            .await?
+            .as_deref(),
+        Some("Durable rename")
+    );
     B::close(connection).await
 }
