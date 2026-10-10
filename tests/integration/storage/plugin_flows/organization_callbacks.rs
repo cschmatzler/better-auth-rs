@@ -32,7 +32,8 @@ backend_tests!(
     organization_deletion_before_await_boundary,
     organization_signed_team_helper_session_scope,
     organization_member_team_policy_headers,
-    organization_member_retargeted_team_rollback
+    organization_member_retargeted_team_rollback,
+    organization_member_cleanup_write_failure
 );
 postgres_tests!(
     organization_lifecycle_callbacks_preserve_patch_authority_and_committed_phases,
@@ -4866,5 +4867,175 @@ async fn organization_member_retargeted_team_rollback<B: Backend>(db: Db) -> Tes
         stable
     );
     let _ = foreign_id;
+    B::close(connection).await
+}
+
+async fn organization_member_cleanup_write_failure<B: Backend>(db: Db) -> TestResult {
+    #[derive(Debug, Default)]
+    struct Hooks(Mutex<Vec<&'static str>>);
+    #[async_trait]
+    impl OrganizationMemberAdditionHooks for Hooks {
+        async fn before_add_member(
+            &self,
+            _: &OrganizationMemberAdditionContext,
+        ) -> AuthResult<Option<OrganizationMemberCreatePatch>> {
+            self.0.lock().unwrap().push("before");
+            Ok(None)
+        }
+        async fn after_add_member(&self, _: &OrganizationMemberAddedContext) -> AuthResult<()> {
+            self.0.lock().unwrap().push("after");
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let hooks = Arc::new(Hooks::default());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            teams: TeamsConfig {
+                enabled: true,
+                create_default_team: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+
+    let owner = signup(&auth, "owner@example.test").await;
+    let target = signup(&auth, "target@example.test").await;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let target_id = body(&target)["user"]["id"].as_str().unwrap().to_owned();
+    let foreign_id = body(&foreign)["user"]["id"].as_str().unwrap().to_owned();
+    let org = body(
+        &call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Owned","slug":"owned"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await,
+    );
+    let other = body(
+        &call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Foreign","slug":"foreign"})),
+                &cookies(&foreign),
+            ),
+            200,
+        )
+        .await,
+    );
+    let mut teams = Vec::new();
+    let mut own_member_id = String::new();
+    for (organization, actor) in [(&org, &owner), (&other, &foreign)] {
+        let member = auth
+            .dispatch_endpoint(
+                OrganizationPlugin::add_member_endpoint(&serde_json::from_value(
+                    json!({"organizationId":organization["id"],"userId":target_id,"role":"member"}),
+                )?)?,
+                alibi::endpoint::EndpointOptions::default(),
+            )
+            .await?
+            .decode()?;
+        if organization["id"] == org["id"] {
+            own_member_id = member.id;
+        }
+        let team = body(
+            &call(
+                &auth,
+                request(
+                    "/organization/create-team",
+                    Some(json!({"organizationId":organization["id"],"name":"Seat"})),
+                    &cookies(actor),
+                ),
+                200,
+            )
+            .await,
+        );
+        let _=call(&auth,request("/organization/add-team-member",Some(json!({"organizationId":organization["id"],"teamId":team["id"],"userId":target_id})),&cookies(actor)),200).await;
+        teams.push(team);
+    }
+    auth.store().delete_member(&own_member_id).await?;
+    let own_team = teams.first().unwrap()["id"].as_str().unwrap().to_owned();
+    let foreign_team = teams.last().unwrap()["id"].as_str().unwrap().to_owned();
+
+    _ = db
+        .execute(
+            "DELETE FROM team_member WHERE team_id=$1 AND user_id=$2",
+            &[&own_team, &target_id],
+        )
+        .await?;
+    _ = db
+        .execute("UPDATE team SET member_count=0 WHERE id=$1", &[&own_team])
+        .await?;
+    let helper = OrganizationPlugin::with_config(OrganizationConfig {
+        member_addition_hooks: Some(hooks.clone()),
+        teams: TeamsConfig {
+            enabled: true,
+            create_default_team: false,
+            maximum_members_per_team: Some(0.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    _=db.execute(&format!("CREATE TRIGGER veto_member_cleanup BEFORE DELETE ON member WHEN OLD.user_id='{}' AND OLD.organization_id='{}' BEGIN SELECT RAISE(ABORT,'member cleanup veto'); END",target_id,org["id"].as_str().unwrap()),&[]).await?;
+    let stable = db
+        .tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "organization",
+            "team",
+            "team_member",
+        ])
+        .await?;
+    let count = db.count("member").await?;
+    let input = serde_json::from_value(
+        json!({"organizationId":org["id"],"userId":target_id,"role":"member","teamId":own_team}),
+    )?;
+    let headers = std::collections::HashMap::from([("cookie".into(), cookies(&owner))]);
+    let failed = helper
+        .add_member_with_headers(auth.context(), &headers, &input)
+        .await
+        .unwrap_err();
+    assert!(matches!(failed, AuthError::Database(_)));
+    assert_eq!(*hooks.0.lock().unwrap(), vec!["before"]);
+    assert_eq!(db.count("member").await?, count + 1);
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM member WHERE organization_id=$1 AND user_id=$2",
+            &[org["id"].as_str().unwrap(), &target_id]
+        )
+        .await?,
+        1
+    );
+    assert_eq!(
+        db.tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "organization",
+            "team",
+            "team_member"
+        ])
+        .await?,
+        stable
+    );
+    _ = db.execute("DROP TRIGGER veto_member_cleanup", &[]).await?;
+    let before = db.table("member").await?;
+    let retry = helper
+        .add_member_with_headers(auth.context(), &headers, &input)
+        .await
+        .unwrap_err();
+    assert_eq!(retry.status_code(), 400);
+    assert!(retry.to_string().contains("already a member"));
+    assert_eq!(*hooks.0.lock().unwrap(), vec!["before"]);
+    assert_eq!(db.table("member").await?, before);
+    let _ = (foreign_id, foreign_team);
     B::close(connection).await
 }
