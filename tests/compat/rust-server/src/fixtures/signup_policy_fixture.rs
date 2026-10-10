@@ -14,7 +14,7 @@ use alibi::plugins::{
 };
 use alibi::seaorm::{
     DatabaseConnection, DatabaseHooks, HookControl,
-    sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, QueryOrder, Set},
+    sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, IntoActiveModel, QueryOrder, Set},
     store::entities::{account, session, user, verification},
 };
 use alibi::{Alibi, AuthBuilder, AuthConfig, AuthError, AuthResult};
@@ -189,6 +189,17 @@ fn database_error(error: alibi::seaorm::sea_orm::DbErr) -> AuthError {
 }
 
 pub(crate) async fn router(base: &AuthConfig, database: DatabaseConnection) -> AuthResult<Router> {
+    for column in [
+        "synthetic_tier",
+        "synthetic_secret",
+        "synthetic_locale",
+        "synthetic_note",
+    ] {
+        _ = database
+            .execute_unprepared(&format!("ALTER TABLE users ADD COLUMN {column} TEXT"))
+            .await
+            .map_err(database_error)?;
+    }
     let app = Arc::new(Application::default());
     let mut router = Router::new();
     let mut profiles: HashMap<String, Arc<Alibi<TestSchema>>> = HashMap::new();
@@ -199,6 +210,10 @@ pub(crate) async fn router(base: &AuthConfig, database: DatabaseConnection) -> A
         "signup-no-auto",
         "signup-required",
         "signup-custom",
+        "signup-synthetic-fields",
+        "signup-synthetic-fields-custom",
+        "signup-synthetic-id",
+        "signup-synthetic-id-custom",
         "signup-policy",
         "signup-zero-policy",
         "signup-username",
@@ -220,6 +235,51 @@ pub(crate) async fn router(base: &AuthConfig, database: DatabaseConnection) -> A
     ] {
         let path = format!("/__test/profiles/{name}/api/auth");
         let mut config = base.clone().base_path(&path);
+        if name.starts_with("signup-synthetic-id") {
+            let app = app.clone();
+            config.advanced.database.generate_id = Some(alibi::config::DatabaseIdStrategy::Custom(
+                Arc::new(move |model: &str, size: Option<usize>| {
+                    app.event(json!({"stage":"id-generation","model":model,"size":size}));
+                    app.fail("id")?;
+                    Ok(Some("synthetic_application_1".into()))
+                }),
+            ));
+        }
+        if name.starts_with("signup-synthetic-fields") {
+            use alibi::field_policy::FieldConfig;
+            _ = config.user.additional_fields.insert(
+                "syntheticTier".into(),
+                FieldConfig::new(json!({"type":"string"}))
+                    .field_name("synthetic_tier")
+                    .validate(|value| {
+                        value
+                            .as_str()
+                            .map(|v| {
+                                alibi::utils::json::JsValue::String(format!(
+                                    "parsed:{}",
+                                    v.trim().to_lowercase()
+                                ))
+                            })
+                            .ok_or_else(|| "tier must be a string".into())
+                    }),
+            );
+            _ = config.user.additional_fields.insert(
+                "syntheticSecret".into(),
+                FieldConfig::new(json!({"type":"string"}))
+                    .field_name("synthetic_secret")
+                    .hidden(),
+            );
+            _ = config.user.additional_fields.insert(
+                "syntheticLocale".into(),
+                FieldConfig::new(json!({"type":"string"}))
+                    .field_name("synthetic_locale")
+                    .default_value(json!("en")),
+            );
+            _ = config.user.additional_fields.insert(
+                "syntheticNote".into(),
+                FieldConfig::new(json!({"type":"string"})).field_name("synthetic_note"),
+            );
+        }
         if name == "signup-background" {
             config.background_tasks = Some(app.clone());
         }
@@ -247,13 +307,14 @@ pub(crate) async fn router(base: &AuthConfig, database: DatabaseConnection) -> A
                 enable_signup: name != "signup-disabled",
                 enable_username: name.starts_with("signup-username"),
                 username: username_policy(name, &app),
-                auto_sign_in: !["signup-no-auto", "signup-custom", "signup-username", "signup-background"].contains(&name),
+                auto_sign_in: !["signup-no-auto", "signup-custom", "signup-synthetic-fields", "signup-synthetic-fields-custom", "signup-synthetic-id", "signup-synthetic-id-custom", "signup-username", "signup-background"].contains(&name),
                 require_email_verification: ["signup-required", "signup-otp", "signup-username-required"].contains(&name),
                 password_min_length: if name == "signup-zero-policy" {0} else if name == "signup-policy" {10} else {8},
                 password_max_length: if name == "signup-zero-policy" {0} else if name == "signup-policy" {20} else {128},
                 password_hasher: Some(app.clone()),
                 on_existing_user_signup: Some({let app=app.clone(); Arc::new(move |user, request| {
                     let app=app.clone(); Box::pin(async move {
+                        if name.starts_with("signup-synthetic-fields") { return Ok(()); }
                         app.event(json!({"stage":"existing-user","user":user,"request":signup_request_observation(&request)}));
                         if app.mode() == "existing-block" { app.release_existing.notified().await; }
                         app.fail("existing")?;
@@ -261,12 +322,23 @@ pub(crate) async fn router(base: &AuthConfig, database: DatabaseConnection) -> A
                         Ok(())
                     })
                 })}),
-                custom_synthetic_user: (name == "signup-custom").then(|| {
+                custom_synthetic_user: (["signup-custom", "signup-synthetic-id-custom", "signup-synthetic-fields-custom"].contains(&name)).then(|| {
                     let app=app.clone(); Arc::new(move |input: alibi::plugins::email_password::SyntheticUserContext| {
                         app.event(json!({"stage":"synthetic-user","coreFields":input.core_fields,
                             "additionalFields":input.additional_fields,"id":input.id}));
                         app.fail("synthetic")?;
                         let mut fields=input.core_fields;
+                        if name == "signup-synthetic-id-custom" {
+                            _ = fields.insert("id".into(),json!(input.id));
+                            return Ok(fields);
+                        }
+                        if name == "signup-synthetic-fields-custom" {
+                            _ = fields.insert("id".into(),json!(input.id));
+                            if let Some(tier)=input.additional_fields.get("syntheticTier") { _ = fields.insert("syntheticTier".into(),json!(format!("custom:{}",tier.as_str().unwrap()))); }
+                            _ = fields.insert("syntheticSecret".into(),json!("custom-private"));
+                            _ = fields.insert("unknownApplication".into(),json!("must-not-escape"));
+                            return Ok(fields);
+                        }
                         let requested=fields.get("name").and_then(Value::as_str).unwrap_or_default();
                         let name=format!("Synthetic {requested}");
                         drop(fields.insert("name".into(),json!(name)));
@@ -391,6 +463,26 @@ pub(crate) async fn router(base: &AuthConfig, database: DatabaseConnection) -> A
             }
         }),
     );
+    router = router.route("/__test/signup-policy/synthetic-fields", get(move || {
+        let database = database.clone();
+        async move {
+            let result: AuthResult<Value> = async {
+                use alibi::seaorm::sea_orm::{DbBackend, Statement};
+                let rows = database.query_all_raw(Statement::from_string(DbBackend::Sqlite,
+                    "SELECT id, synthetic_tier AS syntheticTier, synthetic_secret AS syntheticSecret, synthetic_locale AS syntheticLocale, synthetic_note AS syntheticNote FROM users ORDER BY created_at, id")).await.map_err(database_error)?;
+                let users = rows.iter().map(|row| {
+                    let mut user = serde_json::Map::new();
+                    _ = user.insert("id".into(), json!(row.try_get::<String>("", "id").map_err(database_error)?));
+                    for name in ["syntheticTier", "syntheticSecret", "syntheticLocale", "syntheticNote"] {
+                        _ = user.insert(name.into(), json!(row.try_get::<Option<String>>("", name).map_err(database_error)?));
+                    }
+                    Ok(Value::Object(user))
+                }).collect::<AuthResult<Vec<_>>>()?;
+                Ok(json!({"users":users}))
+            }.await;
+            match result { Ok(value) => Json(value).into_response(), Err(error) => error.into_response() }
+        }
+    }));
     Ok(router)
 }
 
