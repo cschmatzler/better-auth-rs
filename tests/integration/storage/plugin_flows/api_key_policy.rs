@@ -32,7 +32,8 @@ backend_tests!(
     api_key_secondary_index_expiration,
     api_key_secondary_sdk_delete_index_scope,
     api_key_stale_reference_index_authority,
-    api_key_selected_list_storage_isolation
+    api_key_selected_list_storage_isolation,
+    api_key_multistore_sort_pagination
 );
 
 fn raw(path: &str, text: &str, cookie: &str) -> AuthRequest {
@@ -3239,5 +3240,170 @@ async fn api_key_selected_list_storage_isolation<B: Backend>(db: Db) -> TestResu
         body(&call(&auth, request("/api-key/list", None, &cookies(&owner)), 200).await)["total"],
         2
     );
+    B::close(connection).await
+}
+
+async fn api_key_multistore_sort_pagination<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{CacheAdapter, MemoryCacheAdapter};
+    struct ApplicationStorage {
+        cache: MemoryCacheAdapter,
+        writes: Mutex<Vec<(String, Option<i64>)>>,
+        keys: Mutex<std::collections::BTreeSet<String>>,
+        fail_get: Mutex<Option<String>>,
+    }
+    impl ApplicationStorage {
+        fn new() -> Self {
+            Self {
+                cache: MemoryCacheAdapter::new(),
+                writes: Mutex::new(Vec::new()),
+                keys: Mutex::new(Default::default()),
+                fail_get: Mutex::new(None),
+            }
+        }
+        async fn snapshot(&self) -> AuthResult<std::collections::BTreeMap<String, String>> {
+            let keys = self
+                .keys
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut snapshot = std::collections::BTreeMap::new();
+            for key in keys {
+                if let Some(value) = self.cache.get(&key).await? {
+                    _ = snapshot.insert(key, value);
+                }
+            }
+            Ok(snapshot)
+        }
+    }
+    #[async_trait::async_trait]
+    impl ApiKeyStorage for ApplicationStorage {
+        async fn get(&self, key: &str) -> AuthResult<Option<String>> {
+            if self
+                .fail_get
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|prefix| key.starts_with(prefix))
+            {
+                return Err(AuthError::internal("Application key storage unavailable"));
+            }
+            self.cache.get(key).await
+        }
+        async fn set(
+            &self,
+            key: &str,
+            value: &str,
+            ttl: Option<chrono::Duration>,
+        ) -> AuthResult<()> {
+            _ = self.keys.lock().unwrap().insert(key.into());
+            self.writes
+                .lock()
+                .unwrap()
+                .push((key.into(), ttl.map(|ttl| ttl.num_seconds())));
+            match ttl {
+                Some(ttl) => self.cache.set(key, value, ttl).await,
+                None => self.cache.set_without_expiry(key, value).await,
+            }
+        }
+        async fn delete(&self, key: &str) -> AuthResult<()> {
+            self.cache.delete(key).await
+        }
+    }
+
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let storage = Arc::new(ApplicationStorage::new());
+    let isolated = Arc::new(ApplicationStorage::new());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(
+            ApiKeyPlugin::with_config(ApiKeyConfig {
+                storage: ApiKeyStorageMode::SecondaryStorage,
+                custom_storage: Some(storage.clone()),
+                defer_updates: false,
+                ..Default::default()
+            })
+            .configuration(ApiKeyConfig {
+                config_id: "isolated".into(),
+                storage: ApiKeyStorageMode::SecondaryStorage,
+                custom_storage: Some(isolated.clone()),
+                defer_updates: false,
+                ..Default::default()
+            }),
+        )
+        .build()
+        .await?;
+    let owner = signup(&auth, "store-sort@example.test").await;
+    for (config, name) in [
+        ("default", "zulu-b"),
+        ("default", "zulu-a"),
+        ("isolated", "alpha-b"),
+        ("isolated", "alpha-a"),
+    ] {
+        _ = call(
+            &auth,
+            request(
+                "/api-key/create",
+                Some(json!({"configId":config,"name":name})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+    }
+    let before = storage.snapshot().await?;
+    let other_before = isolated.snapshot().await?;
+    let protected = db
+        .tables(&["users", "accounts", "sessions", "api_keys"])
+        .await?;
+    for (query, expected, total) in [
+        (
+            vec![("sortBy", "name"), ("sortDirection", "asc")],
+            vec!["zulu-a", "zulu-b", "alpha-a", "alpha-b"],
+            4,
+        ),
+        (
+            vec![
+                ("sortBy", "name"),
+                ("sortDirection", "asc"),
+                ("offset", "1"),
+                ("limit", "2"),
+            ],
+            vec!["zulu-b", "alpha-a"],
+            4,
+        ),
+        (
+            vec![
+                ("configId", "isolated"),
+                ("sortBy", "name"),
+                ("sortDirection", "asc"),
+                ("offset", "1"),
+                ("limit", "1"),
+            ],
+            vec!["alpha-b"],
+            2,
+        ),
+    ] {
+        let mut input = request("/api-key/list", None, &cookies(&owner));
+        input.set_query_pairs(query);
+        let list = body(&call(&auth, input, 200).await);
+        assert_eq!(
+            list["apiKeys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|key| key["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(list["total"], total);
+        assert_eq!(storage.snapshot().await?, before);
+        assert_eq!(isolated.snapshot().await?, other_before);
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "api_keys"])
+                .await?,
+            protected
+        );
+    }
     B::close(connection).await
 }
