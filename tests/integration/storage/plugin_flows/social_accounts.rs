@@ -22,7 +22,8 @@ backend_tests!(
     callback_user_payload_reaches_the_profile_handler,
     unverified_social_sign_in_delegates_to_the_otp_override,
     ambiguous_provider_accounts_fail_closed,
-    returning_social_signin_preserves_previously_granted_scopes
+    returning_social_signin_preserves_previously_granted_scopes,
+    orphan_oauth_binding_never_adopts_same_email_owner
 );
 
 struct Deny;
@@ -665,5 +666,60 @@ async fn returning_social_signin_preserves_previously_granted_scopes<B: Backend>
         Some("authorization_code")
     );
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn orphan_oauth_binding_never_adopts_same_email_owner<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let social = Social::start().await;
+    let mut provider =
+        alibi::plugins::oauth::OAuthProvider::google("google-client", "google-secret");
+    provider.token_url = social.provider.url.join("token").unwrap().into();
+    provider.get_user_info = Some(Arc::new(social.profile.clone()));
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(alibi::plugins::OAuthPlugin::new().add_provider("google", provider))
+        .build()
+        .await?;
+    let owner = signup(&auth, "orphan-owner@example.test").await;
+    let owner_id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+    _ = db.execute("INSERT INTO accounts (id,user_id,account_id,provider_id,access_token,refresh_token,created_at,updated_at) SELECT 'orphan-account',user_id,'orphan-sub','google','old-access','old-refresh',created_at,updated_at FROM accounts WHERE user_id=$1", &[&owner_id]).await?;
+    _ = db.execute("PRAGMA foreign_keys=OFF", &[]).await?;
+    _ = db
+        .execute(
+            "UPDATE accounts SET user_id='missing-owner' WHERE id='orphan-account'",
+            &[],
+        )
+        .await?;
+    _ = db.execute("PRAGMA foreign_keys=ON", &[]).await?;
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    social
+        .profile
+        .set("orphan-sub", "orphan-owner@example.test", true);
+    let (state, cookie) = authorize(
+        &auth,
+        "/sign-in/social",
+        json!({"provider":"google","callbackURL":"/home","errorCallbackURL":"/oops"}),
+        &cookies(&owner),
+    )
+    .await;
+    let rejected = callback(&auth, &[("code", "grant"), ("state", &state)], &cookie).await;
+    assert_eq!(rejected.status, 302);
+    let location = url::Url::parse(&format!(
+        "{ORIGIN}{}",
+        rejected.headers.get("location").unwrap()
+    ))
+    .or_else(|_| url::Url::parse(rejected.headers.get("location").unwrap()))?;
+    assert_eq!(
+        location
+            .query_pairs()
+            .find(|(key, _)| key == "error")
+            .unwrap()
+            .1,
+        "unable_to_link_account"
+    );
+    assert!(cookies(&rejected).is_empty());
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    assert_eq!(db.count("verifications").await?, 0);
+    authenticated(&auth, &cookies(&owner), "orphan-owner@example.test").await;
     B::close(connection).await
 }
