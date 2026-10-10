@@ -14,7 +14,8 @@ backend_tests!(
     identity_policy_admits_mutations_and_isolates_concurrent_requests,
     provider_admission_distinguishes_creation_returning_and_linking,
     verification_identifier_policy_preserves_logical_access_and_failure_atomicity,
-    verification_trusted_create_cache_key
+    verification_trusted_create_cache_key,
+    verification_expired_transformed_fallback
 );
 postgres_tests!(
     identity_policy_admits_mutations_and_isolates_concurrent_requests,
@@ -605,4 +606,118 @@ async fn verification_trusted_create_cache_key<B: Backend>(db: Db) -> TestResult
     );
     assert_eq!(receipts[1], actual);
     B::close(connection).await
+}
+
+async fn verification_expired_transformed_fallback<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{CacheAdapter, MemoryCacheAdapter};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest, Sha256};
+    for mode in [0, 1, 2] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let cache = Arc::new(MemoryCacheAdapter::new());
+        let mut config = AuthConfig::new(SECRET);
+        config.verification.store_identifier.default = VerificationIdentifierStrategy::Hashed;
+        if mode > 0 {
+            config.verification.secondary_storage = Some(cache.clone());
+        }
+        config.verification.store_in_database = mode == 1;
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .build()
+            .await?;
+        let transformed = URL_SAFE_NO_PAD.encode(Sha256::digest(b"fallback-owner"));
+        let foreign = auth
+            .store()
+            .create_verification(CreateVerification {
+                identifier: "foreign-proof".into(),
+                value: "unchanged".into(),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
+            })
+            .await?;
+        use alibi::AuthVerification;
+        let foreign_id = foreign.id().into_owned();
+        for (identifier, value, expired) in [
+            (transformed.as_str(), "expired-transformed", true),
+            ("fallback-owner", "live-plain", false),
+        ] {
+            let expiry = if expired {
+                "2000-01-01T00:00:00Z"
+            } else {
+                "2100-01-01T00:00:00Z"
+            };
+            if mode == 2 {
+                cache
+                    .set(
+                        &format!("verification:{identifier}"),
+                        &json!({"identifier":identifier,"value":value,"expiresAt":expiry})
+                            .to_string(),
+                        chrono::Duration::minutes(5),
+                    )
+                    .await?;
+            } else {
+                _ = auth
+                    .store()
+                    .create_verification(CreateVerification {
+                        identifier: identifier.into(),
+                        value: value.into(),
+                        expires_at: chrono::DateTime::parse_from_rfc3339(expiry)?
+                            .with_timezone(&chrono::Utc),
+                    })
+                    .await?;
+            }
+        }
+        assert!(
+            auth.context()
+                .verifications()
+                .consume("fallback-owner")
+                .await?
+                .is_none()
+        );
+        assert_eq!(
+            db.count("verifications").await?,
+            if mode == 2 { 1 } else { 2 }
+        );
+        if mode == 2 {
+            assert!(cache.get("verification:fallback-owner").await?.is_none());
+            assert!(
+                cache
+                    .get(&format!("verification:{transformed}"))
+                    .await?
+                    .is_none()
+            );
+        } else {
+            assert_eq!(
+                db.text(
+                    "SELECT value FROM verifications WHERE identifier=$1",
+                    &["fallback-owner"]
+                )
+                .await?
+                .as_deref(),
+                Some("live-plain")
+            );
+        }
+        let next = auth
+            .context()
+            .verifications()
+            .consume("fallback-owner")
+            .await?;
+        if mode == 2 {
+            assert!(next.is_none());
+        } else {
+            assert_eq!(next.unwrap().value()?, "live-plain");
+        }
+        assert_eq!(db.count("verifications").await?, 1);
+        assert_eq!(
+            db.text(
+                "SELECT value FROM verifications WHERE id=$1",
+                &[&foreign_id]
+            )
+            .await?
+            .as_deref(),
+            Some("unchanged")
+        );
+        B::close(connection).await?;
+    }
+    Ok(())
 }
