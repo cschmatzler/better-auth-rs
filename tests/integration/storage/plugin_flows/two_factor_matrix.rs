@@ -26,7 +26,8 @@ backend_tests!(
     two_factor_backup_remainder_json_normalization,
     two_factor_pending_session_cancellation_retirement,
     two_factor_authenticated_totp_failed_rotation_retry,
-    two_factor_expired_pending_factor_stage_policy
+    two_factor_expired_pending_factor_stage_policy,
+    two_factor_configured_proof_cookie_lifetimes
 );
 
 #[derive(Default)]
@@ -2213,6 +2214,125 @@ async fn two_factor_expired_pending_factor_stage_policy<B: Backend>(db: Db) -> T
             authenticated(&auth, &cookies(&done), "expired@example.test").await;
             B::close(connection).await?;
         }
+    }
+    Ok(())
+}
+
+async fn two_factor_configured_proof_cookie_lifetimes<B: Backend>(db: Db) -> TestResult {
+    use alibi::entity::AuthVerification;
+    for (challenge_age, challenge_ms, trust_age, trust_ms) in [
+        (600.75, 600_750, 1200.875, 1_200_875),
+        (0.0, 0, 1200.875, 1_200_875),
+        (-0.25, -250, 1200.875, 1_200_875),
+        (600.75, 600_750, 0.0, 0),
+        (600.75, 600_750, -0.25, -250),
+    ] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(TwoFactorPlugin::with_config(TwoFactorConfig {
+                skip_verification_on_enable: true,
+                two_factor_cookie_max_age: challenge_age,
+                trust_device_max_age: trust_age,
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let signed = signup(&auth, "ttl@example.test").await;
+        let id = body(&signed)["user"]["id"].as_str().unwrap().to_owned();
+        let (totp, _, _) = enroll(&auth, &cookies(&signed)).await;
+        let from = chrono::Utc::now().timestamp_millis();
+        let pending = sign_in(&auth, "ttl@example.test", json!({}), "").await;
+        let to = chrono::Utc::now().timestamp_millis();
+        let header = pending
+            .headers
+            .get_all("set-cookie")
+            .find(|x| x.starts_with("better-auth.two_factor="))
+            .unwrap();
+        let expected = if challenge_ms < 0 {
+            None
+        } else {
+            Some(format!("Max-Age={}", challenge_ms / 1000))
+        };
+        assert_eq!(header.contains("Max-Age="), expected.is_some());
+        if let Some(x) = expected {
+            assert!(header.contains(&x));
+        }
+        assert!(header.contains("HttpOnly"));
+        assert!(header.contains("SameSite=Lax"));
+        assert!(!header.contains("Expires="));
+        let key=db.text("SELECT identifier FROM verifications WHERE value=$1 AND identifier LIKE '2fa-%' AND identifier NOT LIKE '2fa-attempts-%'",&[&id]).await?.unwrap();
+        let proof = auth
+            .store()
+            .get_latest_verification_by_identifier(&key)
+            .await?
+            .unwrap();
+        let attempts = auth
+            .store()
+            .get_latest_verification_by_identifier(&format!("2fa-attempts-{key}"))
+            .await?
+            .unwrap();
+        let expiry = proof.expires_at().timestamp_millis();
+        assert!((from + challenge_ms..=to + challenge_ms).contains(&expiry));
+        assert_eq!(attempts.expires_at(), proof.expires_at());
+        if challenge_ms > 0 {
+            let from = chrono::Utc::now().timestamp_millis();
+            let done = call(
+                &auth,
+                request(
+                    "/two-factor/verify-totp",
+                    Some(json!({"code":totp.generate_current().to_string(),"trustDevice":true})),
+                    &cookies(&pending),
+                ),
+                200,
+            )
+            .await;
+            let to = chrono::Utc::now().timestamp_millis();
+            let header = done
+                .headers
+                .get_all("set-cookie")
+                .find(|x| x.starts_with("better-auth.trust_device="))
+                .unwrap();
+            assert_eq!(header.contains("Max-Age="), trust_ms >= 0);
+            if trust_ms >= 0 {
+                assert!(header.contains(&format!("Max-Age={}", trust_ms / 1000)));
+            }
+            let key=db.text("SELECT identifier FROM verifications WHERE identifier LIKE 'trust-device-%' AND value=$1",&[&id]).await?.unwrap();
+            let trust = auth
+                .store()
+                .get_latest_verification_by_identifier(&key)
+                .await?
+                .unwrap();
+            assert!(
+                (from + trust_ms..=to + trust_ms).contains(&trust.expires_at().timestamp_millis())
+            );
+            let pair = header.split(';').next().unwrap();
+            let from = chrono::Utc::now().timestamp_millis();
+            let rotated = sign_in(&auth, "ttl@example.test", json!({}), pair).await;
+            let to = chrono::Utc::now().timestamp_millis();
+            if trust_ms > 0 {
+                assert_eq!(body(&rotated)["user"]["id"], id);
+                assert!(
+                    auth.store()
+                        .get_latest_verification_by_identifier(&key)
+                        .await?
+                        .is_none()
+                );
+                let next=db.text("SELECT identifier FROM verifications WHERE identifier LIKE 'trust-device-%' AND value=$1",&[&id]).await?.unwrap();
+                assert_ne!(next, key);
+                let expiry = auth
+                    .store()
+                    .get_latest_verification_by_identifier(&next)
+                    .await?
+                    .unwrap()
+                    .expires_at()
+                    .timestamp_millis();
+                assert!((from + trust_ms..=to + trust_ms).contains(&expiry));
+            } else {
+                assert_eq!(body(&rotated)["twoFactorRedirect"], true);
+            }
+        }
+        B::close(connection).await?;
     }
     Ok(())
 }
