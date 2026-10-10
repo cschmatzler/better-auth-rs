@@ -12,7 +12,8 @@ backend_tests!(
     email_otp_issuance_and_request_validation,
     email_otp_change_email_policy,
     email_otp_hooks_and_reset_edges,
-    email_otp_configured_quota_blocks_delivery_and_resets_at_configured_window
+    email_otp_configured_quota_blocks_delivery_and_resets_at_configured_window,
+    disabled_email_change_preserves_live_proofs_for_enabled_instance
 );
 
 #[derive(Default)]
@@ -417,5 +418,119 @@ async fn email_otp_configured_quota_blocks_delivery_and_resets_at_configured_win
     assert_eq!(outbox.0.lock().unwrap().len(), 3);
     assert_eq!(db.count("verifications").await?, 3);
     assert_eq!(db.count("sessions").await?, 0);
+    B::close(connection).await
+}
+
+async fn disabled_email_change_preserves_live_proofs_for_enabled_instance<B: Backend>(
+    db: Db,
+) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let mailbox = Arc::new(Mailbox::default());
+    let enabled = fast_builder::<B>(&connection)
+        .plugin(plugin(
+            &mailbox,
+            EmailOtpConfig {
+                change_email_enabled: true,
+                ..Default::default()
+            },
+        ))
+        .build()
+        .await?;
+    let disabled = fast_builder::<B>(&connection)
+        .plugin(plugin(
+            &mailbox,
+            EmailOtpConfig {
+                change_email_enabled: false,
+                verify_current_email: true,
+                ..Default::default()
+            },
+        ))
+        .build()
+        .await?;
+    let owner = signup(&enabled, "disabled-owner@example.test").await;
+    _ = call(
+        &enabled,
+        request(
+            "/email-otp/request-email-change",
+            Some(json!({"newEmail":"disabled-target@example.test"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let target = mailbox.take();
+    _ = call(
+        &enabled,
+        request(
+            "/email-otp/send-verification-otp",
+            Some(json!({"email":"disabled-owner@example.test","type":"email-verification"})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    let current = mailbox.take();
+    let before = db
+        .tables(&["users", "accounts", "sessions", "verifications"])
+        .await?;
+    let deliveries = mailbox.0.lock().unwrap().len();
+    for (path, otp) in [
+        ("/email-otp/request-email-change", current.otp.as_str()),
+        ("/email-otp/change-email", target.otp.as_str()),
+    ] {
+        let input = json!({"newEmail":"disabled-target@example.test","otp":otp});
+        let denied = call(
+            &disabled,
+            request(path, Some(input.clone()), &cookies(&owner)),
+            400,
+        )
+        .await;
+        assert_eq!(
+            body(&denied)["message"],
+            "Change email with OTP is disabled"
+        );
+        assert!(body(&denied).get("code").is_none());
+        assert_eq!(
+            body(&call(&disabled, request(path, Some(input), ""), 401).await)["code"],
+            "UNAUTHORIZED"
+        );
+        _ = call(
+            &disabled,
+            request(path, Some(json!({"newEmail":55,"otp":otp})), ""),
+            400,
+        )
+        .await;
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+        assert_eq!(mailbox.0.lock().unwrap().len(), deliveries);
+    }
+    _ = call(
+        &enabled,
+        request(
+            "/email-otp/change-email",
+            Some(json!({"newEmail":"disabled-target@example.test","otp":target.otp})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(db.count_where("SELECT COUNT(*) FROM verifications WHERE identifier='email-verification-otp-disabled-owner@example.test'",&[]).await?,1);
+    assert_eq!(db.count("verifications").await?, 1);
+    authenticated(&disabled, &cookies(&owner), "disabled-target@example.test").await;
+    let stable = db.tables(&["users", "accounts", "sessions"]).await?;
+    _ = call(
+        &enabled,
+        request(
+            "/email-otp/change-email",
+            Some(json!({"newEmail":"disabled-target@example.test","otp":target.otp})),
+            &cookies(&owner),
+        ),
+        400,
+    )
+    .await;
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, stable);
     B::close(connection).await
 }
