@@ -16,7 +16,8 @@ backend_tests!(
     captcha_normalized_physical_paths_reject_before_json_and_origin_validation,
     captcha_botid_validator_receives_actual_request_and_full_verification,
     captcha_botid_validator_error_preserves_all_existing_principals,
-    captcha_slow_successful_response_body_still_authenticates_existing_owner
+    captcha_slow_successful_response_body_still_authenticates_existing_owner,
+    captcha_physical_method_admission
 );
 
 const SUFFIX: &str = "1E4C9B93F3F0682250B6CF8331B7EE68FD8";
@@ -738,4 +739,95 @@ async fn captcha_botid_deadline_rejects_authentication_without_cancelling_callba
     authenticated(&auth, &cookies(&owner), "owner@example.test").await;
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     Ok(())
+}
+
+async fn captcha_physical_method_admission<B: Backend>(db: Db) -> TestResult {
+    struct Observer {
+        label: &'static str,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+    #[async_trait::async_trait]
+    impl<S: AuthSchema> alibi::AuthPlugin<S> for Observer {
+        async fn on_request(
+            &self,
+            _: &AuthRequest,
+            _: &alibi::AuthContext<S>,
+        ) -> AuthResult<Option<AuthResponse>> {
+            Ok(None)
+        }
+        fn name(&self) -> &'static str {
+            self.label
+        }
+        fn routes(&self) -> Vec<alibi::AuthRoute> {
+            Vec::new()
+        }
+        async fn on_http_request(
+            &self,
+            r: &AuthRequest,
+            _: &alibi::AuthContext<S>,
+        ) -> AuthResult<Option<AuthResponse>> {
+            if r.path == "/api/auth/sign-in/email" {
+                self.events.lock().unwrap().push(self.label);
+            }
+            Ok(None)
+        }
+    }
+    let provider = Provider::start("application/json", r#"{"success":true}"#).await;
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let setup = super::auth_probe::fast_builder::<B>(&connection)
+        .build()
+        .await?;
+    let owner = signup(&setup, "method-captcha-owner@example.test").await;
+    let foreign = signup(&setup, "method-captcha-foreign@example.test").await;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "verifications"])
+        .await?;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut options = TurnstileConfig::new("actual-captcha-secret");
+    options.http.site_verify_url = Some(provider.url.clone());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(Observer {
+            label: "early",
+            events: events.clone(),
+        })
+        .plugin(CaptchaPlugin::new(CaptchaConfig::new(
+            CaptchaProvider::CloudflareTurnstile(options),
+        )))
+        .plugin(Observer {
+            label: "late",
+            events: events.clone(),
+        })
+        .build()
+        .await?;
+    for method in [HttpMethod::Get, HttpMethod::Options, HttpMethod::Put] {
+        events.lock().unwrap().clear();
+        let mut input = request("/sign-in/email", None, "");
+        input.method = method;
+        _ = input
+            .headers
+            .insert("origin".into(), "https://foreign.fixture.test".into());
+        _ = input
+            .headers
+            .insert("access-control-request-method".into(), "POST".into());
+        let rejected = call(&auth, input, 400).await;
+        assert_eq!(
+            body(&rejected),
+            json!({"message":"Missing CAPTCHA response","code":"MISSING_RESPONSE"})
+        );
+        assert_eq!(*events.lock().unwrap(), ["early"]);
+        assert!(provider.take().is_empty());
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+    }
+    authenticated(&auth, &cookies(&owner), "method-captcha-owner@example.test").await;
+    authenticated(
+        &auth,
+        &cookies(&foreign),
+        "method-captcha-foreign@example.test",
+    )
+    .await;
+    B::close(connection).await
 }
