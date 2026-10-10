@@ -22,7 +22,8 @@ backend_tests!(
     static_org_update_requires_update_action_and_preserves_key_identity,
     static_org_delete_requires_delete_action_and_revokes_only_selected_key,
     disabled_custom_key_expiration_retains_default_lifetime_through_rename,
-    banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_authority
+    banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_authority,
+    api_key_raw_default_expiration
 );
 
 fn raw(path: &str, text: &str, cookie: &str) -> AuthRequest {
@@ -1894,4 +1895,98 @@ async fn banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_autho
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     authenticated(&auth, &cookies(&admin), "admin@example.test").await;
     B::close(connection).await
+}
+
+async fn api_key_raw_default_expiration<B: Backend>(db: Db) -> TestResult {
+    struct Generator(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl ApiKeyGenerator for Generator {
+        async fn generate_key(&self, _: &ApiKeyGenerationOptions<'_>) -> AuthResult<String> {
+            _ = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("default-expiry-secret-material".into())
+        }
+    }
+    for expiry in [
+        60.125,
+        0.0,
+        f64::NAN,
+        -3600.125,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let generator = Arc::new(Generator(std::sync::atomic::AtomicUsize::new(0)));
+        let plugin = ApiKeyPlugin::with_config(ApiKeyConfig {
+            custom_key_generator: Some(generator.clone()),
+            defer_updates: false,
+            key_expiration: KeyExpirationConfig {
+                default_expires_in: Some(expiry),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(plugin.clone())
+            .build()
+            .await?;
+        let owner = signup(&auth, "default-expiry@example.test").await;
+        let before = db
+            .tables(&["users", "accounts", "sessions", "api_keys"])
+            .await?;
+        let response = call(
+            &auth,
+            request("/api-key/create", Some(json!({})), &cookies(&owner)),
+            if expiry.is_infinite() { 500 } else { 200 },
+        )
+        .await;
+        assert_eq!(generator.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        if expiry.is_infinite() {
+            assert!(response.body.is_empty());
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions", "api_keys"])
+                    .await?,
+                before
+            );
+        } else if expiry == 0.0 || expiry.is_nan() {
+            assert!(body(&response)["expiresAt"].is_null());
+            assert!(
+                db.text("SELECT expires_at FROM api_keys", &[])
+                    .await?
+                    .is_none()
+            );
+        } else {
+            let issued = body(&response);
+            let created =
+                chrono::DateTime::parse_from_rfc3339(issued["createdAt"].as_str().unwrap())?;
+            let expires =
+                chrono::DateTime::parse_from_rfc3339(issued["expiresAt"].as_str().unwrap())?;
+            let millis = (expires - created).num_milliseconds();
+            if expiry.is_sign_positive() {
+                assert!((60_100..=60_175).contains(&millis), "{millis}");
+            } else {
+                assert!((-3_600_150..=-3_600_100).contains(&millis), "{millis}");
+                let rejected = plugin
+                    .verify_api_key(
+                        &VerifyApiKey {
+                            key: issued["key"].as_str().unwrap(),
+                            config_id: Some("default"),
+                            permissions: None,
+                        },
+                        auth.context(),
+                    )
+                    .await
+                    .unwrap_err();
+                match rejected {
+                    ApiKeyVerificationError::Validation(error) => {
+                        assert_eq!(serde_json::to_value(error)?["code"], "KEY_EXPIRED")
+                    }
+                    _ => panic!("expiry must reject as KEY_EXPIRED"),
+                }
+                assert_eq!(db.count("api_keys").await?, 0);
+            }
+        }
+        B::close(connection).await?;
+    }
+    Ok(())
 }
