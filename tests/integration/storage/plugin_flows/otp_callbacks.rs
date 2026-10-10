@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 backend_tests!(
     email_otp_custom_codec_controls_reuse_and_failure_consumption,
     email_otp_verification_override_owns_signup_transaction_and_direct_delivery,
+    email_otp_real_signup_after_hook,
     delegated_otp_issuance_retains_original_request_and_live_proof
 );
 postgres_tests!(
@@ -337,6 +338,60 @@ async fn email_otp_verification_override_owns_signup_transaction_and_direct_deli
         B::close(connection).await?;
     }
     Ok(())
+}
+
+async fn email_otp_real_signup_after_hook<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let sender = Arc::new(VerificationDelivery::default());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(EmailOtpPlugin::new(EmailOtpConfig {
+            send_verification_on_sign_up: true,
+            override_default_email_verification: false,
+            send_verification_otp: Some(sender.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let owner = signup(&auth, "signup-otp@example.test").await;
+    let id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(body(&owner)["user"]["emailVerified"], false);
+    let deliveries = sender.otp.lock().unwrap().clone();
+    assert_eq!(deliveries.len(), 1);
+    let delivery = &deliveries[0];
+    assert_eq!(delivery.otp_type, EmailOtpType::EmailVerification);
+    assert_eq!(delivery.email, "signup-otp@example.test");
+    assert_eq!(db.count("verifications").await?, 1);
+    assert_eq!(
+        db.text("SELECT identifier FROM verifications", &[])
+            .await?
+            .as_deref(),
+        Some("email-verification-otp-signup-otp@example.test")
+    );
+    assert_eq!(
+        db.text("SELECT value FROM verifications", &[])
+            .await?
+            .as_deref(),
+        Some(format!("{}:0", delivery.otp).as_str())
+    );
+    let before = db.tables(&["accounts", "sessions"]).await?;
+    let current = body(&call(&auth, request("/get-session", None, &cookies(&owner)), 200).await);
+    assert_eq!(current["user"]["id"], id);
+    assert_eq!(current["user"]["emailVerified"], false);
+    let input = request(
+        "/email-otp/verify-email",
+        Some(json!({"email":delivery.email,"otp":delivery.otp})),
+        "",
+    );
+    _ = call(&auth, input.clone(), 200).await;
+    let current = body(&call(&auth, request("/get-session", None, &cookies(&owner)), 200).await);
+    assert_eq!(current["user"]["id"], id);
+    assert_eq!(current["user"]["emailVerified"], true);
+    assert_eq!(db.count("verifications").await?, 0);
+    assert_eq!(db.tables(&["accounts", "sessions"]).await?, before);
+    let stable = db.tables(&["users", "accounts", "sessions"]).await?;
+    assert_eq!(body(&call(&auth, input, 400).await)["code"], "INVALID_OTP");
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, stable);
+    B::close(connection).await
 }
 
 async fn delegated_otp_issuance_retains_original_request_and_live_proof<B: Backend>(
