@@ -16,6 +16,7 @@ backend_tests!(
     magic_link_redemption_matrix,
     magic_link_configured_quota_blocks_delivery_and_resets_at_configured_window,
     magic_link_returning_verified_owner_retains_credentials_oauth_and_browser_sessions,
+    magic_link_redemption_hasher_failure,
     magic_link_fresh_empty_callback
 );
 
@@ -489,6 +490,96 @@ async fn magic_link_returning_verified_owner_retains_credentials_oauth_and_brows
     assert_eq!(body(&login)["user"]["id"], id);
     assert_eq!(db.table("accounts").await?, accounts);
     B::close(connection).await
+}
+
+async fn magic_link_redemption_hasher_failure<B: Backend>(db: Db) -> TestResult {
+    struct Switched(std::sync::atomic::AtomicU8);
+    #[async_trait]
+    impl MagicLinkTokenHasher for Switched {
+        async fn hash(&self, token: &str) -> AuthResult<String> {
+            match self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                1 => Err(AuthError::Upstream {
+                    status: 403,
+                    code: "MAGIC_HASH_REJECTED",
+                    message: "Application hasher rejected",
+                }),
+                2 => Err(AuthError::internal("private hasher rejection")),
+                _ => Ok(format!("application:{token}")),
+            }
+        }
+    }
+    for failure in [1, 2] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let hasher = Arc::new(Switched(std::sync::atomic::AtomicU8::new(0)));
+        let outbox = Arc::new(Outbox::default());
+        let auth = fast_builder::<B>(&connection)
+            .plugin(MagicLinkPlugin::new(MagicLinkConfig {
+                storage: MagicLinkTokenStorage::Custom(hasher.clone()),
+                send_magic_link: Some(outbox.clone()),
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        _ = call(
+            &auth,
+            request(
+                "/sign-in/magic-link",
+                Some(json!({"email":"hash-retry@example.test"})),
+                "",
+            ),
+            200,
+        )
+        .await;
+        let delivery = outbox.sent.lock().unwrap().last().unwrap().clone();
+        let before = db
+            .tables(&["users", "accounts", "sessions", "verifications"])
+            .await?;
+        assert_eq!(
+            db.text("SELECT identifier FROM verifications", &[])
+                .await?
+                .as_deref(),
+            Some(format!("magic-link:application:{}", delivery.token).as_str())
+        );
+        hasher.0.store(failure, std::sync::atomic::Ordering::SeqCst);
+        let denied = call(
+            &auth,
+            redeem(&delivery, &[("callbackURL", "")]),
+            if failure == 1 { 403 } else { 500 },
+        )
+        .await;
+        assert!(cookies(&denied).is_empty());
+        if failure == 1 {
+            assert_eq!(body(&denied)["code"], "MAGIC_HASH_REJECTED");
+        } else {
+            assert!(denied.body.is_empty());
+        }
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+        hasher.0.store(0, std::sync::atomic::Ordering::SeqCst);
+        let accepted = call(&auth, redeem(&delivery, &[("callbackURL", "")]), 200).await;
+        assert_eq!(body(&accepted)["user"]["email"], "hash-retry@example.test");
+        authenticated(&auth, &cookies(&accepted), "hash-retry@example.test").await;
+        assert_eq!(db.count("verifications").await?, 0);
+        assert_eq!(db.count("sessions").await?, 1);
+        let after = db.tables(&["users", "accounts", "sessions"]).await?;
+        let replay = call(&auth, redeem(&delivery, &[("callbackURL", "")]), 302).await;
+        let location = url::Url::parse(replay.headers.get("location").unwrap())?;
+        assert_eq!(
+            location
+                .query_pairs()
+                .find(|(key, _)| key == "error")
+                .unwrap()
+                .1,
+            "INVALID_TOKEN"
+        );
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, after);
+        B::close(connection).await?;
+    }
+    Ok(())
 }
 
 async fn magic_link_fresh_empty_callback<B: Backend>(db: Db) -> TestResult {
