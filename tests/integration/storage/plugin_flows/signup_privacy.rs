@@ -4,7 +4,10 @@ use super::*;
 use alibi::plugins::phone_number::{PhoneNumberConfig, PhoneNumberPlugin};
 use alibi::plugins::{AdminPlugin, AnonymousPlugin, LastLoginMethodPlugin, TwoFactorPlugin};
 
-backend_tests!(duplicate_signup_preserves_identity_and_filters_synthetic_output);
+backend_tests!(
+    duplicate_signup_preserves_identity_and_filters_synthetic_output,
+    duplicate_privacy_hashes_before_notification_without_replacing_credentials
+);
 postgres_tests!(duplicate_signup_preserves_identity_and_filters_synthetic_output);
 
 async fn duplicate_signup_preserves_identity_and_filters_synthetic_output<B: Backend>(
@@ -162,5 +165,115 @@ async fn duplicate_signup_preserves_identity_and_filters_synthetic_output<B: Bac
         }
     }
     authenticated(&original_auth, &cookies(&owner), "duplicate@example.test").await;
+    B::close(connection).await
+}
+
+async fn duplicate_privacy_hashes_before_notification_without_replacing_credentials<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::{AuthResult, PasswordHasher};
+    struct Crypto(Arc<Mutex<Vec<String>>>);
+    #[async_trait::async_trait]
+    impl PasswordHasher for Crypto {
+        async fn hash(&self, p: &str) -> AuthResult<String> {
+            self.0.lock().unwrap().push(format!("hash:{p}"));
+            super::auth_probe::FastHasher.hash(p).await
+        }
+        async fn verify(&self, h: &str, p: &str) -> AuthResult<bool> {
+            super::auth_probe::FastHasher.verify(h, p).await
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let setup = super::auth_probe::fast_builder::<B>(&connection)
+        .build()
+        .await?;
+    let owner = signup(&setup, "crypto-owner@example.test").await;
+    let foreign = signup(&setup, "crypto-foreign@example.test").await;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "verifications"])
+        .await?;
+    for generic in [false, true] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let notification = events.clone();
+        let customization = events.clone();
+        let expected = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+        let plugin = EmailPasswordPlugin::new()
+            .password_hasher(Arc::new(Crypto(events.clone())))
+            .auto_sign_in(!generic)
+            .on_existing_user_signup(Arc::new(move |user, r| {
+                let events = notification.clone();
+                let id = expected.clone();
+                Box::pin(async move {
+                    assert_eq!(user.id, id);
+                    assert_eq!(user.name.as_deref(), Some("Native owner"));
+                    assert_eq!(r.headers["x-privacy-marker"], "original-request");
+                    assert_eq!(
+                        r.body_as_json::<Value>()?["password"],
+                        "different-password456"
+                    );
+                    events.lock().unwrap().push("existing".into());
+                    Ok(())
+                })
+            }))
+            .custom_synthetic_user(Arc::new(move |c| {
+                customization.lock().unwrap().push("synthetic".into());
+                let mut fields = c.core_fields;
+                _ = fields.insert("id".into(), json!(c.id));
+                Ok(fields)
+            }));
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(plugin)
+            .plugin(SessionManagementPlugin::new())
+            .build()
+            .await?;
+        let mut input = request(
+            "/sign-up/email",
+            Some(
+                json!({"email":"CRYPTO-OWNER@EXAMPLE.TEST","password":"different-password456","name":"Synthetic incoming"}),
+            ),
+            "",
+        );
+        _ = input
+            .headers
+            .insert("x-privacy-marker".into(), "original-request".into());
+        let response = call(&auth, input, if generic { 200 } else { 422 }).await;
+        if generic {
+            assert_eq!(
+                *events.lock().unwrap(),
+                ["hash:different-password456", "existing", "synthetic"]
+            );
+            assert_eq!(body(&response)["token"], Value::Null);
+            let synthetic = body(&response)["user"]["id"].as_str().unwrap().to_owned();
+            assert_ne!(synthetic, body(&owner)["user"]["id"].as_str().unwrap());
+            assert_eq!(
+                db.count_where("SELECT COUNT(*) FROM users WHERE id=$1", &[&synthetic])
+                    .await?,
+                0
+            );
+        } else {
+            assert!(events.lock().unwrap().is_empty());
+        }
+        assert!(!response.headers.contains_key("set-cookie"));
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+    }
+    _ = call(
+        &setup,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"crypto-owner@example.test","password":"different-password456"})),
+            "",
+        ),
+        401,
+    )
+    .await;
+    authenticated(&setup, &cookies(&owner), "crypto-owner@example.test").await;
+    authenticated(&setup, &cookies(&foreign), "crypto-foreign@example.test").await;
     B::close(connection).await
 }
