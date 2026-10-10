@@ -20,6 +20,8 @@ export function createSignupPolicyFixture(database: Database, shared: BetterAuth
     "signup-no-auto",
     "signup-required",
     "signup-custom",
+    "signup-synthetic-id",
+    "signup-synthetic-id-custom",
     "signup-policy",
     "signup-zero-policy",
     "signup-username",
@@ -45,6 +47,8 @@ export function createSignupPolicyFixture(database: Database, shared: BetterAuth
     const autoSignIn = ![
       "signup-no-auto",
       "signup-custom",
+      "signup-synthetic-id",
+      "signup-synthetic-id-custom",
       "signup-username",
       "signup-background",
     ].includes(name);
@@ -195,6 +199,17 @@ export function createSignupPolicyFixture(database: Database, shared: BetterAuth
       ],
       advanced: {
         ...shared.advanced,
+        ...(name.startsWith("signup-synthetic-id")
+          ? {
+              database: {
+                generateId({ model, size }) {
+                  events.push({ stage: "id-generation", model, size: size ?? null });
+                  if (mode === "id-error") throw new Error("application ID failed");
+                  return "synthetic_application_1";
+                },
+              },
+            }
+          : {}),
         ...(name === "signup-background"
           ? {
               backgroundTasks: {
@@ -300,7 +315,7 @@ export function createSignupPolicyFixture(database: Database, shared: BetterAuth
 
           events.push({ stage: "existing-complete" });
         },
-        ...(name === "signup-custom"
+        ...(["signup-custom", "signup-synthetic-id-custom"].includes(name)
           ? {
               customSyntheticUser({ coreFields, additionalFields, id }) {
                 events.push({ stage: "synthetic-user", coreFields, additionalFields, id });
@@ -316,6 +331,7 @@ export function createSignupPolicyFixture(database: Database, shared: BetterAuth
                   });
                 }
 
+                if (name === "signup-synthetic-id-custom") return { ...coreFields, id };
                 return {
                   ...coreFields,
                   id,

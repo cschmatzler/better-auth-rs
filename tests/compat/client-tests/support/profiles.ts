@@ -621,6 +621,8 @@ export const FIXTURE_PROFILES = [
   "signup-no-auto",
   "signup-required",
   "signup-custom",
+  "signup-synthetic-id",
+  "signup-synthetic-id-custom",
   "signup-policy",
   "signup-zero-policy",
   "signup-username",
