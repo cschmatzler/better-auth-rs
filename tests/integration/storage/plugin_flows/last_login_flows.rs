@@ -23,7 +23,8 @@ backend_tests!(
     last_login_resolver_and_cookie_policy,
     last_login_tracks_social_callbacks,
     last_login_resolver_receives_transformed_numbers_and_original_http_bytes,
-    last_login_tracking_update_failure_is_best_effort_for_authentication
+    last_login_tracking_update_failure_is_best_effort_for_authentication,
+    last_login_configured_tracking_cookie_receipt
 );
 
 const COOKIE: &str = "better-auth.last_used_login_method";
@@ -513,4 +514,101 @@ async fn last_login_tracking_update_failure_is_best_effort_for_authentication<B:
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     _ = db.execute("DROP TRIGGER reject_tracking", &[]).await?;
     B::close(connection).await
+}
+
+async fn last_login_configured_tracking_cookie_receipt<B: Backend>(db: Db) -> TestResult {
+    use alibi::config::SameSite;
+    for (age, expected, strict) in [
+        (123.9, Some("123"), false),
+        (0.0, Some("0"), true),
+        (f64::NAN, None, false),
+    ] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        if strict {
+            config.advanced.default_cookie_attributes.same_site = Some(SameSite::Strict);
+        }
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(LastLoginMethodPlugin::with_config(LastLoginMethodConfig {
+                cookie_name: "application.last_login".into(),
+                max_age: age,
+                store_in_database: true,
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let owner = signup(&auth, "tracking-age@example.test").await;
+        let signed = call(
+            &auth,
+            request(
+                "/sign-in/email",
+                Some(json!({"email":"tracking-age@example.test","password":PASSWORD})),
+                "",
+            ),
+            200,
+        )
+        .await;
+        for response in [&owner, &signed] {
+            let headers = response
+                .headers
+                .get_all("set-cookie")
+                .filter(|v| v.starts_with("application.last_login="))
+                .collect::<Vec<_>>();
+            assert_eq!(headers.len(), 1);
+            let raw = headers[0];
+            assert!(raw.starts_with("application.last_login=email;"));
+            assert!(!raw.contains("HttpOnly"));
+            assert!(raw.contains("Path=/"));
+            assert!(raw.contains(if strict {
+                "SameSite=Strict"
+            } else {
+                "SameSite=Lax"
+            }));
+            assert_eq!(
+                raw.split("; ").find_map(|v| v.strip_prefix("Max-Age=")),
+                expected
+            );
+            assert!(
+                !response
+                    .headers
+                    .get_all("set-cookie")
+                    .any(|v| v.starts_with(COOKIE))
+            );
+            authenticated(&auth, &cookies(response), "tracking-age@example.test").await;
+        }
+        assert_eq!(
+            db.text(
+                "SELECT last_login_method FROM users WHERE id=$1",
+                &[body(&owner)["user"]["id"].as_str().unwrap()]
+            )
+            .await?
+            .as_deref(),
+            Some("email")
+        );
+        let before = db.tables(&["users", "accounts", "sessions"]).await?;
+        let rejected = call(
+            &auth,
+            request(
+                "/sign-in/email",
+                Some(json!({"email":"tracking-age@example.test","password":"wrong-password"})),
+                "",
+            ),
+            401,
+        )
+        .await;
+        assert!(
+            !rejected
+                .headers
+                .get_all("set-cookie")
+                .any(|v| v.starts_with("application.last_login="))
+        );
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+        B::close(connection).await?;
+    }
+    Ok(())
 }
