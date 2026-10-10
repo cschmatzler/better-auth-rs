@@ -25,7 +25,8 @@ backend_tests!(
     admin_update_ban_revokes_every_target_browser_and_preserves_foreign_sessions,
     admin_empty_update_authority_order,
     admin_literal_role_input_admission,
-    admin_create_role_selector_precedence
+    admin_create_role_selector_precedence,
+    admin_array_filter_sql_operands
 );
 
 async fn promote<S: AuthSchema>(auth: &Alibi<S>, response: &AuthResponse, role: &str) -> String {
@@ -1554,5 +1555,210 @@ async fn admin_create_role_selector_precedence<B: Backend>(db: Db) -> TestResult
         "create-role-admin@example.test",
     )
     .await;
+    B::close(connection).await
+}
+
+async fn admin_array_filter_sql_operands<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(AdminPlugin::new().roles(roles()))
+        .build()
+        .await?;
+    let names = [
+        "Array Owner",
+        "Array Alpha",
+        "Array Beta",
+        "Array Alpha,Array Beta",
+        "Array %_",
+    ];
+    let mut users = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        users.push(call(&auth,request("/sign-up/email",Some(json!({"email":format!("array-{i}@example.test"),"password":PASSWORD,"name":name})),""),200).await);
+    }
+    _ = promote(&auth, &users[0], "admin").await;
+    let jar = cookies(&users[0]);
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    let make = |field: &str, operator: &str, values: Vec<String>, page: bool, cookie: &str| {
+        let mut input = request("/admin/list-users", None, cookie);
+        let mut query: Vec<(String, String)> = vec![
+            ("sortBy".into(), "name".into()),
+            ("sortDirection".into(), "asc".into()),
+            ("filterField".into(), field.into()),
+            ("filterOperator".into(), operator.into()),
+        ];
+        query.extend(values.into_iter().map(|v| ("filterValue".into(), v)));
+        if page {
+            query.extend([("limit".into(), "1".into()), ("offset".into(), "1".into())]);
+        }
+        input.set_query_pairs(query);
+        input
+    };
+    for (op, values, expected, page) in [
+        (
+            "in",
+            vec![names[1], names[2]],
+            vec![names[1], names[2]],
+            false,
+        ),
+        (
+            "in",
+            vec![names[2], names[1]],
+            vec![names[1], names[2]],
+            false,
+        ),
+        ("in", vec![names[1], names[1]], vec![names[1]], false),
+        (
+            "not_in",
+            vec![names[1], names[2]],
+            vec![names[4], names[3], names[0]],
+            false,
+        ),
+        ("in", vec![names[1], names[2]], vec![names[2]], true),
+    ] {
+        let result = call(
+            &auth,
+            make(
+                "name",
+                op,
+                values.into_iter().map(str::to_owned).collect(),
+                page,
+                &jar,
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(
+            body(&result)["users"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|u| u["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            body(&result)["total"],
+            if page { 2 } else { expected.len() }
+        );
+        if page {
+            assert_eq!(body(&result)["limit"], 1);
+            assert_eq!(body(&result)["offset"], 1);
+        }
+    }
+    for field in ["id", "email"] {
+        let operands = [&users[2], &users[1]]
+            .into_iter()
+            .map(|r| body(r)["user"][field].as_str().unwrap().to_owned())
+            .collect();
+        let result = call(&auth, make(field, "in", operands, false, &jar), 200).await;
+        assert_eq!(
+            body(&result)["users"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|u| u["id"].clone())
+                .collect::<Vec<_>>(),
+            [
+                body(&users[1])["user"]["id"].clone(),
+                body(&users[2])["user"]["id"].clone()
+            ]
+        );
+    }
+    for operator in ["contains", "starts_with", "ends_with"] {
+        let result = call(
+            &auth,
+            make(
+                "name",
+                operator,
+                vec!["array alpha".into(), "array beta".into()],
+                false,
+                &jar,
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(
+            body(&result)["users"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|u| u["name"].clone())
+                .collect::<Vec<_>>(),
+            [json!(names[3])]
+        );
+    }
+    let wildcard = call(
+        &auth,
+        make(
+            "name",
+            "contains",
+            vec!["%".into(), "Array Beta".into()],
+            false,
+            &jar,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(
+        body(&wildcard)["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["name"].clone())
+            .collect::<Vec<_>>(),
+        [json!(names[3])]
+    );
+    let boolean = call(
+        &auth,
+        make(
+            "emailVerified",
+            "in",
+            vec!["0".into(), "0".into()],
+            false,
+            &jar,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&boolean)["total"], 5);
+    for value in ["true", "false", "FALSE", "0"] {
+        let result = call(
+            &auth,
+            make("emailVerified", "not_in", vec![value.into()], false, &jar),
+            200,
+        )
+        .await;
+        assert_eq!(body(&result)["total"], if value == "true" { 5 } else { 0 });
+    }
+    for operator in ["eq", "ne", "lt", "lte", "gt", "gte"] {
+        let result = call(
+            &auth,
+            make(
+                "name",
+                operator,
+                vec![names[1].into(), names[2].into()],
+                true,
+                &jar,
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(body(&result), json!({"users":[],"total":0}));
+    }
+    for (jar, status) in [(String::new(), 401), (cookies(&users[1]), 403)] {
+        _ = call(
+            &auth,
+            make(
+                "name",
+                "in",
+                vec![names[1].into(), names[2].into()],
+                false,
+                &jar,
+            ),
+            status,
+        )
+        .await;
+    }
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
     B::close(connection).await
 }
