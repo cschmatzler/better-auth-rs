@@ -695,6 +695,94 @@ async fn raw_profile_max_age_controls_admission_before_state_consumption<B: Back
     Ok(())
 }
 
+async fn proxy_cache_publication_failure_retains_commit_and_discards_all_cookies<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::{
+        AuthResult, CacheVersionContext, CacheVersionSource, CookieCacheConfig, CookieCacheVersion,
+        CookieCacheVersionResolver,
+    };
+    struct Version;
+    #[async_trait::async_trait]
+    impl CookieCacheVersionResolver for Version {
+        async fn resolve(&self, c: &CacheVersionContext) -> AuthResult<String> {
+            if c.source() == CacheVersionSource::Created {
+                Err(alibi::AuthError::internal("application publication outage"))
+            } else {
+                Ok("v1".into())
+            }
+        }
+    }
+    let mut fixture = Fixture::<B>::with(
+        db,
+        Options {
+            cookie_state: true,
+            shared_secret: false,
+        },
+    )
+    .await;
+    let (authorization, _, browser) = fixture
+        .issue_with("/api/auth/sign-in/social", None, json!({}))
+        .await;
+    let (_, bridge) = fixture.forward(&authorization).await;
+    let first = request(&fixture.preview, &target(&bridge), None, Some(&browser)).await;
+    assert_eq!(first.status, 302);
+    let (authorization, _, browser) = fixture
+        .issue_with("/api/auth/sign-in/social", None, json!({}))
+        .await;
+    let (_, bridge) = fixture.forward(&authorization).await;
+    let mut config = (*fixture.preview.context().config).clone();
+    config.session.cookie_cache = Some(CookieCacheConfig {
+        enabled: true,
+        version: Some(CookieCacheVersion::Resolver(Arc::new(Version))),
+        ..Default::default()
+    });
+    let issuer = authorization.origin().ascii_serialization();
+    fixture.preview = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &fixture._connections.0))
+        .plugin(SessionManagementPlugin::new())
+        .plugin(OAuthPlugin::new().add_provider(
+            "gitlab",
+            OAuthProvider::gitlab_with_issuer("local-client", "local-secret", &issuer),
+        ))
+        .plugin(OAuthProxyPlugin::with_config(OAuthProxyConfig {
+            current_url: Some(PREVIEW.into()),
+            production_url: Some(PRODUCTION.into()),
+            secret: Some(PROXY_SECRET.into()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let users = fixture.preview_db.table("users").await?;
+    let production = rows(&fixture.production_db).await;
+    let count = fixture.preview_db.count("sessions").await?;
+    let failed = request(&fixture.preview, &target(&bridge), None, Some(&browser)).await;
+    assert_eq!(failed.status, 500);
+    assert!(failed.body.is_empty());
+    assert!(failed.headers.get("location").is_none());
+    assert_eq!(failed.headers.get_all("set-cookie").count(), 0);
+    assert_eq!(fixture.preview_db.table("users").await?, users);
+    assert_eq!(fixture.preview_db.count("sessions").await?, count + 1);
+    assert_eq!(fixture.preview_db.count("verifications").await?, 0);
+    let id = fixture
+        .preview_db
+        .text(
+            "SELECT id FROM users WHERE email='proxy-owner@fixture.test'",
+            &[],
+        )
+        .await?
+        .unwrap();
+    assert_eq!(
+        fixture
+            .preview_db
+            .count_where("SELECT COUNT(*) FROM sessions WHERE user_id=$1", &[&id])
+            .await?,
+        2
+    );
+    assert_eq!(rows(&fixture.production_db).await, production);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,7 +792,8 @@ mod tests {
     restored_cookie_state_replays_create_sessions_without_rebinding_owner,
     cookie_state_link_restores_initiating_owner_across_session_change,
     cookie_state_expiry_clears_only_authenticated_matching_proof,
-    raw_profile_max_age_controls_admission_before_state_consumption
+    raw_profile_max_age_controls_admission_before_state_consumption,
+    proxy_cache_publication_failure_retains_commit_and_discards_all_cookies
 );
     postgres_tests!(production_exchange_preserves_rows_then_preview_consumes_state_and_issues_only_the_actual_owner,completion_rejects_foreign_origin_provider_tampering_and_expired_state_before_any_principal_write);
 
