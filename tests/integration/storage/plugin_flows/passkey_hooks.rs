@@ -21,7 +21,8 @@ backend_tests!(
     passkey_authentication_hooks,
     passkey_session_freshness,
     passkey_input_types,
-    passkey_auth_callback_reassignment_keeps_verified_owner
+    passkey_auth_callback_reassignment_keeps_verified_owner,
+    passkey_registration_forces_credential_properties_over_static_false
 );
 
 type Observed = (usize, u32, bool, bool, bool);
@@ -735,5 +736,72 @@ async fn passkey_auth_callback_reassignment_keeps_verified_owner<B: Backend>(db:
     );
     authenticated(&auth, &cookies(&owner), "owner@example.test").await;
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn passkey_registration_forces_credential_properties_over_static_false<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::plugins::passkey::PasskeyExtensions;
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(
+            PasskeyPlugin::new()
+                .origins(vec![ORIGIN.into()])
+                .registration(PasskeyRegistrationConfig {
+                    extensions: Some(PasskeyExtensions::Static(json!({"credProps":false}))),
+                    ..Default::default()
+                })
+                .authentication(PasskeyAuthenticationConfig {
+                    extensions: Some(PasskeyExtensions::Static(
+                        json!({"appid":"https://extensions.fixture.test/static"}),
+                    )),
+                    after_verification: None,
+                }),
+        )
+        .build()
+        .await?;
+    let owner = signup(&auth, "extension-owner@example.test").await;
+    let owner_id = body(&owner)["user"]["id"].clone();
+    let options = call(
+        &auth,
+        request("/passkey/generate-register-options", None, &cookies(&owner)),
+        200,
+    )
+    .await;
+    assert_eq!(body(&options)["extensions"], json!({"credProps":true}));
+    let (key, shape) = keyed(205);
+    let registered = call(&auth,request("/passkey/verify-registration",Some(json!({"response":proof(&key,&shape,&body(&options)["challenge"]),"name":"Extension key"})),&format!("{}; {}",cookies(&owner),cookies(&options))),200).await;
+    assert_eq!(body(&registered)["userId"], owner_id);
+    _ = call(
+        &auth,
+        request("/sign-out", Some(json!({})), &cookies(&owner)),
+        200,
+    )
+    .await;
+    let authentication = call(
+        &auth,
+        request("/passkey/generate-authenticate-options", None, ""),
+        200,
+    )
+    .await;
+    assert_eq!(
+        body(&authentication)["extensions"],
+        json!({"appid":"https://extensions.fixture.test/static"})
+    );
+    let client = json!({"type":"webauthn.get","challenge":body(&authentication)["challenge"],"origin":ORIGIN});
+    let signed_in = call(&auth,request("/passkey/verify-authentication",Some(json!({"response":key.assertion(&client,"localhost",USER_PRESENT|USER_VERIFIED|BACKUP_ELIGIBLE,2)})),&cookies(&authentication)),200).await;
+    let current = body(
+        &call(
+            &auth,
+            request("/get-session", None, &cookies(&signed_in)),
+            200,
+        )
+        .await,
+    );
+    assert_eq!(current["user"]["id"], owner_id);
+    assert_eq!(current["user"]["email"], "extension-owner@example.test");
+    assert_eq!(db.count("passkeys").await?, 1);
+    assert_eq!(db.count("verifications").await?, 0);
     B::close(connection).await
 }
