@@ -20,7 +20,8 @@ backend_tests!(
     organization_plugin_helpers,
     organization_trusted_addition_preserves_literal_role_arrays_and_session_scope,
     fractional_organization_membership_limit_uses_actual_physical_count,
-    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results
+    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results,
+    organization_raw_team_count_quota
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -892,4 +893,122 @@ async fn organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_r
     assert_eq!(policy.seen.lock().unwrap().len(), count);
     assert_eq!(db.count("member").await?, 2);
     B::close(connection).await
+}
+
+async fn organization_raw_team_count_quota<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::OrganizationTeamHooks;
+    use alibi::plugins::organization::extensions::TeamHookContext;
+    use alibi::plugins::organization::extensions::TeamLimitContext;
+    #[derive(Debug)]
+    struct Policy {
+        maximum: Option<f64>,
+        events: Mutex<Vec<&'static str>>,
+    }
+    #[async_trait::async_trait]
+    impl OrganizationLimitResolver for Policy {
+        async fn maximum_teams(&self, c: &TeamLimitContext) -> AuthResult<Option<f64>> {
+            assert_eq!(
+                c.session.as_ref().unwrap().user_id,
+                c.user.as_ref().unwrap().id
+            );
+            assert!(
+                c.request
+                    .as_ref()
+                    .unwrap()
+                    .path
+                    .ends_with("/organization/create-team")
+            );
+            self.events.lock().unwrap().push("quota");
+            Ok(self.maximum)
+        }
+    }
+    #[async_trait::async_trait]
+    impl OrganizationTeamHooks for Policy {
+        async fn before_create(
+            &self,
+            _: &mut alibi::CreateTeam,
+            c: &TeamHookContext,
+        ) -> AuthResult<()> {
+            assert!(c.user.is_some());
+            self.events.lock().unwrap().push("before");
+            Ok(())
+        }
+        async fn after_create(&self, _: &alibi::Team, _: &TeamHookContext) -> AuthResult<()> {
+            self.events.lock().unwrap().push("after");
+            Ok(())
+        }
+    }
+    for resolved in [false, true] {
+        for (maximum, allowed) in [
+            (Some(0.0), 3),
+            (Some(f64::NAN), 3),
+            (Some(1.5), 2),
+            (Some(-1.0), 0),
+            (Some(f64::NEG_INFINITY), 0),
+            (Some(f64::INFINITY), 3),
+            (None, 3),
+        ] {
+            let db = db.fresh().await?;
+            let (connection, _) = db.migrated::<B>(SECRET).await?;
+            let policy = Arc::new(Policy {
+                maximum,
+                events: Mutex::new(Vec::new()),
+            });
+            let auth = super::auth_probe::fast_builder::<B>(&connection)
+                .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                    teams: TeamsConfig {
+                        enabled: true,
+                        create_default_team: false,
+                        maximum_teams: maximum,
+                        limit_resolver: resolved
+                            .then(|| policy.clone() as Arc<dyn OrganizationLimitResolver>),
+                        hooks: Some(policy.clone()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }))
+                .build()
+                .await?;
+            let mut owner = account(&auth, "raw-team-owner@example.test").await;
+            let org = organization(&auth, &mut owner, "raw-team").await;
+            let protected = db
+                .tables(&["users", "accounts", "sessions", "organization", "member"])
+                .await?;
+            for index in 0..3 {
+                policy.events.lock().unwrap().clear();
+                let accepted = index < allowed;
+                let response = call(
+                    &auth,
+                    request(
+                        "/organization/create-team",
+                        Some(json!({"name":format!("Team {index}"),"organizationId":org})),
+                        &owner.cookie,
+                    ),
+                    if accepted { 200 } else { 400 },
+                )
+                .await;
+                if accepted {
+                    assert_eq!(body(&response)["organizationId"], org);
+                } else {
+                    assert_eq!(
+                        body(&response)["code"],
+                        "YOU_HAVE_REACHED_THE_MAXIMUM_NUMBER_OF_TEAMS"
+                    );
+                }
+                let mut expected = if resolved { vec!["quota"] } else { Vec::new() };
+                if accepted {
+                    expected.extend(["before", "after"]);
+                }
+                assert_eq!(*policy.events.lock().unwrap(), expected);
+                assert_eq!(
+                    db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                        .await?,
+                    protected
+                );
+            }
+            assert_eq!(db.count("team").await?, allowed);
+            B::close(connection).await?;
+        }
+    }
+    Ok(())
 }
