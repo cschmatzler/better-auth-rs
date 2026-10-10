@@ -18,7 +18,8 @@ backend_tests!(
     ott_generator_real_endpoint_context,
     ott_verification_cancellation_result,
     ott_positive_custom_expiry,
-    ott_completed_totp_transfer_publication
+    ott_completed_totp_transfer_publication,
+    ott_existing_session_publication_receipt
 );
 
 struct Generator(&'static str);
@@ -904,6 +905,106 @@ async fn ott_completed_totp_transfer_publication<B: Backend>(db: Db) -> TestResu
         &auth,
         &cookies(&foreign),
         "totp-transfer-foreign@example.test",
+    )
+    .await;
+    B::close(connection).await
+}
+
+async fn ott_existing_session_publication_receipt<B: Backend>(db: Db) -> TestResult {
+    fn merge(left: &str, right: &str) -> String {
+        let mut jar = std::collections::BTreeMap::new();
+        for pair in left.split("; ").chain(right.split("; ")) {
+            if let Some((key, value)) = pair.split_once('=') {
+                _ = jar.insert(key.to_owned(), value.to_owned());
+            }
+        }
+        jar.into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let config = AuthConfig::new(SECRET)
+        .base_url(ORIGIN)
+        .session_cookie_cache(CookieCacheConfig {
+            enabled: true,
+            strategy: CookieCacheStrategy::Compact,
+            max_age: 300.0,
+            version: None,
+        });
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(alibi::plugins::MultiSessionPlugin::new())
+        .plugin(OneTimeTokenPlugin::new())
+        .build()
+        .await?;
+    let owner = signup(&auth, "receipt-owner@example.test").await;
+    let foreign = signup(&auth, "receipt-foreign@example.test").await;
+    let sessions = db.table("sessions").await?;
+    let issued = call(
+        &auth,
+        request("/one-time-token/generate", None, &cookies(&owner)),
+        200,
+    )
+    .await;
+    let token = body(&issued)["token"].as_str().unwrap().to_owned();
+    let received = call(
+        &auth,
+        request(
+            "/one-time-token/verify",
+            Some(json!({"token":token})),
+            &cookies(&foreign),
+        ),
+        200,
+    )
+    .await;
+    let receipt = cookies(&received);
+    assert!(receipt.contains("session_data="));
+    let jar = merge(&cookies(&foreign), &receipt);
+    authenticated(&auth, &jar, "receipt-owner@example.test").await;
+    let listed = body(
+        &call(
+            &auth,
+            request("/multi-session/list-device-sessions", None, &jar),
+            200,
+        )
+        .await,
+    );
+    let listed = listed.as_array().unwrap();
+    assert_eq!(listed.len(), 2);
+    for issued in [&owner, &foreign] {
+        assert!(
+            listed
+                .iter()
+                .any(|v| v["session"]["token"] == body(issued)["token"]
+                    && v["user"]["id"] == body(issued)["user"]["id"])
+        );
+    }
+    let selected = call(
+        &auth,
+        request(
+            "/multi-session/set-active",
+            Some(json!({"sessionToken":body(&foreign)["token"]})),
+            &jar,
+        ),
+        200,
+    )
+    .await;
+    authenticated(
+        &auth,
+        &merge(&jar, &cookies(&selected)),
+        "receipt-foreign@example.test",
+    )
+    .await;
+    assert_eq!(db.table("sessions").await?, sessions);
+    assert_eq!(db.count("verifications").await?, 0);
+    _ = call(
+        &auth,
+        request("/one-time-token/verify", Some(json!({"token":token})), ""),
+        400,
     )
     .await;
     B::close(connection).await
