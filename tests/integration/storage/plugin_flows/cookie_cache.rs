@@ -26,7 +26,8 @@ backend_tests!(
     published_snapshot_exposes_public_views_to_response_hooks,
     scoped_cache_chunks_obey_wire_capacity_and_retirement,
     cache_version_issuance_failure_preserves_anonymous_principal,
-    browser_cache_ttl_requires_authenticated_preference
+    browser_cache_ttl_requires_authenticated_preference,
+    cache_raw_and_specific_max_age_keep_distinct_lifetimes
 );
 postgres_tests!(
     every_strategy_serves_reads_from_the_cookie_and_rejects_tampering,
@@ -846,4 +847,78 @@ async fn browser_cache_ttl_requires_authenticated_preference<B: Backend>(db: Db)
         assert_eq!(current, old);
     }
     B::close(connection).await
+}
+
+async fn cache_raw_and_specific_max_age_keep_distinct_lifetimes<B: Backend>(db: Db) -> TestResult {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    for (raw, specific, expected, header) in [
+        (0.0, None, 300_000.0, Some(300)),
+        (f64::NAN, None, 300_000.0, Some(300)),
+        (0.5, None, 500.0, Some(0)),
+        (300.0, Some(0.0), 60_000.0, Some(0)),
+        (300.0, Some(f64::NAN), 60_000.0, None),
+        (300.0, Some(0.5), 500.0, Some(0)),
+        (300.0, Some(17.0), 17_000.0, Some(17)),
+        (300.0, Some(-1.0), -1000.0, None),
+    ] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let mut config = AuthConfig::new(SECRET)
+            .base_url(ORIGIN)
+            .session_cookie_cache(CookieCacheConfig {
+                enabled: true,
+                max_age: raw,
+                ..Default::default()
+            });
+        config.advanced.default_cookie_attributes.max_age = Some(99.0);
+        if let Some(age) = specific {
+            _ = config.advanced.cookies.insert(
+                "session_data".into(),
+                CookieOverride {
+                    name: None,
+                    attributes: CookieAttributes {
+                        max_age: Some(age),
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .build()
+            .await?;
+        let issued = signup(&auth, "age-policy@example.test").await;
+        let data = issued
+            .headers
+            .get_all("set-cookie")
+            .find(|v| v.starts_with("better-auth.session_data="))
+            .unwrap();
+        let value = data.split(';').next().unwrap().split_once('=').unwrap().1;
+        let envelope: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(value)?)?;
+        let ttl = envelope["expiresAt"].as_f64().unwrap()
+            - envelope["session"]["updatedAt"].as_f64().unwrap();
+        assert!(
+            (expected..=expected + 10.0).contains(&ttl),
+            "{raw:?}/{specific:?}: {ttl}"
+        );
+        let max_age = data
+            .split("; ")
+            .find_map(|v| v.strip_prefix("Max-Age="))
+            .map(|v| v.parse::<i64>().unwrap());
+        assert_eq!(max_age, header);
+        let token = issued
+            .headers
+            .get_all("set-cookie")
+            .find(|v| v.starts_with("better-auth.session_token="))
+            .unwrap();
+        assert!(token.contains("; Max-Age=604800;"));
+        assert_eq!(db.count("users").await?, 1);
+        assert_eq!(db.count("accounts").await?, 1);
+        assert_eq!(db.count("sessions").await?, 1);
+        B::close(connection).await?;
+    }
+    Ok(())
 }
