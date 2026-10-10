@@ -359,11 +359,72 @@ fn open(sealed: &str, secret: &str, purpose: &str) -> Value {
     serde_json::from_slice(&plain).unwrap()
 }
 
+async fn empty_query_code_prevents_body_grant_fallback_and_preserves_pending_state<B: Backend>(
+    db: Db,
+) -> TestResult {
+    let fixture = Fixture::<B>::new(db).await;
+    let (authorization, _) = fixture.issue("/api/auth/sign-in/social", None).await;
+    let query: HashMap<_, _> = authorization.query_pairs().into_owned().collect();
+    let original = rows(&fixture.preview_db).await;
+    let production = rows(&fixture.production_db).await;
+    let code = format!("real-code-{}", fixture.provider.lock().unwrap().code);
+    let mut callback = AuthRequest::new(HttpMethod::Post, "/api/auth/callback/gitlab");
+    _ = callback.headers.insert("origin".into(), PREVIEW.into());
+    _ = callback.headers.insert(
+        "content-type".into(),
+        "application/x-www-form-urlencoded".into(),
+    );
+    _ = callback
+        .query
+        .insert("state".into(), query.get("state").unwrap().clone());
+    _ = callback.query.insert("code".into(), String::new());
+    callback.body = Some(
+        url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("code", &code)
+            .finish()
+            .into_bytes(),
+    );
+    let denied = fixture.production.handle_request(callback.clone()).await?;
+    assert_eq!(denied.status, 302);
+    assert!(location(&denied).as_str().contains("error=no_code"));
+    assert!(fixture.provider.lock().unwrap().receipts.is_empty());
+    assert_eq!(rows(&fixture.preview_db).await, original);
+    assert_eq!(rows(&fixture.production_db).await, production);
+    _ = callback.query.insert("code".into(), code.clone());
+    callback.body = Some(b"code=invalid-body-code".to_vec());
+    let forwarded = fixture.production.handle_request(callback).await?;
+    assert_eq!(forwarded.status, 302);
+    let bridge = location(&forwarded);
+    let done = request(&fixture.preview, &target(&bridge), None, None).await;
+    assert_eq!(location(&done).as_str(), format!("{PREVIEW}/new-owner"));
+    assert_eq!(
+        fixture
+            .provider
+            .lock()
+            .unwrap()
+            .receipts
+            .first()
+            .unwrap()
+            .get("form")
+            .unwrap()
+            .get("code")
+            .unwrap()
+            .as_str(),
+        Some(code.as_str())
+    );
+    assert_eq!(fixture.preview_db.count("sessions").await?, 1);
+    assert_eq!(rows(&fixture.production_db).await, production);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
-    backend_tests!(production_exchange_preserves_rows_then_preview_consumes_state_and_issues_only_the_actual_owner,completion_rejects_foreign_origin_provider_tampering_and_expired_state_before_any_principal_write,crafted_profiles_and_forward_errors_redirect_without_principal_writes,proxied_link_social_links_the_signed_in_owner,cookie_state_completion_requires_the_originating_browser,proxied_link_with_a_different_email_redirects_with_the_link_error);
+    backend_tests!(
+    production_exchange_preserves_rows_then_preview_consumes_state_and_issues_only_the_actual_owner,completion_rejects_foreign_origin_provider_tampering_and_expired_state_before_any_principal_write,crafted_profiles_and_forward_errors_redirect_without_principal_writes,proxied_link_social_links_the_signed_in_owner,cookie_state_completion_requires_the_originating_browser,proxied_link_with_a_different_email_redirects_with_the_link_error,
+    empty_query_code_prevents_body_grant_fallback_and_preserves_pending_state
+);
     postgres_tests!(production_exchange_preserves_rows_then_preview_consumes_state_and_issues_only_the_actual_owner,completion_rejects_foreign_origin_provider_tampering_and_expired_state_before_any_principal_write);
 
     #[expect(
