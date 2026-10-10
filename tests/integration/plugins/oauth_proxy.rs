@@ -438,13 +438,124 @@ async fn restored_cookie_state_replays_create_sessions_without_rebinding_owner<B
     Ok(())
 }
 
+async fn cookie_state_link_restores_initiating_owner_across_session_change<B: Backend>(
+    db: Db,
+) -> TestResult {
+    let fixture = Fixture::<B>::with(
+        db,
+        Options {
+            cookie_state: true,
+            shared_secret: false,
+        },
+    )
+    .await;
+    let owner = request(
+        &fixture.preview,
+        "/api/auth/sign-up/email",
+        Some(json!({"email":"proxy-owner@fixture.test","name":"Owner","password":"password123"})),
+        None,
+    )
+    .await;
+    let foreign = request(
+        &fixture.preview,
+        "/api/auth/sign-up/email",
+        Some(json!({"email":"foreign@fixture.test","name":"Foreign","password":"password123"})),
+        None,
+    )
+    .await;
+    assert_eq!((owner.status, foreign.status), (200, 200));
+    let owner_view: Value = serde_json::from_slice(&owner.body)?;
+    let foreign_view: Value = serde_json::from_slice(&foreign.body)?;
+    let (authorization, _, browser) = fixture
+        .issue_with("/api/auth/link-social", Some(&cookies(&owner)), json!({}))
+        .await;
+    let (_, bridge) = fixture.forward(&authorization).await;
+    let before = rows(&fixture.preview_db).await;
+    let production = rows(&fixture.production_db).await;
+    let denied = request(
+        &fixture.preview,
+        &target(&bridge),
+        None,
+        Some(&cookies(&foreign)),
+    )
+    .await;
+    assert!(location(&denied).as_str().contains("error=state_mismatch"));
+    assert_eq!(rows(&fixture.preview_db).await, before);
+    let restored = browser
+        .split("; ")
+        .filter(|x| x.starts_with("better-auth.oauth_state="))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let jar = format!("{}; {restored}", cookies(&foreign));
+    let linked = request(&fixture.preview, &target(&bridge), None, Some(&jar)).await;
+    assert_eq!(linked.status, 302);
+    assert_eq!(
+        location(&linked).as_str(),
+        format!("{PREVIEW}/complete?application=kept")
+    );
+    assert!(
+        !linked
+            .headers
+            .get_all("set-cookie")
+            .any(|x| x.starts_with("better-auth.session_token="))
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&fixture.preview_db.table("users").await?)?,
+        before.get("users").unwrap().clone()
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&fixture.preview_db.table("sessions").await?)?,
+        before.get("sessions").unwrap().clone()
+    );
+    assert_eq!(
+        fixture
+            .preview_db
+            .text(
+                "SELECT user_id FROM accounts WHERE provider_id='gitlab'",
+                &[]
+            )
+            .await?
+            .as_deref(),
+        owner_view.get("user").unwrap().get("id").unwrap().as_str()
+    );
+    let read = request(
+        &fixture.preview,
+        "/api/auth/get-session",
+        None,
+        Some(&cookies(&foreign)),
+    )
+    .await;
+    let view: Value = serde_json::from_slice(&read.body)?;
+    assert_eq!(
+        view.get("user").unwrap().get("id").unwrap(),
+        foreign_view.get("user").unwrap().get("id").unwrap()
+    );
+    assert_eq!(
+        view.get("session").unwrap().get("token").unwrap(),
+        foreign_view.get("token").unwrap()
+    );
+    let after = rows(&fixture.preview_db).await;
+    let replay = request(
+        &fixture.preview,
+        &target(&bridge),
+        None,
+        Some(&cookies(&foreign)),
+    )
+    .await;
+    assert!(location(&replay).as_str().contains("error=state_mismatch"));
+    assert_eq!(rows(&fixture.preview_db).await, after);
+    assert_eq!(rows(&fixture.production_db).await, production);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
     backend_tests!(
     production_exchange_preserves_rows_then_preview_consumes_state_and_issues_only_the_actual_owner,completion_rejects_foreign_origin_provider_tampering_and_expired_state_before_any_principal_write,crafted_profiles_and_forward_errors_redirect_without_principal_writes,proxied_link_social_links_the_signed_in_owner,cookie_state_completion_requires_the_originating_browser,proxied_link_with_a_different_email_redirects_with_the_link_error,
-    restored_cookie_state_replays_create_sessions_without_rebinding_owner
+    restored_cookie_state_replays_create_sessions_without_rebinding_owner,
+    cookie_state_link_restores_initiating_owner_across_session_change
 );
     postgres_tests!(production_exchange_preserves_rows_then_preview_consumes_state_and_issues_only_the_actual_owner,completion_rejects_foreign_origin_provider_tampering_and_expired_state_before_any_principal_write);
 
