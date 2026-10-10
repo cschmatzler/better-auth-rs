@@ -11,7 +11,8 @@ backend_tests!(
     password_length_limits_apply_to_every_new_password_endpoint,
     duplicate_canonical_credentials_keep_first_physical_row_authoritative,
     cookie_emission_failure_preserves_endpoint_commit_stage,
-    username_unicode_identity_admission
+    username_unicode_identity_admission,
+    username_readonly_registration_admission
 );
 postgres_tests!(
     username_signup_lookup_and_denials_share_normalized_identity,
@@ -1016,5 +1017,39 @@ async fn username_unicode_identity_admission<B: Backend>(db: Db) -> TestResult {
     assert_eq!(body(&signed)["user"]["id"], body(&owner)["user"]["id"]);
     assert_eq!(db.table("accounts").await?, accounts);
     authenticated(&auth, &cookies(&signed), "unicode-owner@example.test").await;
+    B::close(connection).await
+}
+
+async fn username_readonly_registration_admission<B: Backend>(db: Db) -> TestResult {
+    use alibi::utils::username::UsernameConfig;
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(
+            super::auth_probe::fast_password()
+                .enable_username(true)
+                .username_config(UsernameConfig {
+                    input: false,
+                    ..Default::default()
+                }),
+        )
+        .plugin(SessionManagementPlugin::new())
+        .build()
+        .await?;
+    let foreign = signup(&auth, "readonly-foreign@example.test").await;
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    let rejected=call(&auth,request("/sign-up/email",Some(json!({"email":"readonly-owner@example.test","password":PASSWORD,"name":"Owner","username":"owner_name"})),""),400).await;
+    assert_eq!(body(&rejected)["code"], "FIELD_NOT_ALLOWED");
+    assert!(!rejected.headers.contains_key("set-cookie"));
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    authenticated(&auth, &cookies(&foreign), "readonly-foreign@example.test").await;
+    let owner = signup(&auth, "readonly-owner@example.test").await;
+    assert_eq!(db.count("users").await?, 2);
+    assert_eq!(db.count("accounts").await?, 2);
+    assert_eq!(db.count("sessions").await?, 2);
+    assert_eq!(body(&owner)["user"]["username"], Value::Null);
+    authenticated(&auth, &cookies(&owner), "readonly-owner@example.test").await;
     B::close(connection).await
 }
