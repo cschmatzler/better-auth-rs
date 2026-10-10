@@ -17,7 +17,8 @@ backend_tests!(
     two_factor_otp_resends_are_consumed_once_across_real_requests,
     two_factor_reenrollment_retains_row_policy,
     two_factor_pending_unverified_totp_backup_recovery,
-    two_factor_account_lock_pending_only_scope
+    two_factor_account_lock_pending_only_scope,
+    two_factor_configured_account_lock_policy
 );
 
 #[derive(Default)]
@@ -1055,4 +1056,166 @@ async fn two_factor_account_lock_pending_only_scope<B: Backend>(db: Db) -> TestR
     assert_eq!(body(&denied)["code"], "ACCOUNT_TEMPORARILY_LOCKED");
     authenticated(&auth, &cookies(&active), "locked@example.test").await;
     B::close(connection).await
+}
+
+async fn two_factor_configured_account_lock_policy<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::two_factor::AccountLockoutConfig;
+    for mode in 0..3 {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(TwoFactorPlugin::with_config(TwoFactorConfig {
+                account_lockout: AccountLockoutConfig {
+                    enabled: mode != 2,
+                    max_failed_attempts: if mode == 1 { 0.0 } else { 2.5 },
+                    duration_seconds: if mode == 1 { 0.0 } else { 600.25 },
+                },
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let signed = signup(&auth, "policy@example.test").await;
+        let id = body(&signed)["user"]["id"].as_str().unwrap().to_owned();
+        let (totp, enrollment, _) = enroll(&auth, &cookies(&signed)).await;
+        let _ = call(
+            &auth,
+            request(
+                "/two-factor/verify-totp",
+                Some(json!({"code":totp.generate_current().to_string()})),
+                &cookies(&signed),
+            ),
+            200,
+        )
+        .await;
+        let pending = sign_in(&auth, "policy@example.test", json!({}), "").await;
+        _ = db
+            .execute(
+                if mode == 1 {
+                    "UPDATE two_factor SET failed_verification_count = NULL"
+                } else {
+                    "UPDATE two_factor SET failed_verification_count = 0.5"
+                },
+                &[],
+            )
+            .await?;
+        let original = auth.store().get_two_factor_by_user_id(&id).await?.unwrap();
+        let mut started = chrono::Utc::now();
+        for _ in 0..if mode == 0 { 2 } else { 1 } {
+            started = chrono::Utc::now();
+            let _ = call(
+                &auth,
+                request(
+                    "/two-factor/verify-totp",
+                    Some(json!({"code":"invalid-code"})),
+                    &cookies(&pending),
+                ),
+                401,
+            )
+            .await;
+        }
+        let finished = chrono::Utc::now();
+        let failed = auth.store().get_two_factor_by_user_id(&id).await?.unwrap();
+        assert_eq!(
+            failed.failed_verification_count,
+            match mode {
+                0 => Some(2.5),
+                1 => None,
+                _ => Some(0.5),
+            }
+        );
+        if mode == 0 {
+            let until = failed.locked_until.unwrap().timestamp_millis();
+            assert!(
+                (started.timestamp_millis() + 600_250..=finished.timestamp_millis() + 600_250)
+                    .contains(&until)
+            );
+            let before = db
+                .tables(&["two_factor", "verifications", "sessions"])
+                .await?;
+            let _ = call(
+                &auth,
+                request(
+                    "/two-factor/verify-backup-code",
+                    Some(json!({"code":enrollment["backupCodes"][0]})),
+                    &cookies(&pending),
+                ),
+                429,
+            )
+            .await;
+            assert_eq!(
+                db.tables(&["two_factor", "verifications", "sessions"])
+                    .await?,
+                before
+            );
+            _ = auth
+                .store()
+                .set_two_factor_lock_if_count_at_least(
+                    &failed.id,
+                    2.5,
+                    chrono::Utc::now() - chrono::Duration::seconds(1),
+                )
+                .await?;
+        } else {
+            assert!(failed.locked_until.is_none());
+        }
+        let completed = call(
+            &auth,
+            request(
+                "/two-factor/verify-totp",
+                Some(json!({"code":totp.generate_current().to_string()})),
+                &cookies(&pending),
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(body(&completed)["user"]["id"], id);
+        let recovered = auth.store().get_two_factor_by_user_id(&id).await?.unwrap();
+        assert_eq!(
+            recovered.failed_verification_count,
+            if mode == 2 { Some(0.5) } else { Some(0.0) }
+        );
+        assert!(recovered.locked_until.is_none());
+        assert_eq!(
+            (recovered.id, recovered.secret, recovered.backup_codes),
+            (original.id, original.secret, original.backup_codes)
+        );
+        if mode == 1 {
+            let next = sign_in(&auth, "policy@example.test", json!({}), "").await;
+            let from = chrono::Utc::now().timestamp_millis();
+            let _ = call(
+                &auth,
+                request(
+                    "/two-factor/verify-totp",
+                    Some(json!({"code":"invalid-code"})),
+                    &cookies(&next),
+                ),
+                401,
+            )
+            .await;
+            let until = auth
+                .store()
+                .get_two_factor_by_user_id(&id)
+                .await?
+                .unwrap()
+                .locked_until
+                .unwrap()
+                .timestamp_millis();
+            assert!((from..=chrono::Utc::now().timestamp_millis()).contains(&until));
+            let _ = call(
+                &auth,
+                request(
+                    "/two-factor/verify-totp",
+                    Some(json!({"code":totp.generate_current().to_string()})),
+                    &cookies(&next),
+                ),
+                200,
+            )
+            .await;
+            let cleared = auth.store().get_two_factor_by_user_id(&id).await?.unwrap();
+            assert_eq!(cleared.failed_verification_count, Some(0.0));
+            assert!(cleared.locked_until.is_none());
+        }
+        B::close(connection).await?;
+    }
+    Ok(())
 }
