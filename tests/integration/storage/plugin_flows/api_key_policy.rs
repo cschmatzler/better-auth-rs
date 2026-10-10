@@ -22,7 +22,8 @@ backend_tests!(
     static_org_update_requires_update_action_and_preserves_key_identity,
     static_org_delete_requires_delete_action_and_revokes_only_selected_key,
     disabled_custom_key_expiration_retains_default_lifetime_through_rename,
-    banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_authority
+    banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_authority,
+    api_key_start_bytes_through_update
 );
 
 fn raw(path: &str, text: &str, cookie: &str) -> AuthRequest {
@@ -1893,5 +1894,96 @@ async fn banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_autho
     assert!(!orphan.headers.contains_key("set-cookie"));
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     authenticated(&auth, &cookies(&admin), "admin@example.test").await;
+    B::close(connection).await
+}
+
+async fn api_key_start_bytes_through_update<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let plugin = ApiKeyPlugin::with_config(ApiKeyConfig {
+        custom_key_generator: Some(Arc::new(Surrogate::default())),
+        starting_characters_length: 1.5,
+        store_starting_characters: true,
+        rate_limit: RateLimitDefaults {
+            enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(plugin.clone())
+        .build()
+        .await?;
+    let owner = signup(&auth, "start-bytes@example.test").await;
+    let created = call(
+        &auth,
+        request(
+            "/api-key/create",
+            Some(json!({"name":"Original"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let issued = body(&created);
+    let id = issued["id"].as_str().unwrap();
+    let start = issued["start"].clone();
+    assert!(start.is_string());
+    assert_eq!(
+        db.text("SELECT HEX(start) FROM api_keys WHERE id=$1", &[id])
+            .await?
+            .as_deref(),
+        Some("EDA0BD")
+    );
+    assert_eq!(
+        db.text("SELECT TYPEOF(start) FROM api_keys WHERE id=$1", &[id])
+            .await?
+            .as_deref(),
+        Some("text")
+    );
+    let mut get = request("/api-key/get", None, &cookies(&owner));
+    get.set_query_pairs([("id", id)]);
+    assert_eq!(body(&call(&auth, get, 200).await)["start"], start);
+    assert_eq!(
+        body(&call(&auth, request("/api-key/list", None, &cookies(&owner)), 200).await)["apiKeys"]
+            [0]["start"],
+        start
+    );
+    let renamed = call(
+        &auth,
+        request(
+            "/api-key/update",
+            Some(json!({"keyId":id,"name":"Renamed"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&renamed)["start"], start);
+    assert_eq!(body(&renamed)["name"], "Renamed");
+    let verified = plugin
+        .verify_api_key(
+            &VerifyApiKey {
+                key: issued["key"].as_str().unwrap(),
+                config_id: Some("default"),
+                permissions: None,
+            },
+            auth.context(),
+        )
+        .await?;
+    assert_eq!(serde_json::to_value(verified)?["start"], start);
+    assert_eq!(
+        db.text("SELECT HEX(start) FROM api_keys WHERE id=$1", &[id])
+            .await?
+            .as_deref(),
+        Some("EDA0BD")
+    );
+    assert_eq!(
+        db.text("SELECT TYPEOF(start) FROM api_keys WHERE id=$1", &[id])
+            .await?
+            .as_deref(),
+        Some("text")
+    );
+    assert_eq!(db.count("api_keys").await?, 1);
+    authenticated(&auth, &cookies(&owner), "start-bytes@example.test").await;
     B::close(connection).await
 }
