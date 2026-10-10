@@ -23,7 +23,8 @@ backend_tests!(
     managed_jwt_signer_issues_and_verifies_cache_tokens,
     update_user_refreshes_the_cache_and_invalid_sessions_clear_every_cookie_family,
     pending_factor_challenge_clears_cache_cookies_including_incoming_chunks,
-    published_snapshot_exposes_public_views_to_response_hooks
+    published_snapshot_exposes_public_views_to_response_hooks,
+    browser_cache_ttl_requires_authenticated_preference
 );
 postgres_tests!(
     every_strategy_serves_reads_from_the_cookie_and_rejects_tampering,
@@ -483,4 +484,117 @@ async fn published_snapshot_exposes_public_views_to_response_hooks<B: Backend>(
     assert_eq!(seen[0]["email"], "observer@example.test");
     assert_eq!(seen[0]["token"], body(&issued)["token"]);
     Ok(())
+}
+
+async fn browser_cache_ttl_requires_authenticated_preference<B: Backend>(db: Db) -> TestResult {
+    use base64::{
+        Engine,
+        engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    };
+    use hkdf::hmac::{Hmac, KeyInit, Mac};
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let config = AuthConfig::new(SECRET)
+        .base_url(ORIGIN)
+        .session_cookie_cache(CookieCacheConfig {
+            enabled: true,
+            max_age: 300.0,
+            ..Default::default()
+        });
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .build()
+        .await?;
+    _ = signup(&auth, "browser-ttl@example.test").await;
+    let signed = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(
+                json!({"email":"browser-ttl@example.test","password":PASSWORD,"rememberMe":false}),
+            ),
+            "",
+        ),
+        200,
+    )
+    .await;
+    for raw in signed.headers.get_all("set-cookie") {
+        assert!(!raw.contains("Max-Age="));
+        assert!(!raw.contains("Expires="));
+    }
+    let jar = cookies(&signed);
+    let encoded = jar
+        .split("; ")
+        .find_map(|v| v.strip_prefix("better-auth.session_data="))
+        .unwrap();
+    let envelope: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?;
+    let ttl = envelope["expiresAt"].as_f64().unwrap()
+        - envelope["session"]["updatedAt"].as_f64().unwrap();
+    assert!((60_000.0..=60_010.0).contains(&ttl));
+    let preference = jar
+        .split("; ")
+        .find_map(|v| v.strip_prefix("better-auth.dont_remember="))
+        .unwrap();
+    let encoded_pair = format!("v={preference}");
+    let decoded = url::form_urlencoded::parse(encoded_pair.as_bytes())
+        .next()
+        .unwrap()
+        .1
+        .into_owned();
+    let (payload, signature) = decoded.rsplit_once('.').unwrap();
+    assert_eq!(payload, "true");
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(SECRET.as_bytes())?;
+    mac.update(b"true");
+    mac.verify_slice(&STANDARD.decode(signature)?)?;
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    let token = jar
+        .split("; ")
+        .find(|v| v.starts_with("better-auth.session_token="))
+        .unwrap();
+    let invalid = call(
+        &auth,
+        request(
+            "/get-session",
+            None,
+            &format!("{token}; better-auth.dont_remember=true.invalid"),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&invalid)["user"]["id"], body(&signed)["user"]["id"]);
+    let renewed = cookies(&invalid);
+    let encoded = renewed
+        .split("; ")
+        .find_map(|v| v.strip_prefix("better-auth.session_data="))
+        .unwrap();
+    let envelope: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?;
+    let ttl = envelope["expiresAt"].as_f64().unwrap()
+        - envelope["session"]["updatedAt"].as_f64().unwrap();
+    assert!((300_000.0..=300_010.0).contains(&ttl));
+    assert_eq!(db.tables(&["users", "accounts"]).await?, before[..2]);
+    let before_sessions: Vec<Value> = serde_json::from_str(&before[2])?;
+    let after_sessions: Vec<Value> = serde_json::from_str(&db.table("sessions").await?)?;
+    assert_eq!(before_sessions.len(), after_sessions.len());
+    for mut old in before_sessions {
+        let mut current = after_sessions
+            .iter()
+            .find(|s| s["id"] == old["id"])
+            .unwrap()
+            .clone();
+        if old["token"] == body(&signed)["token"] {
+            let old_expiry: chrono::DateTime<chrono::Utc> =
+                old["expires_at"].as_str().unwrap().parse()?;
+            let renewed_expiry: chrono::DateTime<chrono::Utc> =
+                current["expires_at"].as_str().unwrap().parse()?;
+            assert!(renewed_expiry > old_expiry + chrono::Duration::days(5));
+            for key in ["expires_at", "updated_at"] {
+                _ = old.as_object_mut().unwrap().remove(key);
+                _ = current.as_object_mut().unwrap().remove(key);
+            }
+        }
+        assert_eq!(current, old);
+    }
+    B::close(connection).await
 }
