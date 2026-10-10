@@ -22,7 +22,8 @@ backend_tests!(
     static_org_update_requires_update_action_and_preserves_key_identity,
     static_org_delete_requires_delete_action_and_revokes_only_selected_key,
     disabled_custom_key_expiration_retains_default_lifetime_through_rename,
-    banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_authority
+    banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_authority,
+    api_key_secondary_sdk_delete_index_scope
 );
 
 fn raw(path: &str, text: &str, cookie: &str) -> AuthRequest {
@@ -1894,4 +1895,221 @@ async fn banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_autho
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     authenticated(&auth, &cookies(&admin), "admin@example.test").await;
     B::close(connection).await
+}
+
+async fn api_key_secondary_sdk_delete_index_scope<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{CacheAdapter, MemoryCacheAdapter};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest as _, Sha256};
+    struct ApplicationStorage {
+        cache: MemoryCacheAdapter,
+        writes: Mutex<Vec<(String, Option<i64>)>>,
+        keys: Mutex<std::collections::BTreeSet<String>>,
+        fail_get: Mutex<Option<String>>,
+    }
+    impl ApplicationStorage {
+        fn new() -> Self {
+            Self {
+                cache: MemoryCacheAdapter::new(),
+                writes: Mutex::new(Vec::new()),
+                keys: Mutex::new(Default::default()),
+                fail_get: Mutex::new(None),
+            }
+        }
+        async fn snapshot(&self) -> AuthResult<std::collections::BTreeMap<String, String>> {
+            let keys = self
+                .keys
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut snapshot = std::collections::BTreeMap::new();
+            for key in keys {
+                if let Some(value) = self.cache.get(&key).await? {
+                    _ = snapshot.insert(key, value);
+                }
+            }
+            Ok(snapshot)
+        }
+    }
+    #[async_trait::async_trait]
+    impl ApiKeyStorage for ApplicationStorage {
+        async fn get(&self, key: &str) -> AuthResult<Option<String>> {
+            if self
+                .fail_get
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|prefix| key.starts_with(prefix))
+            {
+                return Err(AuthError::internal("Application key storage unavailable"));
+            }
+            self.cache.get(key).await
+        }
+        async fn set(
+            &self,
+            key: &str,
+            value: &str,
+            ttl: Option<chrono::Duration>,
+        ) -> AuthResult<()> {
+            _ = self.keys.lock().unwrap().insert(key.into());
+            self.writes
+                .lock()
+                .unwrap()
+                .push((key.into(), ttl.map(|ttl| ttl.num_seconds())));
+            match ttl {
+                Some(ttl) => self.cache.set(key, value, ttl).await,
+                None => self.cache.set_without_expiry(key, value).await,
+            }
+        }
+        async fn delete(&self, key: &str) -> AuthResult<()> {
+            self.cache.delete(key).await
+        }
+    }
+    fn indices(key: &Value) -> [String; 3] {
+        [
+            format!(
+                "api-key:{}",
+                URL_SAFE_NO_PAD.encode(Sha256::digest(key["key"].as_str().unwrap().as_bytes()))
+            ),
+            format!("api-key:by-id:{}", key["id"].as_str().unwrap()),
+            format!("api-key:by-ref:{}", key["referenceId"].as_str().unwrap()),
+        ]
+    }
+
+    for fallback in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let storage = Arc::new(ApplicationStorage::new());
+        let plugin = ApiKeyPlugin::with_config(ApiKeyConfig {
+            storage: ApiKeyStorageMode::SecondaryStorage,
+            custom_storage: Some(storage.clone()),
+            fallback_to_database: fallback,
+            defer_updates: false,
+            rate_limit: RateLimitDefaults {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(plugin.clone())
+            .build()
+            .await?;
+        let owner = signup(&auth, "delete-index-owner@example.test").await;
+        let foreign = signup(&auth, "delete-index-foreign@example.test").await;
+        let selected = body(
+            &call(
+                &auth,
+                request(
+                    "/api-key/create",
+                    Some(json!({"name":"Selected"})),
+                    &cookies(&owner),
+                ),
+                200,
+            )
+            .await,
+        );
+        let sibling = body(
+            &call(
+                &auth,
+                request(
+                    "/api-key/create",
+                    Some(json!({"name":"Sibling"})),
+                    &cookies(&owner),
+                ),
+                200,
+            )
+            .await,
+        );
+        let other = body(
+            &call(
+                &auth,
+                request(
+                    "/api-key/create",
+                    Some(json!({"name":"Foreign"})),
+                    &cookies(&foreign),
+                ),
+                200,
+            )
+            .await,
+        );
+        _ = call(&auth, request("/api-key/list", None, &cookies(&owner)), 200).await;
+        _ = call(
+            &auth,
+            request("/api-key/list", None, &cookies(&foreign)),
+            200,
+        )
+        .await;
+        let before = storage.snapshot().await?;
+        let protected = db.tables(&["users", "accounts", "sessions"]).await?;
+        _ = call(
+            &auth,
+            request(
+                "/api-key/delete",
+                Some(json!({"keyId":selected["id"]})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+        let after = storage.snapshot().await?;
+        let selected_indices = indices(&selected);
+        let sibling_indices = indices(&sibling);
+        let other_indices = indices(&other);
+        assert!(!after.contains_key(&selected_indices[0]));
+        assert!(!after.contains_key(&selected_indices[1]));
+        for index in &sibling_indices[..2] {
+            assert_eq!(after.get(index), before.get(index));
+        }
+        for index in &other_indices {
+            assert_eq!(after.get(index), before.get(index));
+        }
+        if fallback {
+            assert!(!after.contains_key(&selected_indices[2]));
+            assert_eq!(db.count("api_keys").await?, 2);
+        } else {
+            assert_eq!(
+                serde_json::from_str::<Vec<String>>(after.get(&selected_indices[2]).unwrap())?,
+                [sibling["id"].as_str().unwrap()]
+            );
+            assert_eq!(db.count("api_keys").await?, 0);
+        }
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions"]).await?,
+            protected
+        );
+        assert!(
+            plugin
+                .verify_api_key(
+                    &VerifyApiKey {
+                        key: selected["key"].as_str().unwrap(),
+                        config_id: Some("default"),
+                        permissions: None
+                    },
+                    auth.context()
+                )
+                .await
+                .is_err()
+        );
+        for key in [&sibling, &other] {
+            assert_eq!(
+                plugin
+                    .verify_api_key(
+                        &VerifyApiKey {
+                            key: key["key"].as_str().unwrap(),
+                            config_id: Some("default"),
+                            permissions: None
+                        },
+                        auth.context()
+                    )
+                    .await?
+                    .id,
+                key["id"].as_str().unwrap()
+            );
+        }
+        B::close(connection).await?;
+    }
+    Ok(())
 }
