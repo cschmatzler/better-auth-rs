@@ -16,7 +16,8 @@ backend_tests!(
     ott_new_session_callback_failures_preserve_committed_authentication,
     ott_redemption_hasher_retry,
     ott_generator_real_endpoint_context,
-    ott_verification_cancellation_result
+    ott_verification_cancellation_result,
+    ott_positive_custom_expiry
 );
 
 struct Generator(&'static str);
@@ -697,6 +698,88 @@ async fn ott_verification_cancellation_result<B: Backend>(db: Db) -> TestResult 
         db.tables(&["users", "accounts", "sessions", "verifications"])
             .await?,
         before
+    );
+    B::close(connection).await
+}
+
+async fn ott_positive_custom_expiry<B: Backend>(db: Db) -> TestResult {
+    use alibi::AuthVerification;
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = fast_builder::<B>(&connection)
+        .plugin(OneTimeTokenPlugin::with_config(OneTimeTokenConfig {
+            expires_in: Duration::seconds(3),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let owner = signup(&auth, "ttl-owner@example.test").await;
+    let foreign = signup(&auth, "ttl-foreign@example.test").await;
+    let protected = db.tables(&["users", "accounts", "sessions"]).await?;
+    let started = chrono::Utc::now();
+    let issued = call(
+        &auth,
+        request("/one-time-token/generate", None, &cookies(&owner)),
+        200,
+    )
+    .await;
+    let finished = chrono::Utc::now();
+    let token = body(&issued)["token"].as_str().unwrap().to_owned();
+    let proof = auth
+        .store()
+        .get_latest_verification_by_identifier(&format!("one-time-token:{token}"))
+        .await?
+        .unwrap();
+    assert_eq!(proof.value(), body(&owner)["token"].as_str().unwrap());
+    let expiry = proof.expires_at().timestamp_millis();
+    assert!(expiry >= started.timestamp_millis() + 3000);
+    assert!(expiry <= finished.timestamp_millis() + 3000);
+    let live = call(
+        &auth,
+        request("/one-time-token/generate", None, &cookies(&owner)),
+        200,
+    )
+    .await;
+    let live = body(&live)["token"].as_str().unwrap().to_owned();
+    let redeemed = call(
+        &auth,
+        request(
+            "/one-time-token/verify",
+            Some(json!({"token":live})),
+            &cookies(&foreign),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&redeemed)["user"]["id"], body(&owner)["user"]["id"]);
+    _ = call(
+        &auth,
+        request("/one-time-token/verify", Some(json!({"token":live})), ""),
+        400,
+    )
+    .await;
+    db.set_timestamp(
+        "verifications",
+        "expires_at",
+        ("id", proof.id().as_ref()),
+        chrono::Utc::now() - Duration::seconds(1),
+    )
+    .await?;
+    let expired = call(
+        &auth,
+        request("/one-time-token/verify", Some(json!({"token":token})), ""),
+        400,
+    )
+    .await;
+    assert_eq!(body(&expired)["message"], "Invalid token");
+    assert!(!expired.headers.contains_key("set-cookie"));
+    assert_eq!(
+        body(&call(&auth, request("/get-session", None, ""), 200).await),
+        Value::Null
+    );
+    assert_eq!(db.count("verifications").await?, 0);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        protected
     );
     B::close(connection).await
 }
