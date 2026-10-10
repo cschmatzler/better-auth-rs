@@ -18,7 +18,8 @@ backend_tests!(
     verification_expired_transformed_fallback,
     verification_cache_before_veto,
     verification_reservation_logical_primary,
-    verification_find_cleanup_snapshot
+    verification_find_cleanup_snapshot,
+    verification_update_sibling_authority
 );
 postgres_tests!(
     identity_policy_admits_mutations_and_isolates_concurrent_requests,
@@ -1031,4 +1032,166 @@ async fn verification_find_cleanup_snapshot<B: Backend>(db: Db) -> TestResult {
         B::close(connection).await?;
     }
     Ok(())
+}
+
+async fn verification_update_sibling_authority<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{
+        CacheAdapter, DatabaseHookContext, DatabaseHooks, HookBackend, HookControl,
+        MemoryCacheAdapter,
+    };
+    use alibi::verification::{VerificationCreation, VerificationSnapshot};
+    struct Mutation(Arc<Mutex<Vec<Value>>>);
+    #[async_trait]
+    impl<S: AuthSchema, H: HookBackend> DatabaseHooks<S, H> for Mutation {
+        async fn before_update_verification(
+            &self,
+            id: &str,
+            patch: &mut UpdateVerification,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<HookControl> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(json!({"before":id,"value":patch.value}));
+            patch.value = Some("trusted-update".into());
+            Ok(HookControl::Continue)
+        }
+        async fn after_update_verification_record(
+            &self,
+            row: Option<&VerificationSnapshot>,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<()> {
+            let value = row
+                .map(|v| serde_json::to_value(v.data()))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            self.0.lock().unwrap().push(json!({"after":value}));
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let cache = Arc::new(MemoryCacheAdapter::new());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut config = AuthConfig::new(SECRET);
+    config.verification.secondary_storage = Some(cache.clone());
+    config.verification.store_in_database = true;
+    config.verification.store_identifier.default = VerificationIdentifierStrategy::Custom(
+        Arc::new(IdentifierHasher(Arc::new(AtomicBool::new(false)))),
+    );
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::hook(
+            B::store(Arc::new(config), &connection),
+            Mutation(events.clone()),
+        ))
+        .build()
+        .await?;
+    let old =
+        chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")?.with_timezone(&chrono::Utc);
+    for index in 0..2 {
+        _ = auth
+            .context()
+            .verifications()
+            .create(VerificationCreation {
+                id: Some(format!("sibling-{index}")),
+                identifier: "owner".into(),
+                value: format!("old-{index}"),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
+                created_at: old,
+                updated_at: old,
+            })
+            .await?;
+    }
+    _ = auth
+        .store()
+        .create_verification(CreateVerification {
+            identifier: "owner".into(),
+            value: "legacy-plain".into(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
+        })
+        .await?;
+    let before = db.table("verifications").await?;
+    let changed = auth
+        .context()
+        .verifications()
+        .update(
+            "owner",
+            UpdateVerification {
+                value: Some("original-patch".into()),
+                ..Default::default()
+            },
+        )
+        .await?
+        .unwrap();
+    assert_eq!(changed.value()?, "trusted-update");
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM verifications WHERE identifier=$1 AND value=$2",
+            &["application:owner", "trusted-update"]
+        )
+        .await?,
+        2
+    );
+    for id in ["sibling-0", "sibling-1"] {
+        let row = auth
+            .store()
+            .get_latest_verification_by_identifier("application:owner")
+            .await?
+            .unwrap();
+        use alibi::AuthVerification;
+        assert!(row.updated_at() > old);
+        assert_eq!(
+            db.text("SELECT value FROM verifications WHERE id=$1", &[id])
+                .await?
+                .as_deref(),
+            Some("trusted-update")
+        );
+    }
+    let before: Value = serde_json::from_str(&before)?;
+    let after: Value = serde_json::from_str(&db.table("verifications").await?)?;
+    assert_eq!(
+        before
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["identifier"] == "owner"),
+        after
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["identifier"] == "owner")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            &cache.get("verification:application:owner").await?.unwrap()
+        )?["value"],
+        "original-patch"
+    );
+    let absent = auth
+        .context()
+        .verifications()
+        .update(
+            "absent",
+            UpdateVerification {
+                value: Some("absent-patch".into()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(absent.is_none());
+    let receipts = events.lock().unwrap().clone();
+    assert_eq!(receipts.len(), 4);
+    assert_eq!(
+        receipts[0],
+        json!({"before":"application:owner","value":"original-patch"})
+    );
+    assert_eq!(receipts[1]["after"]["value"], "trusted-update");
+    assert_eq!(receipts[3], json!({"after":null}));
+    assert_eq!(db.count("verifications").await?, 3);
+    assert!(
+        cache
+            .get("verification:application:absent")
+            .await?
+            .is_none()
+    );
+    B::close(connection).await
 }
