@@ -20,7 +20,8 @@ backend_tests!(
     organization_plugin_helpers,
     organization_trusted_addition_preserves_literal_role_arrays_and_session_scope,
     fractional_organization_membership_limit_uses_actual_physical_count,
-    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results
+    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results,
+    organization_physical_membership_pages
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -892,4 +893,90 @@ async fn organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_r
     assert_eq!(policy.seen.lock().unwrap().len(), count);
     assert_eq!(db.count("member").await?, 2);
     B::close(connection).await
+}
+
+async fn organization_physical_membership_pages<B: Backend>(db: Db) -> TestResult {
+    use alibi::CreateMember;
+    for limit in [100, 2, 1, 0] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let setup = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(OrganizationPlugin::new())
+            .build()
+            .await?;
+        let mut older = account(&setup, "page-older@example.test").await;
+        let mut newer = account(&setup, "page-newer@example.test").await;
+        let target = account(&setup, "page-target@example.test").await;
+        let old = organization(&setup, &mut older, "page-old").await;
+        let new = organization(&setup, &mut newer, "page-new").await;
+        for org in [&new, &old, &new] {
+            _ = setup
+                .store()
+                .create_member(CreateMember {
+                    organization_id: org.clone(),
+                    user_id: target.id.clone(),
+                    role: "member".into(),
+                })
+                .await?;
+        }
+        let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        config.advanced.database.default_find_many_limit = limit;
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+                organization_limit: Some(2.5),
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let listed = body(
+            &call(
+                &auth,
+                request("/organization/list", None, &target.cookie),
+                200,
+            )
+            .await,
+        );
+        let ids = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        let expected = [new.as_str(), old.as_str(), new.as_str()];
+        assert_eq!(ids, expected[..limit.min(3)]);
+        let before = db
+            .tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?;
+        let response = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Paged quota","slug":"page-quota"})),
+                &target.cookie,
+            ),
+            if limit == 100 { 403 } else { 200 },
+        )
+        .await;
+        if limit == 100 {
+            assert_eq!(
+                body(&response)["code"],
+                "YOU_HAVE_REACHED_THE_MAXIMUM_NUMBER_OF_ORGANIZATIONS"
+            );
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions", "organization", "member"])
+                    .await?,
+                before
+            );
+        } else {
+            assert_eq!(db.count("organization").await?, 3);
+            assert_eq!(db.count("member").await?, 6);
+            assert_eq!(body(&response)["members"][0]["userId"], target.id);
+        }
+        B::close(connection).await?;
+    }
+    Ok(())
 }
