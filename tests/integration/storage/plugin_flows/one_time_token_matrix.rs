@@ -14,6 +14,10 @@ backend_tests!(
     one_time_token_issuance_and_redemption_policies,
     one_time_token_server_endpoints_publish_cached_identity,
     ott_new_session_callback_failures_preserve_committed_authentication,
+    ott_redemption_hasher_retry,
+    ott_generator_real_endpoint_context,
+    ott_verification_cancellation_result,
+    ott_positive_custom_expiry,
     ott_completed_totp_transfer_publication
 );
 
@@ -396,6 +400,389 @@ async fn ott_new_session_callback_failures_preserve_committed_authentication<B: 
         }
     }
     Ok(())
+}
+
+async fn ott_redemption_hasher_retry<B: Backend>(db: Db) -> TestResult {
+    struct Hash(Mutex<u8>);
+    #[async_trait]
+    impl HashOneTimeToken for Hash {
+        async fn hash(&self, token: &str) -> AuthResult<String> {
+            match *self.0.lock().unwrap() {
+                1 => Err(AuthError::internal("private hashing outage")),
+                2 => Err(AuthError::Upstream {
+                    status: 403,
+                    code: "OTT_VETO",
+                    message: "OTT callback veto",
+                }),
+                _ => Ok(format!("digest-{token}")),
+            }
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let hash = Arc::new(Hash(Mutex::new(0)));
+    let auth = fast_builder::<B>(&connection)
+        .plugin(OneTimeTokenPlugin::with_config(OneTimeTokenConfig {
+            storage: OneTimeTokenStorage::Custom(hash.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let owner = signup(&auth, "retry-owner@example.test").await;
+    let foreign = signup(&auth, "retry-foreign@example.test").await;
+    let generated = call(
+        &auth,
+        request("/one-time-token/generate", None, &cookies(&owner)),
+        200,
+    )
+    .await;
+    let token = body(&generated)["token"].as_str().unwrap().to_owned();
+    let before = db
+        .tables(&["users", "accounts", "sessions", "verifications"])
+        .await?;
+    assert_eq!(
+        db.text(
+            "SELECT value FROM verifications WHERE identifier=$1",
+            &[&format!("one-time-token:digest-{token}")]
+        )
+        .await?,
+        Some(body(&owner)["token"].as_str().unwrap().to_owned())
+    );
+    for mode in [1, 2] {
+        *hash.0.lock().unwrap() = mode;
+        let denied = call(
+            &auth,
+            request(
+                "/one-time-token/verify",
+                Some(json!({"token":token})),
+                &cookies(&foreign),
+            ),
+            if mode == 1 { 500 } else { 403 },
+        )
+        .await;
+        if mode == 1 {
+            assert!(denied.body.is_empty());
+        } else {
+            assert_eq!(
+                body(&denied),
+                json!({"code":"OTT_VETO","message":"OTT callback veto"})
+            );
+        }
+        assert!(!denied.headers.contains_key("set-cookie"));
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+    }
+    *hash.0.lock().unwrap() = 0;
+    let accepted = call(
+        &auth,
+        request(
+            "/one-time-token/verify",
+            Some(json!({"token":token})),
+            &cookies(&foreign),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&accepted)["session"]["token"], body(&owner)["token"]);
+    authenticated(&auth, &cookies(&accepted), "retry-owner@example.test").await;
+    assert_eq!(db.count("verifications").await?, 0);
+    let replay = call(
+        &auth,
+        request("/one-time-token/verify", Some(json!({"token":token})), ""),
+        400,
+    )
+    .await;
+    assert_eq!(body(&replay)["message"], "Invalid token");
+    assert_eq!(db.table("sessions").await?, before[2]);
+    authenticated(&auth, &cookies(&foreign), "retry-foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn ott_generator_real_endpoint_context<B: Backend>(db: Db) -> TestResult {
+    struct Generator(Mutex<Vec<(OneTimeTokenSession, Option<AuthRequest>)>>);
+    #[async_trait]
+    impl GenerateOneTimeToken for Generator {
+        async fn generate(
+            &self,
+            s: &OneTimeTokenSession,
+            r: Option<&AuthRequest>,
+        ) -> AuthResult<String> {
+            self.0.lock().unwrap().push((s.clone(), r.cloned()));
+            Ok(if r.is_some() {
+                "physical-transfer"
+            } else {
+                "server-transfer"
+            }
+            .into())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let generator = Arc::new(Generator(Mutex::new(Vec::new())));
+    let auth = fast_builder::<B>(&connection)
+        .plugin(OneTimeTokenPlugin::with_config(OneTimeTokenConfig {
+            generator: Some(generator.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let owner = signup(&auth, "context-owner@example.test").await;
+    let foreign = signup(&auth, "context-foreign@example.test").await;
+    let sessions = db.table("sessions").await?;
+    let mut input =
+        request("/one-time-token/generate", None, &cookies(&owner)).with_url(url::Url::parse(
+            &format!("{ORIGIN}/api/auth/one-time-token/generate?physical=1"),
+        )?);
+    _ = input
+        .headers
+        .insert("x-ott-marker".into(), "callback-http".into());
+    let physical = call(&auth, input, 200).await;
+    assert_eq!(body(&physical)["token"], "physical-transfer");
+    let server = auth
+        .dispatch_endpoint(
+            OneTimeTokenPlugin::generate_endpoint(),
+            EndpointOptions {
+                headers: Some([("cookie".into(), cookies(&owner))].into()),
+                ..Default::default()
+            },
+        )
+        .await?
+        .decode()?;
+    assert_eq!(server.token, "server-transfer");
+    let receipts = generator.0.lock().unwrap().clone();
+    assert_eq!(receipts.len(), 2);
+    for (s, _) in &receipts {
+        assert_eq!(s.user.id, body(&owner)["user"]["id"].as_str().unwrap());
+        assert_eq!(s.session.token, body(&owner)["token"].as_str().unwrap());
+    }
+    let physical = receipts[0].1.as_ref().unwrap();
+    assert_eq!(physical.method, HttpMethod::Get);
+    assert!(physical.path.ends_with("/one-time-token/generate"));
+    assert_eq!(physical.headers["x-ott-marker"], "callback-http");
+    assert_eq!(
+        physical.url().unwrap().path(),
+        "/api/auth/one-time-token/generate"
+    );
+    assert!(receipts[1].1.is_none());
+    for token in ["physical-transfer", "server-transfer"] {
+        assert_eq!(
+            db.text(
+                "SELECT value FROM verifications WHERE identifier=$1",
+                &[&format!("one-time-token:{token}")]
+            )
+            .await?
+            .as_deref(),
+            Some(receipts[0].0.session.token.as_str())
+        );
+        let redeemed = call(
+            &auth,
+            request(
+                "/one-time-token/verify",
+                Some(json!({"token":token})),
+                &cookies(&foreign),
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(body(&redeemed)["session"]["token"], body(&owner)["token"]);
+    }
+    assert_eq!(db.table("sessions").await?, sessions);
+    assert_eq!(db.count("verifications").await?, 0);
+    B::close(connection).await
+}
+
+async fn ott_verification_cancellation_result<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{DatabaseHookContext, DatabaseHooks, HookBackend, HookControl};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    #[derive(Clone)]
+    struct Veto {
+        cancel: Arc<AtomicBool>,
+        seen: Arc<Mutex<Vec<(String, String)>>>,
+    }
+    #[async_trait]
+    impl<S: AuthSchema, H: HookBackend> DatabaseHooks<S, H> for Veto {
+        async fn before_create_verification(
+            &self,
+            v: &mut alibi::CreateVerification,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<HookControl> {
+            if v.identifier.starts_with("one-time-token:") {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((v.identifier.clone(), v.value.clone()));
+                if self.cancel.load(Ordering::SeqCst) {
+                    return Ok(HookControl::Cancel);
+                }
+            }
+            Ok(HookControl::Continue)
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let veto = Arc::new(Veto {
+        cancel: Arc::new(AtomicBool::new(true)),
+        seen: Arc::new(Mutex::new(Vec::new())),
+    });
+    let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::hook(
+            B::store(Arc::new(config), &connection),
+            veto.as_ref().clone(),
+        ))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(OneTimeTokenPlugin::new())
+        .build()
+        .await?;
+    let owner = signup(&auth, "cancel-owner@example.test").await;
+    let foreign = signup(&auth, "cancel-foreign@example.test").await;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "verifications"])
+        .await?;
+    let issued = call(
+        &auth,
+        request("/one-time-token/generate", None, &cookies(&owner)),
+        200,
+    )
+    .await;
+    let token = body(&issued)["token"].as_str().unwrap().to_owned();
+    assert!(!token.is_empty());
+    assert_eq!(
+        *veto.seen.lock().unwrap(),
+        [(
+            format!("one-time-token:{token}"),
+            body(&owner)["token"].as_str().unwrap().to_owned()
+        )]
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "verifications"])
+            .await?,
+        before
+    );
+    let denied = call(
+        &auth,
+        request(
+            "/one-time-token/verify",
+            Some(json!({"token":token})),
+            &cookies(&foreign),
+        ),
+        400,
+    )
+    .await;
+    assert_eq!(body(&denied)["message"], "Invalid token");
+    assert!(!denied.headers.contains_key("set-cookie"));
+    veto.cancel.store(false, Ordering::SeqCst);
+    let live = call(
+        &auth,
+        request("/one-time-token/generate", None, &cookies(&owner)),
+        200,
+    )
+    .await;
+    let live = body(&live)["token"].as_str().unwrap().to_owned();
+    assert_eq!(db.count("verifications").await?, 1);
+    let accepted = call(
+        &auth,
+        request("/one-time-token/verify", Some(json!({"token":live})), ""),
+        200,
+    )
+    .await;
+    assert_eq!(body(&accepted)["session"]["token"], body(&owner)["token"]);
+    _ = call(
+        &auth,
+        request("/one-time-token/verify", Some(json!({"token":live})), ""),
+        400,
+    )
+    .await;
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "verifications"])
+            .await?,
+        before
+    );
+    B::close(connection).await
+}
+
+async fn ott_positive_custom_expiry<B: Backend>(db: Db) -> TestResult {
+    use alibi::AuthVerification;
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = fast_builder::<B>(&connection)
+        .plugin(OneTimeTokenPlugin::with_config(OneTimeTokenConfig {
+            expires_in: Duration::seconds(3),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let owner = signup(&auth, "ttl-owner@example.test").await;
+    let foreign = signup(&auth, "ttl-foreign@example.test").await;
+    let protected = db.tables(&["users", "accounts", "sessions"]).await?;
+    let started = chrono::Utc::now();
+    let issued = call(
+        &auth,
+        request("/one-time-token/generate", None, &cookies(&owner)),
+        200,
+    )
+    .await;
+    let finished = chrono::Utc::now();
+    let token = body(&issued)["token"].as_str().unwrap().to_owned();
+    let proof = auth
+        .store()
+        .get_latest_verification_by_identifier(&format!("one-time-token:{token}"))
+        .await?
+        .unwrap();
+    assert_eq!(proof.value(), body(&owner)["token"].as_str().unwrap());
+    let expiry = proof.expires_at().timestamp_millis();
+    assert!(expiry >= started.timestamp_millis() + 3000);
+    assert!(expiry <= finished.timestamp_millis() + 3000);
+    let live = call(
+        &auth,
+        request("/one-time-token/generate", None, &cookies(&owner)),
+        200,
+    )
+    .await;
+    let live = body(&live)["token"].as_str().unwrap().to_owned();
+    let redeemed = call(
+        &auth,
+        request(
+            "/one-time-token/verify",
+            Some(json!({"token":live})),
+            &cookies(&foreign),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&redeemed)["user"]["id"], body(&owner)["user"]["id"]);
+    _ = call(
+        &auth,
+        request("/one-time-token/verify", Some(json!({"token":live})), ""),
+        400,
+    )
+    .await;
+    db.set_timestamp(
+        "verifications",
+        "expires_at",
+        ("id", proof.id().as_ref()),
+        chrono::Utc::now() - Duration::seconds(1),
+    )
+    .await?;
+    let expired = call(
+        &auth,
+        request("/one-time-token/verify", Some(json!({"token":token})), ""),
+        400,
+    )
+    .await;
+    assert_eq!(body(&expired)["message"], "Invalid token");
+    assert!(!expired.headers.contains_key("set-cookie"));
+    assert_eq!(
+        body(&call(&auth, request("/get-session", None, ""), 200).await),
+        Value::Null
+    );
+    assert_eq!(db.count("verifications").await?, 0);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        protected
+    );
+    B::close(connection).await
 }
 
 async fn ott_completed_totp_transfer_publication<B: Backend>(db: Db) -> TestResult {
