@@ -20,7 +20,8 @@ backend_tests!(
     organization_plugin_helpers,
     organization_trusted_addition_preserves_literal_role_arrays_and_session_scope,
     fractional_organization_membership_limit_uses_actual_physical_count,
-    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results
+    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results,
+    organization_creation_policy_principal
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -891,5 +892,155 @@ async fn organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_r
     );
     assert_eq!(policy.seen.lock().unwrap().len(), count);
     assert_eq!(db.count("member").await?, 2);
+    B::close(connection).await
+}
+
+async fn organization_creation_policy_principal<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::OrganizationCreationPolicy;
+    #[derive(Debug)]
+    struct Policy {
+        reached: std::sync::atomic::AtomicBool,
+        events: Mutex<Vec<(&'static str, String)>>,
+    }
+    #[async_trait::async_trait]
+    impl OrganizationCreationPolicy for Policy {
+        async fn allow_creation(&self, user: &UserView) -> AuthResult<Option<bool>> {
+            self.events.lock().unwrap().push(("allow", user.id.clone()));
+            Ok(Some(user.name.as_deref() == Some("Paid")))
+        }
+        async fn limit_reached(&self, user: &UserView) -> AuthResult<Option<bool>> {
+            self.events.lock().unwrap().push(("limit", user.id.clone()));
+            Ok(Some(self.reached.load(std::sync::atomic::Ordering::SeqCst)))
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let policy = Arc::new(Policy {
+        reached: std::sync::atomic::AtomicBool::new(false),
+        events: Mutex::new(Vec::new()),
+    });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            creation_policy: Some(policy.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let free = account(&auth, "creation-free@example.test").await;
+    let paid = account(&auth, "creation-paid@example.test").await;
+    _ = db
+        .execute("UPDATE users SET name='Paid' WHERE id=$1", &[&paid.id])
+        .await?;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    assert_eq!(
+        body(
+            &call(
+                &auth,
+                request(
+                    "/organization/create",
+                    Some(json!({"name":"Free denied","slug":"free-denied","userId":paid.id})),
+                    &free.cookie
+                ),
+                403
+            )
+            .await
+        )["code"],
+        "YOU_ARE_NOT_ALLOWED_TO_CREATE_A_NEW_ORGANIZATION"
+    );
+    assert_eq!(*policy.events.lock().unwrap(), [("allow", free.id.clone())]);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?,
+        before
+    );
+    policy.events.lock().unwrap().clear();
+    let accepted = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Paid allowed","slug":"paid-allowed","userId":free.id})),
+            &paid.cookie,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&accepted)["members"][0]["userId"], paid.id);
+    assert_eq!(
+        *policy.events.lock().unwrap(),
+        [("allow", paid.id.clone()), ("limit", paid.id.clone())]
+    );
+    policy.events.lock().unwrap().clear();
+    policy
+        .reached
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let before = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    _ = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Paid capped","slug":"paid-capped"})),
+            &paid.cookie,
+        ),
+        403,
+    )
+    .await;
+    assert_eq!(
+        *policy.events.lock().unwrap(),
+        [("allow", paid.id.clone()), ("limit", paid.id.clone())]
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?,
+        before
+    );
+    policy
+        .reached
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    policy.events.lock().unwrap().clear();
+    let sessions = db.table("sessions").await?;
+    let input = serde_json::from_value(
+        json!({"name":"Trusted free","slug":"trusted-free","userId":free.id}),
+    )?;
+    let created = Box::pin(auth.dispatch_endpoint(
+        OrganizationPlugin::create_endpoint(&input, Some(&free.id))?,
+        EndpointOptions::default(),
+    ))
+    .await?
+    .decode()?;
+    assert_eq!(
+        serde_json::to_value(created)?["members"][0]["userId"],
+        free.id
+    );
+    assert_eq!(
+        *policy.events.lock().unwrap(),
+        [("allow", free.id.clone()), ("limit", free.id.clone())]
+    );
+    assert_eq!(db.table("sessions").await?, sessions);
+    policy
+        .reached
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let before = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    let rejected = Box::pin(auth.dispatch_endpoint(
+        OrganizationPlugin::create_endpoint(
+            &serde_json::from_value(
+                json!({"name":"Trusted capped","slug":"trusted-capped","userId":free.id}),
+            )?,
+            Some(&free.id),
+        )?,
+        EndpointOptions::default(),
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(rejected.error.status_code(), 403);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?,
+        before
+    );
     B::close(connection).await
 }
