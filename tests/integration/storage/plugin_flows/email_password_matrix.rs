@@ -13,7 +13,8 @@ use async_trait::async_trait;
 backend_tests!(
     email_password_switches_and_sign_in_guards,
     email_password_signup_without_session_hides_rejections,
-    email_password_username_and_verification_flows
+    email_password_username_and_verification_flows,
+    missing_credential_signin_hashes_once_without_verifier_or_session
 );
 
 struct Deny;
@@ -281,5 +282,74 @@ async fn email_password_username_and_verification_flows<B: Backend>(db: Db) -> T
         B::close(connection).await?;
     }
     trace.assert("email-password/username-and-verification");
+    Ok(())
+}
+
+async fn missing_credential_signin_hashes_once_without_verifier_or_session<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::PasswordHasher;
+    struct Crypto(Mutex<Vec<(bool, String)>>);
+    #[async_trait]
+    impl PasswordHasher for Crypto {
+        async fn hash(&self, p: &str) -> AuthResult<String> {
+            self.0.lock().unwrap().push((false, p.into()));
+            super::auth_probe::FastHasher.hash(p).await
+        }
+        async fn verify(&self, h: &str, p: &str) -> AuthResult<bool> {
+            self.0.lock().unwrap().push((true, p.into()));
+            super::auth_probe::FastHasher.verify(h, p).await
+        }
+    }
+    for mode in ["unknown", "null", "empty", "removed"] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let crypto = Arc::new(Crypto(Mutex::new(Vec::new())));
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(EmailPasswordPlugin::new().password_hasher(crypto.clone()))
+            .plugin(SessionManagementPlugin::new())
+            .build()
+            .await?;
+        let owner = signup(&auth, "dummy-owner@example.test").await;
+        let foreign = signup(&auth, "dummy-foreign@example.test").await;
+        let id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+        match mode {
+            "null" => {
+                _ = db
+                    .execute("UPDATE accounts SET password=NULL WHERE user_id=$1", &[&id])
+                    .await?;
+            }
+            "empty" => {
+                _ = db
+                    .execute("UPDATE accounts SET password='' WHERE user_id=$1", &[&id])
+                    .await?;
+            }
+            "removed" => {
+                _ = db
+                    .execute("DELETE FROM accounts WHERE user_id=$1", &[&id])
+                    .await?;
+            }
+            _ => {}
+        }
+        let before = db
+            .tables(&["users", "accounts", "sessions", "verifications"])
+            .await?;
+        crypto.0.lock().unwrap().clear();
+        let denied=call(&auth,request("/sign-in/email",Some(json!({"email":if mode=="unknown"{"dummy-missing@example.test"}else{"dummy-owner@example.test"},"password":"short"})),""),401).await;
+        assert_eq!(body(&denied)["code"], "INVALID_EMAIL_OR_PASSWORD");
+        assert!(!denied.headers.contains_key("set-cookie"));
+        assert_eq!(*crypto.0.lock().unwrap(), [(false, "short".into())]);
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+        authenticated(&auth, &cookies(&owner), "dummy-owner@example.test").await;
+        authenticated(&auth, &cookies(&foreign), "dummy-foreign@example.test").await;
+        B::close(connection).await?;
+    }
     Ok(())
 }
