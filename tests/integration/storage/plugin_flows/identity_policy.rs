@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 backend_tests!(
     identity_policy_admits_mutations_and_isolates_concurrent_requests,
     provider_admission_distinguishes_creation_returning_and_linking,
-    verification_identifier_policy_preserves_logical_access_and_failure_atomicity
+    verification_identifier_policy_preserves_logical_access_and_failure_atomicity,
+    verification_retirement_cache_delete_failure
 );
 postgres_tests!(
     identity_policy_admits_mutations_and_isolates_concurrent_requests,
@@ -463,6 +464,162 @@ async fn provider_admission_distinguishes_creation_returning_and_linking<B: Back
             UserValidationAction::LinkAccount,
             UserValidationAction::LinkAccount
         ]
+    );
+    B::close(connection).await
+}
+
+async fn verification_retirement_cache_delete_failure<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{
+        CacheAdapter, DatabaseHookContext, DatabaseHooks, HookBackend, MemoryCacheAdapter,
+    };
+    struct Cache {
+        inner: MemoryCacheAdapter,
+        fail: AtomicBool,
+        deleted: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl CacheAdapter for Cache {
+        async fn get(&self, k: &str) -> AuthResult<Option<String>> {
+            self.inner.get(k).await
+        }
+        async fn set(&self, k: &str, v: &str, t: chrono::Duration) -> AuthResult<()> {
+            self.inner.set(k, v, t).await
+        }
+        async fn get_and_delete(&self, k: &str) -> AuthResult<Option<String>> {
+            self.inner.get_and_delete(k).await
+        }
+        async fn delete(&self, k: &str) -> AuthResult<()> {
+            self.deleted.lock().unwrap().push(k.into());
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(AuthError::internal("application cache delete failed"));
+            }
+            self.inner.delete(k).await
+        }
+        async fn exists(&self, k: &str) -> AuthResult<bool> {
+            self.inner.exists(k).await
+        }
+        async fn expire(&self, k: &str, t: chrono::Duration) -> AuthResult<()> {
+            self.inner.expire(k, t).await
+        }
+        async fn clear(&self) -> AuthResult<()> {
+            self.inner.clear().await
+        }
+    }
+    struct After {
+        raw: super::super::Raw,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+    #[async_trait]
+    impl<S: AuthSchema, H: HookBackend> DatabaseHooks<S, H> for After {
+        async fn after_delete_verification(
+            &self,
+            _: &S::Verification,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<()> {
+            let count = self
+                .raw
+                .count_where(
+                    "SELECT COUNT(*) FROM verifications WHERE identifier=$1",
+                    &["application:retire-owner"],
+                )
+                .await
+                .map_err(|e| AuthError::internal(e.to_string()))?;
+            assert_eq!(count, 0);
+            self.events.lock().unwrap().push("retired");
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let cache = Arc::new(Cache {
+        inner: MemoryCacheAdapter::new(),
+        fail: AtomicBool::new(false),
+        deleted: Mutex::new(Vec::new()),
+    });
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut config = AuthConfig::new(SECRET);
+    config.verification.secondary_storage = Some(cache.clone());
+    config.verification.store_in_database = true;
+    config.verification.store_identifier.default = VerificationIdentifierStrategy::Custom(
+        Arc::new(IdentifierHasher(Arc::new(AtomicBool::new(false)))),
+    );
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::hook(
+            B::store(Arc::new(config), &connection),
+            After {
+                raw: db.raw.clone(),
+                events: events.clone(),
+            },
+        ))
+        .build()
+        .await?;
+    _ = auth
+        .context()
+        .verifications()
+        .create(CreateVerification {
+            identifier: "retire-owner".into(),
+            value: "actual-proof".into(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
+        })
+        .await?;
+    let key = "verification:application:retire-owner";
+    let raw = cache.get(key).await?.unwrap();
+    cache
+        .set(
+            "verification:retire-owner",
+            &raw,
+            chrono::Duration::minutes(10),
+        )
+        .await?;
+    _ = auth
+        .store()
+        .create_verification(CreateVerification {
+            identifier: "foreign".into(),
+            value: "untouched".into(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
+        })
+        .await?;
+    cache.fail.store(true, Ordering::SeqCst);
+    assert!(
+        auth.context()
+            .verifications()
+            .consume("retire-owner")
+            .await
+            .is_err()
+    );
+    assert_eq!(db.count("verifications").await?, 1);
+    assert_eq!(*events.lock().unwrap(), ["retired"]);
+    assert_eq!(cache.get(key).await?.as_deref(), Some(raw.as_str()));
+    assert_eq!(
+        cache.get("verification:retire-owner").await?.as_deref(),
+        Some(raw.as_str())
+    );
+    let mut attempts = cache.deleted.lock().unwrap().clone();
+    attempts.sort();
+    assert_eq!(
+        attempts,
+        [
+            "verification:application:retire-owner",
+            "verification:retire-owner"
+        ]
+    );
+    cache.fail.store(false, Ordering::SeqCst);
+    assert!(
+        auth.context()
+            .verifications()
+            .consume("retire-owner")
+            .await?
+            .is_none()
+    );
+    assert_eq!(cache.get(key).await?.as_deref(), Some(raw.as_str()));
+    assert_eq!(cache.deleted.lock().unwrap().len(), 2);
+    assert_eq!(
+        db.text(
+            "SELECT value FROM verifications WHERE identifier=$1",
+            &["foreign"]
+        )
+        .await?
+        .as_deref(),
+        Some("untouched")
     );
     B::close(connection).await
 }
