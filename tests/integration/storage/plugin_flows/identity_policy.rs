@@ -16,7 +16,8 @@ backend_tests!(
     verification_identifier_policy_preserves_logical_access_and_failure_atomicity,
     verification_trusted_create_cache_key,
     verification_expired_transformed_fallback,
-    verification_cache_before_veto
+    verification_cache_before_veto,
+    verification_reservation_logical_primary
 );
 postgres_tests!(
     identity_policy_admits_mutations_and_isolates_concurrent_requests,
@@ -821,5 +822,104 @@ async fn verification_cache_before_veto<B: Backend>(db: Db) -> TestResult {
     assert_eq!(db.table("verifications").await?, before);
     assert!(cache.get("verification:application:owner").await?.is_none());
     assert_eq!(*events.lock().unwrap(), ["update", "delete"]);
+    B::close(connection).await
+}
+
+async fn verification_reservation_logical_primary<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{
+        CacheAdapter, DatabaseHookContext, DatabaseHooks, HookBackend, HookControl,
+        MemoryCacheAdapter,
+    };
+    use alibi::verification::{VerificationCreation, VerificationSnapshot};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest, Sha256};
+    struct Calls(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait]
+    impl<S: AuthSchema, H: HookBackend> DatabaseHooks<S, H> for Calls {
+        async fn before_create_verification_record(
+            &self,
+            _: &mut VerificationCreation,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<HookControl> {
+            _ = self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(HookControl::Continue)
+        }
+        async fn after_create_verification_record(
+            &self,
+            _: &VerificationSnapshot,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<()> {
+            _ = self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let cache = Arc::new(MemoryCacheAdapter::new());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut config = AuthConfig::new(SECRET);
+    config.verification.secondary_storage = Some(cache.clone());
+    config.verification.store_in_database = true;
+    config.verification.store_identifier.default = VerificationIdentifierStrategy::Hashed;
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::hook(
+            B::store(Arc::new(config.clone()), &connection),
+            Calls(calls.clone()),
+        ))
+        .build()
+        .await?;
+    let expiry = chrono::Utc::now() + chrono::Duration::minutes(5);
+    let candidate = || CreateVerification {
+        identifier: "logical-reservation".into(),
+        value: "reservation-proof".into(),
+        expires_at: expiry,
+    };
+    assert!(auth.context().verifications().reserve(candidate()).await?);
+    config.verification.store_identifier.default = VerificationIdentifierStrategy::Plain;
+    let alternate = AuthBuilder::new(config.clone())
+        .store(B::hook(
+            B::store(Arc::new(config.clone()), &connection),
+            Calls(calls.clone()),
+        ))
+        .build()
+        .await?;
+    assert!(
+        !alternate
+            .context()
+            .verifications()
+            .reserve(candidate())
+            .await?
+    );
+    let id = URL_SAFE_NO_PAD.encode(Sha256::digest(b"reserve:logical-reservation"));
+    let identifier = URL_SAFE_NO_PAD.encode(Sha256::digest(b"logical-reservation"));
+    assert_eq!(db.count("verifications").await?, 1);
+    assert_eq!(
+        db.text("SELECT identifier FROM verifications WHERE id=$1", &[&id])
+            .await?,
+        Some(identifier.clone())
+    );
+    let key = format!("verification:{identifier}");
+    let raw = cache.get(&key).await?.unwrap();
+    let actual: Value = serde_json::from_str(&raw)?;
+    assert_eq!(
+        actual,
+        json!({"id":id,"identifier":identifier,"value":"reservation-proof","expiresAt":expiry.to_rfc3339_opts(chrono::SecondsFormat::Millis,true)})
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let before = db.table("verifications").await?;
+    config.verification.store_in_database = false;
+    let cache_only = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .build()
+        .await?;
+    assert!(
+        cache_only
+            .context()
+            .verifications()
+            .reserve(candidate())
+            .await
+            .is_err()
+    );
+    assert_eq!(db.table("verifications").await?, before);
+    assert_eq!(cache.get(&key).await?.unwrap(), raw);
     B::close(connection).await
 }
