@@ -19,7 +19,8 @@ backend_tests!(
     processed_invitation_cancellation_keeps_members_and_original_callback_status,
     organization_invitation_raw_quota,
     organization_invitation_raw_expiry,
-    organization_invitation_delivery_await_policy
+    organization_invitation_delivery_await_policy,
+    organization_invitation_page_before_expiry
 );
 
 #[derive(Debug, Default)]
@@ -1180,4 +1181,110 @@ async fn organization_invitation_delivery_await_policy<B: Backend>(db: Db) -> Te
         B::close(connection).await?;
     }
     Ok(())
+}
+
+async fn organization_invitation_page_before_expiry<B: Backend>(db: Db) -> TestResult {
+    let organization = OrganizationConfig::default();
+
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let config = {
+        let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        config.advanced.database.default_find_many_limit = 1;
+        config
+    };
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(OrganizationPlugin::with_config(organization))
+        .build()
+        .await?;
+    let owner = signup(&auth, "invitation-life-owner@example.test").await;
+    let foreign = signup(&auth, "invitation-life-foreign@example.test").await;
+    let target = signup(&auth, "invitation-life-target@example.test").await;
+    let created = call(
+        &auth,
+        request(
+            "/organization/create",
+            Some(json!({"name":"Life","slug":"invitation-life"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let org = body(&created)["id"].as_str().unwrap().to_owned();
+    let jar = merge(&cookies(&owner), &cookies(&created));
+
+    let expired = auth
+        .store()
+        .create_invitation(alibi::CreateInvitation::new(
+            &org,
+            "page-recipient@example.test",
+            "member",
+            body(&owner)["user"]["id"].as_str().unwrap(),
+            chrono::Utc::now() - chrono::Duration::days(1),
+        ))
+        .await?;
+    let before = db
+        .tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "team",
+            "team_member",
+        ])
+        .await?;
+    let mut ids = vec![expired.id.clone()];
+    for _ in 0..2 {
+        let response=call(&auth,request("/organization/invite-member",Some(json!({"organizationId":org,"email":"page-recipient@example.test","role":"member"})),&jar),200).await;
+        let id = body(&response)["id"].as_str().unwrap().to_owned();
+        assert!(!ids.contains(&id));
+        ids.push(id);
+    }
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM invitation WHERE organization_id=$1 AND status='pending'",
+            &[&org]
+        )
+        .await?,
+        3
+    );
+    assert_eq!(
+        auth.store()
+            .get_invitation_by_id(&expired.id)
+            .await?
+            .unwrap(),
+        expired
+    );
+    let mut query = request("/organization/list-invitations", None, &jar);
+    _ = query.query.insert("organizationId".into(), org.clone());
+    let listed = call(&auth, query, 200).await;
+    assert_eq!(body(&listed).as_array().unwrap().len(), 1);
+    assert_eq!(body(&listed)[0]["id"], expired.id);
+    assert_eq!(
+        db.tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "member",
+            "team",
+            "team_member"
+        ])
+        .await?,
+        before
+    );
+    authenticated(
+        &auth,
+        &cookies(&foreign),
+        "invitation-life-foreign@example.test",
+    )
+    .await;
+    authenticated(
+        &auth,
+        &cookies(&target),
+        "invitation-life-target@example.test",
+    )
+    .await;
+    B::close(connection).await
 }
