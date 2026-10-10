@@ -13,7 +13,8 @@ use chrono::Duration;
 backend_tests!(
     one_time_token_issuance_and_redemption_policies,
     one_time_token_server_endpoints_publish_cached_identity,
-    ott_new_session_callback_failures_preserve_committed_authentication
+    ott_new_session_callback_failures_preserve_committed_authentication,
+    ott_completed_totp_transfer_publication
 );
 
 struct Generator(&'static str);
@@ -395,4 +396,128 @@ async fn ott_new_session_callback_failures_preserve_committed_authentication<B: 
         }
     }
     Ok(())
+}
+
+async fn ott_completed_totp_transfer_publication<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = fast_builder::<B>(&connection)
+        .plugin(alibi::plugins::TwoFactorPlugin::new())
+        .plugin(OneTimeTokenPlugin::with_config(OneTimeTokenConfig {
+            set_ott_header_on_new_session: true,
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let owner = signup(&auth, "totp-transfer-owner@example.test").await;
+    let foreign = signup(&auth, "totp-transfer-foreign@example.test").await;
+    let enrolled = call(
+        &auth,
+        request(
+            "/two-factor/enable",
+            Some(json!({"password":PASSWORD})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let authenticator = totp_rs::Totp::from_url(body(&enrolled)["totpURI"].as_str().unwrap())?;
+    let activated = call(
+        &auth,
+        request(
+            "/two-factor/verify-totp",
+            Some(json!({"code":authenticator.generate_current().to_string()})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    authenticated(
+        &auth,
+        &cookies(&activated),
+        "totp-transfer-owner@example.test",
+    )
+    .await;
+    let pending = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"totp-transfer-owner@example.test","password":PASSWORD})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&pending)["twoFactorRedirect"], true);
+    assert!(!pending.headers.contains_key("set-ott"));
+    let rejected = call(
+        &auth,
+        request(
+            "/two-factor/verify-totp",
+            Some(json!({"code":"not-a-code"})),
+            &cookies(&pending),
+        ),
+        401,
+    )
+    .await;
+    assert!(!rejected.headers.contains_key("set-ott"));
+    let completed = call(
+        &auth,
+        request(
+            "/two-factor/verify-totp",
+            Some(json!({"code":authenticator.generate_current().to_string()})),
+            &cookies(&pending),
+        ),
+        200,
+    )
+    .await;
+    let ott = completed.headers.get("set-ott").unwrap().to_string();
+    let session = body(
+        &call(
+            &auth,
+            request("/get-session", None, &cookies(&completed)),
+            200,
+        )
+        .await,
+    );
+    assert_eq!(session["user"]["id"], body(&owner)["user"]["id"]);
+    assert_eq!(
+        db.text(
+            "SELECT value FROM verifications WHERE identifier=$1",
+            &[&format!("one-time-token:{ott}")]
+        )
+        .await?,
+        Some(session["session"]["token"].as_str().unwrap().to_owned())
+    );
+    let sessions = db.table("sessions").await?;
+    let received = call(
+        &auth,
+        request(
+            "/one-time-token/verify",
+            Some(json!({"token":ott})),
+            &cookies(&foreign),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&received)["session"], session["session"]);
+    authenticated(
+        &auth,
+        &cookies(&received),
+        "totp-transfer-owner@example.test",
+    )
+    .await;
+    _ = call(
+        &auth,
+        request("/one-time-token/verify", Some(json!({"token":ott})), ""),
+        400,
+    )
+    .await;
+    assert_eq!(db.table("sessions").await?, sessions);
+    authenticated(
+        &auth,
+        &cookies(&foreign),
+        "totp-transfer-foreign@example.test",
+    )
+    .await;
+    B::close(connection).await
 }
