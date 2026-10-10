@@ -18,6 +18,7 @@ backend_tests!(
     id_token_sign_in_outcomes,
     callback_protocol_outcomes,
     sign_in_policies,
+    valid_form_post_preserves_issued_state_and_escaped_query_until_get,
     different_email_opt_in_links_unlinks_and_relinks_original_owner
 );
 
@@ -589,6 +590,135 @@ async fn sign_in_policies<B: Backend>(db: Db) -> TestResult {
     );
     trace.assert("social/sign-in-policies");
     B::close(connection).await
+}
+
+async fn valid_form_post_preserves_issued_state_and_escaped_query_until_get<B: Backend>(
+    db: Db,
+) -> TestResult {
+    for mode in ["valid", "query-overrides", "missing-state", "wrong-state"] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let social = Social::start().await;
+        let auth = social
+            .auth::<B>(&connection, AccountConfig::default(), |_| {})
+            .await?;
+        let (state, cookie) = authorize(
+            &auth,
+            "/sign-in/social",
+            json!({"provider":"google","callbackURL":"/dashboard"}),
+            "",
+        )
+        .await;
+        let before = db
+            .tables(&["users", "accounts", "sessions", "verifications"])
+            .await?;
+        let code = "form :+&=/%é";
+        let user = json!({"name":{"firstName":"Élodie &","lastName":"Form <Owner>"},"email":"social@example.com"}).to_string();
+        let mut form = url::form_urlencoded::Serializer::new(String::new());
+        _ = form.append_pair("code", code).append_pair("user", &user);
+        if mode != "missing-state" {
+            _ = form.append_pair(
+                "state",
+                if mode == "valid" {
+                    &state
+                } else {
+                    "unissued-state"
+                },
+            );
+        }
+        let mut posted = request("/callback/google", None, &cookie);
+        posted.method = HttpMethod::Post;
+        posted.body = Some(form.finish().into_bytes());
+        _ = posted.headers.insert(
+            "content-type".into(),
+            "application/x-www-form-urlencoded".into(),
+        );
+        if mode == "query-overrides" {
+            posted.set_query_pairs([("code", "query-code"), ("state", &state)]);
+        }
+        let redirect = call(&auth, posted, 302).await;
+        let location = url::Url::parse(redirect.headers.get("location").unwrap())?;
+        assert_eq!(location.path(), "/api/auth/callback/google");
+        let fields: std::collections::BTreeMap<_, _> =
+            location.query_pairs().into_owned().collect();
+        assert_eq!(fields.get("user"), Some(&user));
+        let expected_code = if mode == "query-overrides" {
+            "query-code"
+        } else {
+            code
+        };
+        assert_eq!(fields.get("code").map(String::as_str), Some(expected_code));
+        assert_eq!(
+            fields.get("state").map(String::as_str),
+            match mode {
+                "missing-state" => None,
+                "wrong-state" => Some("unissued-state"),
+                _ => Some(state.as_str()),
+            }
+        );
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+        assert!(social.provider.take().is_empty());
+        let mut followed = request("/callback/google", None, &cookie);
+        followed.set_query_pairs(location.query_pairs());
+        let completed = call(&auth, followed, 302).await;
+        let negative = matches!(mode, "missing-state" | "wrong-state");
+        let accepted = if negative {
+            let error = url::Url::parse(completed.headers.get("location").unwrap())?;
+            assert_eq!(
+                error
+                    .query_pairs()
+                    .find(|(key, _)| key == "error")
+                    .unwrap()
+                    .1,
+                if mode == "missing-state" {
+                    "state_not_found"
+                } else {
+                    "state_mismatch"
+                }
+            );
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions", "verifications"])
+                    .await?,
+                before
+            );
+            assert!(social.provider.take().is_empty());
+            callback(
+                &auth,
+                &[("code", "recovered-code"), ("state", &state)],
+                &cookie,
+            )
+            .await
+        } else {
+            completed
+        };
+        assert_eq!(
+            accepted.headers.get("location").map(String::as_str),
+            Some("/dashboard")
+        );
+        authenticated(&auth, &cookies(&accepted), "social@example.com").await;
+        for table in ["users", "accounts", "sessions"] {
+            assert_eq!(db.count(table).await?, 1, "{mode}: {table}");
+        }
+        assert_eq!(db.count("verifications").await?, 0);
+        let receipts = social.provider.take();
+        assert_eq!(receipts.len(), 1);
+        let grant: std::collections::BTreeMap<_, _> =
+            url::form_urlencoded::parse(&receipts[0].body).collect();
+        assert_eq!(
+            grant.get("code").map(|value| value.as_ref()),
+            Some(if negative {
+                "recovered-code"
+            } else {
+                expected_code
+            })
+        );
+        B::close(connection).await?;
+    }
+    Ok(())
 }
 
 async fn different_email_opt_in_links_unlinks_and_relinks_original_owner<B: Backend>(
