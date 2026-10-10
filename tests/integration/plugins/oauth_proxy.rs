@@ -976,6 +976,85 @@ async fn empty_query_code_prevents_body_grant_fallback_and_preserves_pending_sta
     Ok(())
 }
 
+async fn skip_proxy_header_keeps_local_state_and_consumes_provider_error<B: Backend>(
+    db: Db,
+) -> TestResult {
+    let mut fixture = Fixture::<B>::new(db).await;
+    let (probe, _) = fixture.issue("/api/auth/sign-in/social", None).await;
+    let issuer = probe.origin().ascii_serialization();
+    let mut config = (*fixture.preview.context().config).clone();
+    config.api_error_url = Some(format!("{PREVIEW}/configured-error?kept=yes"));
+    fixture.preview = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &fixture._connections.0))
+        .plugin(SessionManagementPlugin::new())
+        .plugin(OAuthPlugin::new().add_provider(
+            "gitlab",
+            OAuthProvider::gitlab_with_issuer("local-client", "local-secret", &issuer),
+        ))
+        .plugin(OAuthProxyPlugin::with_config(OAuthProxyConfig {
+            current_url: Some(PREVIEW.into()),
+            production_url: Some(PRODUCTION.into()),
+            secret: Some(PROXY_SECRET.into()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let before = rows(&fixture.preview_db).await;
+    let production = rows(&fixture.production_db).await;
+    let mut input = AuthRequest::new(HttpMethod::Post, "/api/auth/sign-in/social");
+    _ = input.headers.insert("origin".into(), PREVIEW.into());
+    _ = input
+        .headers
+        .insert("content-type".into(), "application/json".into());
+    _ = input
+        .headers
+        .insert("x-skip-oauth-proxy".into(), "true".into());
+    input.body=Some(json!({"provider":"gitlab","callbackURL":format!("{PREVIEW}/complete"),"disableRedirect":true}).to_string().into_bytes());
+    let issued = fixture.preview.handle_request(input).await?;
+    assert_eq!(issued.status, 200);
+    let result: Value = serde_json::from_slice(&issued.body)?;
+    let authorization = url::Url::parse(result.get("url").unwrap().as_str().unwrap())?;
+    let query: HashMap<_, _> = authorization.query_pairs().into_owned().collect();
+    assert_eq!(
+        query.get("redirect_uri").unwrap(),
+        &format!("{PREVIEW}/api/auth/callback/gitlab")
+    );
+    let state = query.get("state").unwrap();
+    assert_eq!(state.len(), 32);
+    let mut callback = url::Url::parse(query.get("redirect_uri").unwrap())?;
+    _ = callback
+        .query_pairs_mut()
+        .append_pair("state", state)
+        .append_pair("error", "access_denied")
+        .append_pair("code", "ignored");
+    let failed = request(
+        &fixture.preview,
+        &target(&callback),
+        None,
+        Some(&cookies(&issued)),
+    )
+    .await;
+    assert_eq!(failed.status, 302);
+    let error = location(&failed);
+    assert_eq!(error.path(), "/configured-error");
+    let query: HashMap<_, _> = error.query_pairs().into_owned().collect();
+    assert_eq!(query.get("kept").unwrap(), "yes");
+    assert_eq!(query.get("error").unwrap(), "access_denied");
+    assert!(fixture.provider.lock().unwrap().receipts.is_empty());
+    assert_eq!(rows(&fixture.preview_db).await, before);
+    assert_eq!(rows(&fixture.production_db).await, production);
+    let replay = request(
+        &fixture.preview,
+        &target(&callback),
+        None,
+        Some(&cookies(&issued)),
+    )
+    .await;
+    assert!(location(&replay).as_str().contains("error=state_mismatch"));
+    assert_eq!(rows(&fixture.preview_db).await, before);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,7 +1067,8 @@ mod tests {
     raw_profile_max_age_controls_admission_before_state_consumption,
     proxy_cache_publication_failure_retains_commit_and_discards_all_cookies,
     proxy_loose_profile_retains_resolved_account_key_authority,
-    empty_query_code_prevents_body_grant_fallback_and_preserves_pending_state
+    empty_query_code_prevents_body_grant_fallback_and_preserves_pending_state,
+    skip_proxy_header_keeps_local_state_and_consumes_provider_error
 );
     postgres_tests!(production_exchange_preserves_rows_then_preview_consumes_state_and_issues_only_the_actual_owner,completion_rejects_foreign_origin_provider_tampering_and_expired_state_before_any_principal_write);
 
