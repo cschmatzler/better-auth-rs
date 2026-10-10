@@ -23,7 +23,8 @@ backend_tests!(
     organization_invitation_page_before_expiry,
     organization_invitation_first_reinvite_cancellation,
     organization_invitation_limit_callback_error,
-    organization_invitation_existing_member_acceptance
+    organization_invitation_existing_member_acceptance,
+    organization_invitation_concurrent_admission
 );
 
 #[derive(Debug, Default)]
@@ -1815,6 +1816,212 @@ async fn organization_invitation_existing_member_acceptance<B: Backend>(db: Db) 
             "staged-invitation-foreign@example.test",
         )
         .await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn organization_invitation_concurrent_admission<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        MembershipLimit, OrganizationInvitationAcceptanceContext,
+        OrganizationInvitationAcceptanceHooks, OrganizationInvitationAcceptedContext,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Debug, Default)]
+    struct Gate {
+        entered: AtomicUsize,
+        changed: tokio::sync::Notify,
+        release: [tokio::sync::Notify; 2],
+        after: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl OrganizationInvitationAcceptanceHooks for Gate {
+        async fn before_accept_invitation(
+            &self,
+            c: &OrganizationInvitationAcceptanceContext,
+        ) -> AuthResult<()> {
+            assert_eq!(c.invitation.status, alibi::InvitationStatus::Pending);
+            let index = self.entered.fetch_add(1, Ordering::SeqCst);
+            assert!(index < 2);
+            self.changed.notify_one();
+            self.release[index].notified().await;
+            Ok(())
+        }
+        async fn after_accept_invitation(
+            &self,
+            c: &OrganizationInvitationAcceptedContext,
+        ) -> AuthResult<()> {
+            self.after.lock().unwrap().push(c.member.id.clone());
+            Ok(())
+        }
+    }
+    for different in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let gate = Arc::new(Gate::default());
+        let organization = OrganizationConfig {
+            membership_limit: Some(MembershipLimit::Fixed(2.0)),
+            invitation_acceptance_hooks: Some(gate.clone()),
+            ..Default::default()
+        };
+
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(OrganizationPlugin::with_config(organization))
+            .build()
+            .await?;
+        let owner = signup(&auth, "staged-invitation-owner@example.test").await;
+        let target = signup(&auth, "staged-invitation-target@example.test").await;
+        let foreign = signup(&auth, "staged-invitation-foreign@example.test").await;
+        let sibling = call(
+            &auth,
+            request(
+                "/sign-in/email",
+                Some(json!({"email":"staged-invitation-target@example.test","password":PASSWORD})),
+                "",
+            ),
+            200,
+        )
+        .await;
+        let created = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Stage","slug":"invitation-stage"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+        let org = body(&created)["id"].as_str().unwrap().to_owned();
+        let jar = merge(&cookies(&owner), &cookies(&created));
+
+        let second_target = if different {
+            signup(&auth, "staged-invitation-second@example.test").await
+        } else {
+            target.clone()
+        };
+        let first=call(&auth,request("/organization/invite-member",Some(json!({"organizationId":org,"email":"staged-invitation-target@example.test","role":"member"})),&jar),200).await;
+        let second = if different {
+            call(&auth,request("/organization/invite-member",Some(json!({"organizationId":org,"email":"staged-invitation-second@example.test","role":"admin"})),&jar),200).await
+        } else {
+            first.clone()
+        };
+        let before = db.tables(&["users", "accounts"]).await?;
+        let auth = Arc::new(auth);
+        let one = auth.clone();
+        let first_id = body(&first)["id"].clone();
+        let first_jar = cookies(&target);
+        let task_one = tokio::spawn(async move {
+            call(
+                &one,
+                request(
+                    "/organization/accept-invitation",
+                    Some(json!({"invitationId":first_id})),
+                    &first_jar,
+                ),
+                200,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while gate.entered.load(Ordering::SeqCst) < 1 {
+                gate.changed.notified().await;
+            }
+        })
+        .await?;
+        let two = auth.clone();
+        let second_id = body(&second)["id"].clone();
+        let second_jar = cookies(&second_target);
+        let task_two = tokio::spawn(async move {
+            call(
+                &two,
+                request(
+                    "/organization/accept-invitation",
+                    Some(json!({"invitationId":second_id})),
+                    &second_jar,
+                ),
+                if different { 200 } else { 400 },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while gate.entered.load(Ordering::SeqCst) < 2 {
+                gate.changed.notified().await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM member WHERE organization_id=$1",
+                &[&org]
+            )
+            .await?,
+            1
+        );
+        gate.release[0].notify_one();
+        let first_result = task_one.await?;
+        let first_member = body(&first_result)["member"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let first_state = db.tables(&["invitation", "member", "sessions"]).await?;
+        gate.release[1].notify_one();
+        let second_result = task_two.await?;
+        if different {
+            assert_ne!(body(&second_result)["member"]["id"], first_member);
+            assert_eq!(body(&second_result)["member"]["role"], "admin");
+            assert_eq!(
+                db.count_where(
+                    "SELECT COUNT(*) FROM member WHERE organization_id=$1",
+                    &[&org]
+                )
+                .await?,
+                3
+            );
+            assert_eq!(gate.after.lock().unwrap().len(), 2);
+        } else {
+            assert_eq!(body(&second_result)["code"], "INVITATION_NOT_FOUND");
+            assert_eq!(
+                db.tables(&["invitation", "member", "sessions"]).await?,
+                first_state
+            );
+            assert_eq!(*gate.after.lock().unwrap(), vec![first_member]);
+        }
+        assert_eq!(db.tables(&["users", "accounts"]).await?, before);
+        let sibling_current = call(
+            &auth,
+            request("/get-session", None, &cookies(&sibling)),
+            200,
+        )
+        .await;
+        assert!(body(&sibling_current)["session"]["activeOrganizationId"].is_null());
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "staged-invitation-foreign@example.test",
+        )
+        .await;
+        let stable = db.tables(&["invitation", "member", "sessions"]).await?;
+        let replay = call(
+            &auth,
+            request(
+                "/organization/accept-invitation",
+                Some(json!({"invitationId":body(&second)["id"]})),
+                &cookies(&second_target),
+            ),
+            400,
+        )
+        .await;
+        assert_eq!(body(&replay)["code"], "INVITATION_NOT_FOUND");
+        assert_eq!(
+            db.tables(&["invitation", "member", "sessions"]).await?,
+            stable
+        );
         B::close(connection).await?;
     }
     Ok(())
