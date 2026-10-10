@@ -13,7 +13,8 @@ use chrono::Duration;
 backend_tests!(
     one_time_token_issuance_and_redemption_policies,
     one_time_token_server_endpoints_publish_cached_identity,
-    ott_new_session_callback_failures_preserve_committed_authentication
+    ott_new_session_callback_failures_preserve_committed_authentication,
+    ott_generator_real_endpoint_context
 );
 
 struct Generator(&'static str);
@@ -395,4 +396,96 @@ async fn ott_new_session_callback_failures_preserve_committed_authentication<B: 
         }
     }
     Ok(())
+}
+
+async fn ott_generator_real_endpoint_context<B: Backend>(db: Db) -> TestResult {
+    struct Generator(Mutex<Vec<(OneTimeTokenSession, Option<AuthRequest>)>>);
+    #[async_trait]
+    impl GenerateOneTimeToken for Generator {
+        async fn generate(
+            &self,
+            s: &OneTimeTokenSession,
+            r: Option<&AuthRequest>,
+        ) -> AuthResult<String> {
+            self.0.lock().unwrap().push((s.clone(), r.cloned()));
+            Ok(if r.is_some() {
+                "physical-transfer"
+            } else {
+                "server-transfer"
+            }
+            .into())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let generator = Arc::new(Generator(Mutex::new(Vec::new())));
+    let auth = fast_builder::<B>(&connection)
+        .plugin(OneTimeTokenPlugin::with_config(OneTimeTokenConfig {
+            generator: Some(generator.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let owner = signup(&auth, "context-owner@example.test").await;
+    let foreign = signup(&auth, "context-foreign@example.test").await;
+    let sessions = db.table("sessions").await?;
+    let mut input =
+        request("/one-time-token/generate", None, &cookies(&owner)).with_url(url::Url::parse(
+            &format!("{ORIGIN}/api/auth/one-time-token/generate?physical=1"),
+        )?);
+    _ = input
+        .headers
+        .insert("x-ott-marker".into(), "callback-http".into());
+    let physical = call(&auth, input, 200).await;
+    assert_eq!(body(&physical)["token"], "physical-transfer");
+    let server = auth
+        .dispatch_endpoint(
+            OneTimeTokenPlugin::generate_endpoint(),
+            EndpointOptions {
+                headers: Some([("cookie".into(), cookies(&owner))].into()),
+                ..Default::default()
+            },
+        )
+        .await?
+        .decode()?;
+    assert_eq!(server.token, "server-transfer");
+    let receipts = generator.0.lock().unwrap().clone();
+    assert_eq!(receipts.len(), 2);
+    for (s, _) in &receipts {
+        assert_eq!(s.user.id, body(&owner)["user"]["id"].as_str().unwrap());
+        assert_eq!(s.session.token, body(&owner)["token"].as_str().unwrap());
+    }
+    let physical = receipts[0].1.as_ref().unwrap();
+    assert_eq!(physical.method, HttpMethod::Get);
+    assert!(physical.path.ends_with("/one-time-token/generate"));
+    assert_eq!(physical.headers["x-ott-marker"], "callback-http");
+    assert_eq!(
+        physical.url().unwrap().path(),
+        "/api/auth/one-time-token/generate"
+    );
+    assert!(receipts[1].1.is_none());
+    for token in ["physical-transfer", "server-transfer"] {
+        assert_eq!(
+            db.text(
+                "SELECT value FROM verifications WHERE identifier=$1",
+                &[&format!("one-time-token:{token}")]
+            )
+            .await?
+            .as_deref(),
+            Some(receipts[0].0.session.token.as_str())
+        );
+        let redeemed = call(
+            &auth,
+            request(
+                "/one-time-token/verify",
+                Some(json!({"token":token})),
+                &cookies(&foreign),
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(body(&redeemed)["session"]["token"], body(&owner)["token"]);
+    }
+    assert_eq!(db.table("sessions").await?, sessions);
+    assert_eq!(db.count("verifications").await?, 0);
+    B::close(connection).await
 }
