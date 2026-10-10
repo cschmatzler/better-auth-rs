@@ -20,7 +20,8 @@ backend_tests!(
     organization_plugin_helpers,
     organization_trusted_addition_preserves_literal_role_arrays_and_session_scope,
     fractional_organization_membership_limit_uses_actual_physical_count,
-    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results
+    organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_results,
+    organization_duplicate_member_exact_id_cleanup
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -891,5 +892,151 @@ async fn organization_membership_resolver_keeps_target_snapshots_and_raw_falsy_r
     );
     assert_eq!(policy.seen.lock().unwrap().len(), count);
     assert_eq!(db.count("member").await?, 2);
+    B::close(connection).await
+}
+
+async fn organization_duplicate_member_exact_id_cleanup<B: Backend>(db: Db) -> TestResult {
+    use alibi::{CreateMember, types::CreateTeam};
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            teams: TeamsConfig {
+                enabled: true,
+                create_default_team: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let mut owner = account(&auth, "exact-owner@example.test").await;
+    let target = account(&auth, "exact-target@example.test").await;
+    let mut foreign = account(&auth, "exact-foreign@example.test").await;
+    let own = organization(&auth, &mut owner, "exact-own").await;
+    let other = organization(&auth, &mut foreign, "exact-other").await;
+    let first = add(&auth, &own, &target.id, "member").await;
+    _ = add(&auth, &other, &target.id, "member").await;
+    let duplicate = auth
+        .store()
+        .create_member(CreateMember {
+            organization_id: own.clone(),
+            user_id: target.id.clone(),
+            role: "admin".into(),
+        })
+        .await?;
+    let own_team = auth
+        .store()
+        .create_team(CreateTeam {
+            organization_id: own.clone(),
+            name: "Own seats".into(),
+            updated_at: None,
+        })
+        .await?;
+    let other_team = auth
+        .store()
+        .create_team(CreateTeam {
+            organization_id: other.clone(),
+            name: "Foreign seats".into(),
+            updated_at: None,
+        })
+        .await?;
+    for (team, user) in [
+        (&own_team.id, &target.id),
+        (&own_team.id, &owner.id),
+        (&other_team.id, &target.id),
+    ] {
+        _ = auth.store().add_team_member(team, user, None).await?;
+    }
+    let protected = db
+        .tables(&["users", "accounts", "sessions", "organization"])
+        .await?;
+    let first_id = first["id"].as_str().unwrap();
+    let first_role = db
+        .text("SELECT role FROM member WHERE id=$1", &[first_id])
+        .await?;
+    _ = call(
+        &auth,
+        request(
+            "/organization/update-member-role",
+            Some(json!({"organizationId":own,"memberId":duplicate.id,"role":"member"})),
+            &owner.cookie,
+        ),
+        200,
+    )
+    .await;
+    _ = call(
+        &auth,
+        request(
+            "/organization/remove-member",
+            Some(json!({"organizationId":own,"memberIdOrEmail":duplicate.id})),
+            &owner.cookie,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM member WHERE id=$1", &[&duplicate.id])
+            .await?,
+        0
+    );
+    assert_eq!(
+        db.text("SELECT role FROM member WHERE id=$1", &[first_id])
+            .await?,
+        first_role
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM team_member WHERE team_id=$1 AND user_id=$2",
+            &[&own_team.id, &target.id]
+        )
+        .await?,
+        0
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM team_member WHERE team_id=$1 AND user_id=$2",
+            &[&other_team.id, &target.id]
+        )
+        .await?,
+        1
+    );
+    assert_eq!(
+        db.text(
+            "SELECT CAST(member_count AS TEXT) FROM team WHERE id=$1",
+            &[&own_team.id]
+        )
+        .await?
+        .as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        db.text(
+            "SELECT CAST(member_count AS TEXT) FROM team WHERE id=$1",
+            &[&other_team.id]
+        )
+        .await?
+        .as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "organization"])
+            .await?,
+        protected
+    );
+    _ = call(
+        &auth,
+        request(
+            "/organization/remove-member",
+            Some(json!({"organizationId":own,"memberIdOrEmail":duplicate.id})),
+            &owner.cookie,
+        ),
+        400,
+    )
+    .await;
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM member WHERE id=$1", &[first_id])
+            .await?,
+        1
+    );
     B::close(connection).await
 }
