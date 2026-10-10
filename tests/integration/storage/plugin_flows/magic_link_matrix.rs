@@ -15,7 +15,10 @@ backend_tests!(
     magic_link_issuance_policies,
     magic_link_redemption_matrix,
     magic_link_configured_quota_blocks_delivery_and_resets_at_configured_window,
-    magic_link_returning_verified_owner_retains_credentials_oauth_and_browser_sessions
+    magic_link_returning_verified_owner_retains_credentials_oauth_and_browser_sessions,
+    magic_link_redemption_hasher_failure,
+    magic_link_fresh_empty_callback,
+    magic_link_delivery_request_context
 );
 
 #[derive(Default)]
@@ -487,5 +490,228 @@ async fn magic_link_returning_verified_owner_retains_credentials_oauth_and_brows
     .await;
     assert_eq!(body(&login)["user"]["id"], id);
     assert_eq!(db.table("accounts").await?, accounts);
+    B::close(connection).await
+}
+
+async fn magic_link_redemption_hasher_failure<B: Backend>(db: Db) -> TestResult {
+    struct Switched(std::sync::atomic::AtomicU8);
+    #[async_trait]
+    impl MagicLinkTokenHasher for Switched {
+        async fn hash(&self, token: &str) -> AuthResult<String> {
+            match self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                1 => Err(AuthError::Upstream {
+                    status: 403,
+                    code: "MAGIC_HASH_REJECTED",
+                    message: "Application hasher rejected",
+                }),
+                2 => Err(AuthError::internal("private hasher rejection")),
+                _ => Ok(format!("application:{token}")),
+            }
+        }
+    }
+    for failure in [1, 2] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let hasher = Arc::new(Switched(std::sync::atomic::AtomicU8::new(0)));
+        let outbox = Arc::new(Outbox::default());
+        let auth = fast_builder::<B>(&connection)
+            .plugin(MagicLinkPlugin::new(MagicLinkConfig {
+                storage: MagicLinkTokenStorage::Custom(hasher.clone()),
+                send_magic_link: Some(outbox.clone()),
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        _ = call(
+            &auth,
+            request(
+                "/sign-in/magic-link",
+                Some(json!({"email":"hash-retry@example.test"})),
+                "",
+            ),
+            200,
+        )
+        .await;
+        let delivery = outbox.sent.lock().unwrap().last().unwrap().clone();
+        let before = db
+            .tables(&["users", "accounts", "sessions", "verifications"])
+            .await?;
+        assert_eq!(
+            db.text("SELECT identifier FROM verifications", &[])
+                .await?
+                .as_deref(),
+            Some(format!("magic-link:application:{}", delivery.token).as_str())
+        );
+        hasher.0.store(failure, std::sync::atomic::Ordering::SeqCst);
+        let denied = call(
+            &auth,
+            redeem(&delivery, &[("callbackURL", "")]),
+            if failure == 1 { 403 } else { 500 },
+        )
+        .await;
+        assert!(cookies(&denied).is_empty());
+        if failure == 1 {
+            assert_eq!(body(&denied)["code"], "MAGIC_HASH_REJECTED");
+        } else {
+            assert!(denied.body.is_empty());
+        }
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+        hasher.0.store(0, std::sync::atomic::Ordering::SeqCst);
+        let accepted = call(&auth, redeem(&delivery, &[("callbackURL", "")]), 200).await;
+        assert_eq!(body(&accepted)["user"]["email"], "hash-retry@example.test");
+        authenticated(&auth, &cookies(&accepted), "hash-retry@example.test").await;
+        assert_eq!(db.count("verifications").await?, 0);
+        assert_eq!(db.count("sessions").await?, 1);
+        let after = db.tables(&["users", "accounts", "sessions"]).await?;
+        let replay = call(&auth, redeem(&delivery, &[("callbackURL", "")]), 302).await;
+        let location = url::Url::parse(replay.headers.get("location").unwrap())?;
+        assert_eq!(
+            location
+                .query_pairs()
+                .find(|(key, _)| key == "error")
+                .unwrap()
+                .1,
+            "INVALID_TOKEN"
+        );
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, after);
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn magic_link_fresh_empty_callback<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let outbox = Arc::new(Outbox::default());
+    let auth = fast_builder::<B>(&connection)
+        .plugin(MagicLinkPlugin::new(MagicLinkConfig {
+            send_magic_link: Some(outbox.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    _ = call(
+        &auth,
+        request(
+            "/sign-in/magic-link",
+            Some(json!({"email":"fresh-json@example.test","name":"JSON owner"})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    let delivery = outbox.sent.lock().unwrap().last().unwrap().clone();
+    assert_eq!(db.count("users").await?, 0);
+    assert_eq!(db.count("verifications").await?, 1);
+    let input = redeem(
+        &delivery,
+        &[("callbackURL", ""), ("newUserCallbackURL", "/welcome")],
+    );
+    let accepted = call(&auth, input.clone(), 200).await;
+    assert!(!accepted.headers.contains_key("location"));
+    assert_eq!(body(&accepted)["user"]["name"], "JSON owner");
+    assert_eq!(body(&accepted)["user"]["emailVerified"], true);
+    assert!(body(&accepted)["token"].is_string());
+    authenticated(&auth, &cookies(&accepted), "fresh-json@example.test").await;
+    assert_eq!(db.count("sessions").await?, 1);
+    assert_eq!(db.count("verifications").await?, 0);
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    let replay = call(&auth, input, 302).await;
+    let location = url::Url::parse(replay.headers.get("location").unwrap())?;
+    assert_eq!(
+        location
+            .query_pairs()
+            .find(|(key, _)| key == "error")
+            .unwrap()
+            .1,
+        "INVALID_TOKEN"
+    );
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    B::close(connection).await
+}
+
+async fn magic_link_delivery_request_context<B: Backend>(db: Db) -> TestResult {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest as _, Sha256};
+    struct Sender<S: AuthSchema> {
+        raw: crate::storage::Raw,
+        seen: Mutex<Vec<(MagicLinkDelivery, AuthRequest)>>,
+        schema: std::marker::PhantomData<fn() -> S>,
+    }
+    #[async_trait]
+    impl<S: AuthSchema> SendMagicLink for Sender<S> {
+        async fn send(&self, delivery: &MagicLinkDelivery, c: &CallbackContext) -> AuthResult<()> {
+            assert_eq!(c.context::<S>().unwrap().config.base_path, "/api/auth");
+            let identifier = format!(
+                "magic-link:{}",
+                URL_SAFE_NO_PAD.encode(Sha256::digest(delivery.token.as_bytes()))
+            );
+            assert_eq!(
+                self.raw
+                    .count_where(
+                        "SELECT COUNT(*) FROM verifications WHERE identifier=$1",
+                        &[&identifier]
+                    )
+                    .await
+                    .map_err(|error| AuthError::internal(error.to_string()))?,
+                1
+            );
+            self.seen
+                .lock()
+                .unwrap()
+                .push((delivery.clone(), c.request.clone().unwrap()));
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let sender = Arc::new(Sender::<B::Schema> {
+        raw: db.raw.clone(),
+        seen: Mutex::new(Vec::new()),
+        schema: std::marker::PhantomData,
+    });
+    let auth = fast_builder::<B>(&connection)
+        .plugin(MagicLinkPlugin::new(MagicLinkConfig {
+            storage: MagicLinkTokenStorage::Hashed,
+            send_magic_link: Some(sender.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let raw_body =
+        r#"{ "email": "delivery-context@example.test", "metadata": {"channel":"callback-probe"} }"#;
+    let mut input = super::auth_probe::raw("/sign-in/magic-link", raw_body, "").with_url(
+        url::Url::parse(&format!("{ORIGIN}/api/auth/sign-in/magic-link?probe=207"))?,
+    );
+    input.set_query_pairs([("probe", "207")]);
+    _ = input
+        .headers
+        .insert("x-callback-probe".into(), "issue207".into());
+    _ = call(&auth, input.clone(), 200).await;
+    let records = sender.seen.lock().unwrap().clone();
+    assert_eq!(records.len(), 1);
+    let (delivery, actual) = &records[0];
+    assert_eq!(actual.method, HttpMethod::Post);
+    assert_eq!(actual.url().unwrap().path(), "/api/auth/sign-in/magic-link");
+    assert_eq!(actual.query, input.query);
+    assert_eq!(actual.body, Some(raw_body.as_bytes().to_vec()));
+    assert_eq!(
+        actual.headers.get("x-callback-probe").map(String::as_str),
+        Some("issue207")
+    );
+    assert_eq!(
+        delivery.metadata.as_ref().unwrap().to_json_value()?,
+        json!({"channel":"callback-probe"})
+    );
+    let accepted = call(&auth, redeem(delivery, &[("callbackURL", "")]), 200).await;
+    authenticated(&auth, &cookies(&accepted), "delivery-context@example.test").await;
+    assert_eq!(db.count("accounts").await?, 0);
+    assert_eq!(db.count("sessions").await?, 1);
+    assert_eq!(db.count("verifications").await?, 0);
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    _ = call(&auth, redeem(delivery, &[("callbackURL", "")]), 302).await;
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
     B::close(connection).await
 }
