@@ -18,7 +18,8 @@ backend_tests!(
     id_token_sign_in_outcomes,
     callback_protocol_outcomes,
     sign_in_policies,
-    valid_form_post_preserves_issued_state_and_escaped_query_until_get
+    valid_form_post_preserves_issued_state_and_escaped_query_until_get,
+    different_email_opt_in_links_unlinks_and_relinks_original_owner
 );
 
 #[derive(Clone)]
@@ -718,4 +719,95 @@ async fn valid_form_post_preserves_issued_state_and_escaped_query_until_get<B: B
         B::close(connection).await?;
     }
     Ok(())
+}
+
+async fn different_email_opt_in_links_unlinks_and_relinks_original_owner<B: Backend>(
+    db: Db,
+) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let social = Social::start().await;
+    let mut provider = OAuthProvider::google("google-client", "google-secret");
+    provider.token_url = social.provider.url.join("token").unwrap().into();
+    provider.get_user_info = Some(Arc::new(social.profile.clone()));
+    let config = AuthConfig::new(SECRET)
+        .base_url(ORIGIN)
+        .account(linking(|policy| policy.allow_different_emails = true));
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(AccountManagementPlugin::new())
+        .plugin(OAuthPlugin::new().add_provider("google", provider))
+        .build()
+        .await?;
+    let owner = signup(&auth, "local-link-owner@example.test").await;
+    let foreign = signup(&auth, "local-link-foreign@example.test").await;
+    let owner_id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+    _ = db.execute("INSERT INTO accounts (id,user_id,account_id,provider_id,created_at,updated_at) SELECT 'github-backup',user_id,'local-github','github',created_at,updated_at FROM accounts WHERE user_id=$1", &[&owner_id]).await?;
+    let before = db.tables(&["users", "sessions"]).await?;
+    let before_accounts: Vec<Value> = serde_json::from_str(&db.table("accounts").await?)?;
+    social
+        .profile
+        .set("different-email-sub", "provider-link@example.test", true);
+    for destination in ["/linked", "/relinked"] {
+        let (state, cookie) = authorize(
+            &auth,
+            "/link-social",
+            json!({"provider":"google","callbackURL":destination}),
+            &cookies(&owner),
+        )
+        .await;
+        let completed = callback(&auth, &[("code", "grant"), ("state", &state)], &cookie).await;
+        assert_eq!(completed.status, 302);
+        assert_eq!(
+            completed.headers.get("location").map(String::as_str),
+            Some(destination)
+        );
+        let current =
+            body(&call(&auth, request("/get-session", None, &cookies(&owner)), 200).await);
+        assert_eq!(current["user"]["id"], owner_id);
+        assert_eq!(current["user"]["email"], "local-link-owner@example.test");
+        assert_eq!(
+            accounts(&auth, &cookies(&owner)).await,
+            json!(["credential", "github", "google"])
+        );
+        let all: Vec<Value> = serde_json::from_str(&db.table("accounts").await?)?;
+        assert_eq!(all.len(), before_accounts.len() + 1);
+        assert!(before_accounts.iter().all(|row| all.contains(row)));
+        let google = all
+            .iter()
+            .find(|row| row["provider_id"] == "google")
+            .unwrap();
+        assert_eq!(google["user_id"], owner_id);
+        assert_eq!(google["account_id"], "different-email-sub");
+        if destination == "/linked" {
+            assert_eq!(
+                body(
+                    &call(
+                        &auth,
+                        request(
+                            "/unlink-account",
+                            Some(json!({"accountId":google["id"]})),
+                            &cookies(&owner)
+                        ),
+                        200
+                    )
+                    .await
+                )["status"],
+                true
+            );
+            assert_eq!(
+                accounts(&auth, &cookies(&owner)).await,
+                json!(["credential", "github"])
+            );
+            assert_eq!(
+                serde_json::from_str::<Vec<Value>>(&db.table("accounts").await?)?,
+                before_accounts
+            );
+        }
+        assert_eq!(db.tables(&["users", "sessions"]).await?, before);
+    }
+    authenticated(&auth, &cookies(&foreign), "local-link-foreign@example.test").await;
+    B::close(connection).await
 }
