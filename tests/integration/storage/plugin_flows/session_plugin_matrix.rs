@@ -16,7 +16,8 @@ backend_tests!(
     multi_session_raw_capacity_controls_proofs_without_evicting_durable_sessions,
     multi_session_repeated_genuine_proofs_retire_before_fractional_capacity,
     multi_session_without_database_preserves_order_fallback_and_cache_replay_limits,
-    parallel_sibling_revocation_retains_owned_deletes_after_rejection
+    parallel_sibling_revocation_retains_owned_deletes_after_rejection,
+    bearer_configured_cookie_authority
 );
 
 fn merge(first: &str, second: &str) -> String {
@@ -869,5 +870,104 @@ async fn parallel_sibling_revocation_retains_owned_deletes_after_rejection<B: Ba
     authenticated(&auth, &siblings[1].1, "parallel-owner@example.test").await;
     authenticated(&auth, &cookies(&owner), "parallel-owner@example.test").await;
     authenticated(&auth, &cookies(&foreign), "parallel-foreign@example.test").await;
+    Ok(())
+}
+
+async fn bearer_configured_cookie_authority<B: Backend>(db: Db) -> TestResult {
+    use alibi::config::CookieOverride;
+    for secure in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        let name = if secure {
+            config.advanced.use_secure_cookies = Some(true);
+            config.advanced.cookie_prefix = Some("bearer-app".into());
+            "__Secure-bearer-app.session_token"
+        } else {
+            _ = config.advanced.cookies.insert(
+                "session_token".into(),
+                CookieOverride {
+                    name: Some("configured-bearer-token".into()),
+                    attributes: Default::default(),
+                },
+            );
+            "configured-bearer-token"
+        };
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(BearerPlugin::new())
+            .build()
+            .await?;
+        let owner = signup(&auth, "named-header-owner@example.test").await;
+        let foreign = signup(&auth, "named-header-foreign@example.test").await;
+        let jar = cookies(&owner);
+        assert_eq!(
+            owner
+                .headers
+                .get_all("set-cookie")
+                .filter(|v| v.starts_with(&format!("{name}=")))
+                .count(),
+            1
+        );
+        assert!(
+            !owner
+                .headers
+                .get_all("set-cookie")
+                .any(|v| v.starts_with("better-auth.session_token="))
+        );
+        let encoded = jar
+            .split("; ")
+            .find_map(|v| v.strip_prefix(&format!("{name}=")))
+            .unwrap();
+        let query = format!("v={encoded}");
+        let signed = url::form_urlencoded::parse(query.as_bytes())
+            .next()
+            .unwrap()
+            .1
+            .into_owned();
+        assert_eq!(owner.headers.get("set-auth-token"), Some(&signed));
+        authenticated(&auth, &jar, "named-header-owner@example.test").await;
+        let before = db.tables(&["users", "accounts", "sessions"]).await?;
+        for token in [body(&owner)["token"].as_str().unwrap(), signed.as_str()] {
+            let mut input = request("/get-session", None, &cookies(&foreign));
+            _ = input
+                .headers
+                .insert("authorization".into(), format!("Bearer {token}"));
+            let read = call(&auth, input, 200).await;
+            assert_eq!(body(&read)["session"]["token"], body(&owner)["token"]);
+            assert_eq!(body(&read)["user"]["id"], body(&owner)["user"]["id"]);
+        }
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+        let mut input = request("/sign-out", Some(json!({})), &cookies(&foreign));
+        _ = input
+            .headers
+            .insert("authorization".into(), format!("Bearer {signed}"));
+        let logout = call(&auth, input, 200).await;
+        assert!(
+            logout
+                .headers
+                .get_all("set-cookie")
+                .any(|v| v.starts_with(&format!("{name}=")) && v.contains("Max-Age=0"))
+        );
+        assert!(!logout.headers.contains_key("set-auth-token"));
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM sessions WHERE token=$1",
+                &[body(&owner)["token"].as_str().unwrap()]
+            )
+            .await?,
+            0
+        );
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "named-header-foreign@example.test",
+        )
+        .await;
+        B::close(connection).await?;
+    }
     Ok(())
 }
