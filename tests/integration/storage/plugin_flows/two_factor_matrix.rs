@@ -14,7 +14,8 @@ backend_tests!(
     two_factor_forged_trust_proofs,
     two_factor_otp_budget_and_session_choices,
     two_factor_numeric_options_and_damaged_factor,
-    two_factor_otp_resends_are_consumed_once_across_real_requests
+    two_factor_otp_resends_are_consumed_once_across_real_requests,
+    two_factor_factor_cookie_wire_aliases
 );
 
 #[derive(Default)]
@@ -757,4 +758,192 @@ async fn two_factor_otp_resends_are_consumed_once_across_real_requests<B: Backen
     authenticated(&auth, &cookie, "owner@example.test").await;
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
+}
+
+async fn two_factor_factor_cookie_wire_aliases<B: Backend>(db: Db) -> TestResult {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use hkdf::hmac::{Hmac, KeyInit, Mac};
+    let sign = |payload: &str| {
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(SECRET.as_bytes()).unwrap();
+        mac.update(payload.as_bytes());
+        format!("{payload}.{}", STANDARD.encode(mac.finalize().into_bytes()))
+    };
+    let encode =
+        |value: &str| url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>();
+    for mode in 0..5 {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(TwoFactorPlugin::with_config(TwoFactorConfig {
+                skip_verification_on_enable: true,
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let signed = signup(&auth, "wire@example.test").await;
+        let id = body(&signed)["user"]["id"].as_str().unwrap().to_owned();
+        let (_, enrollment, _) = enroll(&auth, &cookies(&signed)).await;
+        let actual = sign_in(&auth, "wire@example.test", json!({}), "").await;
+        let key = if mode == 0 {
+            "2fa-雪-é.uri".to_owned()
+        } else if mode == 1 {
+            "2fa-%E9".to_owned()
+        } else {
+            db.text("SELECT identifier FROM verifications WHERE value=$1 AND identifier LIKE '2fa-%' AND identifier NOT LIKE '2fa-attempts-%'",&[&id]).await?.unwrap()
+        };
+        if mode < 2 {
+            for (identifier, value) in [
+                (key.clone(), id.clone()),
+                (format!("2fa-attempts-{key}"), "0".into()),
+            ] {
+                let _ = auth
+                    .store()
+                    .create_verification(alibi::CreateVerification {
+                        identifier,
+                        value,
+                        expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    })
+                    .await?;
+            }
+        }
+        let signed_key = sign(&key);
+        let before = db
+            .tables(&[
+                "two_factor",
+                "verifications",
+                "users",
+                "accounts",
+                "sessions",
+            ])
+            .await?;
+        let incomplete = signed_key.strip_suffix('=').unwrap();
+        let bad = call(
+            &auth,
+            request(
+                "/two-factor/verify-backup-code",
+                Some(json!({"code":enrollment["backupCodes"][0]})),
+                &format!("better-auth.two_factor={}", encode(incomplete)),
+            ),
+            401,
+        )
+        .await;
+        assert_eq!(body(&bad)["code"], "INVALID_TWO_FACTOR_COOKIE");
+        assert_eq!(
+            db.tables(&[
+                "two_factor",
+                "verifications",
+                "users",
+                "accounts",
+                "sessions"
+            ])
+            .await?,
+            before
+        );
+        let wire = match mode {
+            0 => encode(&signed_key)
+                .replace("%C3", "%c3")
+                .replace("%A9", "%a9")
+                .replace('.', "%2e"),
+            1 => signed_key.clone(),
+            2 => format!("\"{}\"", encode(&signed_key)),
+            3 => encode(&signed_key),
+            _ => {
+                let mut alias = signed_key.clone().into_bytes();
+                let index = alias.len() - 2;
+                let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                let position = alphabet
+                    .iter()
+                    .position(|x| x == alias.get(index).unwrap())
+                    .unwrap();
+                *alias.get_mut(index).unwrap() = *alphabet.get(position + 1).unwrap();
+                let alias = String::from_utf8(alias)?;
+                let permissive = base64::engine::general_purpose::GeneralPurpose::new(
+                    &base64::alphabet::STANDARD,
+                    base64::engine::general_purpose::GeneralPurposeConfig::new()
+                        .with_decode_allow_trailing_bits(true),
+                );
+                assert_eq!(
+                    permissive.decode(alias.rsplit_once('.').unwrap().1)?,
+                    STANDARD.decode(signed_key.rsplit_once('.').unwrap().1)?
+                );
+                encode(&alias)
+            }
+        };
+        let preference = encode(&sign("temporary"));
+        let pair = if mode == 3 {
+            format!(
+                "better-auth.two_factor \t={wire}; better-auth.two_factor=invalid; better-auth.dont_remember \t={preference}; better-auth.dont_remember=invalid"
+            )
+        } else {
+            format!("better-auth.two_factor={wire}; better-auth.dont_remember={preference}")
+        };
+        let done = call(
+            &auth,
+            request(
+                "/two-factor/verify-backup-code",
+                Some(json!({"code":enrollment["backupCodes"][0],"trustDevice":true})),
+                &pair,
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(body(&done)["user"]["id"], id);
+        let session = done
+            .headers
+            .get_all("set-cookie")
+            .find(|x| x.starts_with("better-auth.session_token="))
+            .unwrap();
+        assert!(!session.contains("Max-Age="));
+        assert!(!session.contains("Expires="));
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM verifications WHERE identifier=$1",
+                &[&key]
+            )
+            .await?,
+            0
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM verifications WHERE identifier=$1",
+                &[&format!("2fa-attempts-{key}")]
+            )
+            .await?,
+            0
+        );
+        let mut active = cookies(&done);
+        if mode == 2 {
+            active = active
+                .split("; ")
+                .map(|x| {
+                    x.split_once('=')
+                        .map_or_else(|| x.to_owned(), |(k, v)| format!("{k}=\"{v}\""))
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+        }
+        let disabled = call(
+            &auth,
+            request(
+                "/two-factor/disable",
+                Some(json!({"password":PASSWORD})),
+                &active,
+            ),
+            200,
+        )
+        .await;
+        assert!(body(&disabled)["status"].as_bool().unwrap());
+        assert_eq!(db.count("two_factor").await?, 0);
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM verifications WHERE identifier LIKE 'trust-device-%'",
+                &[]
+            )
+            .await?,
+            0
+        );
+        let _ = actual;
+        B::close(connection).await?;
+    }
+    Ok(())
 }
