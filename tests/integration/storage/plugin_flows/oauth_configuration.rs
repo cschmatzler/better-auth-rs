@@ -7,7 +7,11 @@ use alibi::plugins::oauth::{
 };
 use async_trait::async_trait;
 
-backend_tests!(generic_oauth_fallback_mapping_and_account_authority);
+backend_tests!(
+    generic_oauth_fallback_mapping_and_account_authority,
+    configured_oauth_expiry_preserves_zero_negative_and_grant_precedence,
+    custom_code_handler_owns_transport_and_state_bound_grant_context
+);
 postgres_tests!(generic_oauth_fallback_mapping_and_account_authority);
 
 struct Mapper;
@@ -286,6 +290,237 @@ async fn generic_oauth_fallback_mapping_and_account_authority<B: Backend>(db: Db
             let profile = requests.iter().find(|r| r.path == "/profile").unwrap();
             assert_eq!(profile.headers["authorization"], "Bearer access-from-grant");
         }
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn configured_oauth_expiry_preserves_zero_negative_and_grant_precedence<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use chrono::{DateTime, Duration, Utc};
+    for seconds in [17, 0, -60] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let peer = Provider::start("application/json", "{}").await;
+        peer.respond_at("/token", 200, json!({"access_token":"initial-access","refresh_token":"initial-refresh","scope":"calendar"}));
+        peer.respond_at("/profile", 200, json!({"id":"expiry-sub","email":"expiry@example.test","name":"Expiry owner","email_verified":true}));
+        let mut config = GenericOAuthConfig::new("native-client", "native-secret");
+        config.authorization_url = Some(peer.url.join("authorize")?.into());
+        config.token_url = Some(peer.url.join("token")?.into());
+        config.user_info_url = Some(peer.url.join("profile")?.into());
+        config.access_token_expires_in = Some(f64::from(seconds));
+        let provider = config.resolve().await?.unwrap().provider;
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(OAuthPlugin::new().add_provider("generic", provider))
+            .build()
+            .await?;
+        let (authorization, cookie) = super::oauth_profiles::begin(&auth, "generic").await;
+        let before = Utc::now();
+        let response =
+            super::oauth_profiles::complete(&auth, "generic", &authorization, &cookie).await;
+        let after = Utc::now();
+        assert_eq!(
+            url::Url::parse(response.headers.get("location").unwrap())?.path(),
+            "/done"
+        );
+        let id = db.text("SELECT id FROM accounts", &[]).await?.unwrap();
+        let expiry = db
+            .text(
+                "SELECT access_token_expires_at FROM accounts WHERE id=$1",
+                &[&id],
+            )
+            .await?;
+        if seconds == 0 {
+            assert!(expiry.is_none());
+        } else {
+            let expiry =
+                DateTime::parse_from_rfc3339(expiry.as_deref().unwrap())?.with_timezone(&Utc);
+            assert!(
+                expiry >= before + Duration::seconds(i64::from(seconds)) - Duration::seconds(1)
+            );
+            assert!(expiry <= after + Duration::seconds(i64::from(seconds)) + Duration::seconds(1));
+        }
+        authenticated(&auth, &cookies(&response), "expiry@example.test").await;
+        let stable = db.tables(&["users", "sessions"]).await?;
+        let receipts = peer.take();
+        assert_eq!(
+            receipts
+                .iter()
+                .filter(|receipt| receipt.path == "/token")
+                .count(),
+            1
+        );
+        peer.respond_at("/token", 200, json!({"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600}));
+        let before = Utc::now();
+        let refreshed = call(
+            &auth,
+            request(
+                "/refresh-token",
+                Some(json!({"accountId":id})),
+                &cookies(&response),
+            ),
+            200,
+        )
+        .await;
+        let after = Utc::now();
+        assert_eq!(body(&refreshed)["accessToken"], "rotated-access");
+        let expiry = db
+            .text(
+                "SELECT access_token_expires_at FROM accounts WHERE id=$1",
+                &[&id],
+            )
+            .await?
+            .unwrap();
+        let expiry = DateTime::parse_from_rfc3339(&expiry)?.with_timezone(&Utc);
+        assert!(expiry >= before + Duration::seconds(3599));
+        assert!(expiry <= after + Duration::seconds(3601));
+        assert_eq!(db.tables(&["users", "sessions"]).await?, stable);
+        let receipts = peer.take();
+        assert_eq!(receipts.len(), 1);
+        let fields: std::collections::BTreeMap<_, _> =
+            url::form_urlencoded::parse(&receipts[0].body).collect();
+        assert_eq!(
+            fields.get("grant_type").map(|value| value.as_ref()),
+            Some("refresh_token")
+        );
+        assert_eq!(
+            fields.get("refresh_token").map(|value| value.as_ref()),
+            Some("initial-refresh")
+        );
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn custom_code_handler_owns_transport_and_state_bound_grant_context<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::plugins::oauth::{
+        OAuthAuthorizationCodeCallback, OAuthAuthorizationCodeContext,
+        OAuthAuthorizationCodeHandler, OAuthTokenSet,
+    };
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest as _, Sha256};
+    struct Handler {
+        fail: bool,
+        seen: Arc<Mutex<Vec<OAuthAuthorizationCodeContext>>>,
+    }
+    #[async_trait]
+    impl OAuthAuthorizationCodeHandler for Handler {
+        async fn validate_authorization_code(
+            &self,
+            context: OAuthAuthorizationCodeContext,
+        ) -> Result<OAuthTokenSet, String> {
+            self.seen.lock().unwrap().push(context);
+            if self.fail {
+                return Err("private callback rejection".into());
+            }
+            Ok(OAuthTokenSet {
+                access_token: Some("custom-access".into()),
+                refresh_token: Some("custom-refresh".into()),
+                ..Default::default()
+            })
+        }
+    }
+    for fail in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let peer = Provider::start("application/json", "{}").await;
+        peer.respond_at(
+            "/token",
+            503,
+            json!({"error":"default transport must not run"}),
+        );
+        peer.respond_at("/profile", 200, json!({"id":"custom-sub","email":"custom-code@example.test","name":"Custom owner","email_verified":true}));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut config = GenericOAuthConfig::new("native-client", "native-secret");
+        config.authorization_url = Some(peer.url.join("authorize")?.into());
+        config.token_url = Some(peer.url.join("token")?.into());
+        config.user_info_url = Some(peer.url.join("profile")?.into());
+        config.access_token_expires_in = Some(17.0);
+        config
+            .provider
+            .authorization
+            .as_mut()
+            .unwrap()
+            .authorization_code = Some(OAuthAuthorizationCodeCallback(Arc::new(Handler {
+            fail,
+            seen: seen.clone(),
+        })));
+        let provider = config.resolve().await?.unwrap().provider;
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(OAuthPlugin::new().add_provider("generic", provider))
+            .build()
+            .await?;
+        let (authorization, cookie) = super::oauth_profiles::begin(&auth, "generic").await;
+        let before = db.tables(&["users", "accounts", "sessions"]).await?;
+        let completed =
+            super::oauth_profiles::complete(&auth, "generic", &authorization, &cookie).await;
+        let contexts = seen.lock().unwrap().clone();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].code, "one-use-grant");
+        assert_eq!(
+            url::Url::parse(&contexts[0].redirect_uri)?.path(),
+            "/api/auth/callback/generic"
+        );
+        let verifier = contexts[0].code_verifier.as_deref().unwrap();
+        assert!(verifier.len() > 40);
+        assert_eq!(
+            URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())),
+            authorization["code_challenge"]
+        );
+        assert_eq!(db.count("verifications").await?, 0);
+        let receipts = peer.take();
+        assert!(receipts.iter().all(|receipt| receipt.path != "/token"));
+        let destination = url::Url::parse(completed.headers.get("location").unwrap())?;
+        if fail {
+            assert_eq!(destination.path(), "/failed");
+            assert_eq!(
+                destination
+                    .query_pairs()
+                    .find(|(key, _)| key == "error")
+                    .unwrap()
+                    .1,
+                "invalid_code"
+            );
+            assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+            assert!(cookies(&completed).is_empty());
+            assert!(receipts.is_empty());
+        } else {
+            assert_eq!(destination.path(), "/done");
+            authenticated(&auth, &cookies(&completed), "custom-code@example.test").await;
+            assert_eq!(
+                db.text("SELECT access_token FROM accounts", &[])
+                    .await?
+                    .as_deref(),
+                Some("custom-access")
+            );
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].path, "/profile");
+            assert_eq!(
+                receipts[0]
+                    .headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer custom-access")
+            );
+        }
+        let after = db.tables(&["users", "accounts", "sessions"]).await?;
+        let replay =
+            super::oauth_profiles::complete(&auth, "generic", &authorization, &cookie).await;
+        let replay = url::Url::parse(replay.headers.get("location").unwrap())?;
+        assert_eq!(
+            replay
+                .query_pairs()
+                .find(|(key, _)| key == "error")
+                .unwrap()
+                .1,
+            "state_mismatch"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(peer.take().is_empty());
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, after);
         B::close(connection).await?;
     }
     Ok(())
