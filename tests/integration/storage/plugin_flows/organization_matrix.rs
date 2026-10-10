@@ -11,7 +11,8 @@ backend_tests!(
     organization_mixed_selectors_only_update_current_token_selection,
     organization_selection_returns_stored_metadata_text_without_rewriting_rows,
     revoked_cache_identity_retains_physical_organization_membership_checks,
-    organization_empty_update_storage_error
+    organization_empty_update_storage_error,
+    organization_ignored_default_patch_null_result
 );
 
 fn get(path: &str, query: &[(&str, &str)], cookie: &str) -> AuthRequest {
@@ -806,5 +807,100 @@ async fn organization_empty_update_storage_error<B: Backend>(db: Db) -> TestResu
     _ = db
         .execute("DROP TRIGGER organization_update_veto", &[])
         .await?;
+    B::close(connection).await
+}
+
+async fn organization_ignored_default_patch_null_result<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::new())
+        .build()
+        .await?;
+    let owner = signup(&auth, "ignore-owner@example.test").await;
+    let foreign = signup(&auth, "ignore-foreign@example.test").await;
+    let mut id = String::new();
+    for (actor, slug) in [(&owner, "ignore-target"), (&foreign, "ignore-foreign")] {
+        let created = call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":slug,"slug":slug})),
+                &cookies(actor),
+            ),
+            200,
+        )
+        .await;
+        if id.is_empty() {
+            id = body(&created)["id"].as_str().unwrap().into();
+        }
+    }
+    let before = db
+        .tables(&["users", "accounts", "sessions", "organization", "member"])
+        .await?;
+    for disappear in [false, true] {
+        let action = if disappear {
+            format!(
+                "DELETE FROM member WHERE organization_id='{}'; DELETE FROM organization WHERE id='{}';",
+                id.replace('\'', "''"),
+                id.replace('\'', "''")
+            )
+        } else {
+            String::new()
+        };
+        let trigger = format!(
+            "CREATE TRIGGER organization_update_ignore BEFORE UPDATE ON organization WHEN OLD.id='{}' BEGIN {} SELECT RAISE(IGNORE); END",
+            id.replace('\'', "''"),
+            action
+        );
+        _ = db.execute(&trigger, &[]).await?;
+        let response = call(
+            &auth,
+            request(
+                "/organization/update",
+                Some(json!({"organizationId":id,"data":{"name":"Ignored"}})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(response.body, b"null");
+        assert_eq!(
+            response.headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert!(!response.headers.contains_key("set-cookie"));
+        let after = db
+            .tables(&["users", "accounts", "sessions", "organization", "member"])
+            .await?;
+        if !disappear {
+            assert_eq!(after, before);
+        } else {
+            assert_eq!(after[..3], before[..3]);
+            for (table, index, foreign_key) in
+                [("organization", 3, "id"), ("member", 4, "organization_id")]
+            {
+                let old: Vec<Value> = serde_json::from_str(&before[index])?;
+                let current: Vec<Value> = serde_json::from_str(&db.table(table).await?)?;
+                assert_eq!(
+                    current,
+                    old.into_iter()
+                        .filter(|r| r[foreign_key] != id)
+                        .collect::<Vec<_>>()
+                );
+            }
+            assert_eq!(
+                db.text(
+                    "SELECT active_organization_id FROM sessions WHERE token=$1",
+                    &[body(&owner)["token"].as_str().unwrap()]
+                )
+                .await?
+                .as_deref(),
+                Some(id.as_str())
+            );
+        }
+        _ = db
+            .execute("DROP TRIGGER organization_update_ignore", &[])
+            .await?;
+    }
     B::close(connection).await
 }
