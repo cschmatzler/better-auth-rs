@@ -24,7 +24,8 @@ backend_tests!(
     disabled_custom_key_expiration_retains_default_lifetime_through_rename,
     banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_authority,
     api_key_builtin_fractional_generation,
-    api_key_raw_default_expiration
+    api_key_raw_default_expiration,
+    api_key_fractional_policy_bounds
 );
 
 fn raw(path: &str, text: &str, cookie: &str) -> AuthRequest {
@@ -2104,4 +2105,94 @@ async fn api_key_raw_default_expiration<B: Backend>(db: Db) -> TestResult {
         B::close(connection).await?;
     }
     Ok(())
+}
+
+async fn api_key_fractional_policy_bounds<B: Backend>(db: Db) -> TestResult {
+    struct Generator(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl ApiKeyGenerator for Generator {
+        async fn generate_key(&self, _: &ApiKeyGenerationOptions<'_>) -> AuthResult<String> {
+            Ok(format!(
+                "fractional-policy-secret-{}",
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ))
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let generator = Arc::new(Generator(std::sync::atomic::AtomicUsize::new(0)));
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(
+            ApiKeyPlugin::with_config(ApiKeyConfig {
+                custom_key_generator: Some(generator.clone()),
+                min_prefix_length: 1.5,
+                max_prefix_length: 2.5,
+                min_name_length: 1.5,
+                max_name_length: 3.5,
+                key_expiration: KeyExpirationConfig {
+                    min_expires_in: 1.5 / 86400.0,
+                    max_expires_in: 3.5 / 86400.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .configuration(ApiKeyConfig {
+                config_id: "nan-bounds".into(),
+                custom_key_generator: Some(generator.clone()),
+                min_prefix_length: f64::NAN,
+                max_prefix_length: f64::NAN,
+                min_name_length: f64::NAN,
+                max_name_length: f64::NAN,
+                key_expiration: KeyExpirationConfig {
+                    min_expires_in: f64::NAN,
+                    max_expires_in: f64::NAN,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .build()
+        .await?;
+    let owner = signup(&auth, "fractional-policy@example.test").await;
+    for input in [
+        json!({"name":"x"}),
+        json!({"name":"four"}),
+        json!({"prefix":"x"}),
+        json!({"prefix":"abc"}),
+        json!({"expiresIn":1}),
+        json!({"expiresIn":4}),
+    ] {
+        let before = db
+            .tables(&["users", "accounts", "sessions", "api_keys"])
+            .await?;
+        let denied = call(
+            &auth,
+            request("/api-key/create", Some(input), &cookies(&owner)),
+            400,
+        )
+        .await;
+        assert!(body(&denied)["code"].is_string());
+        assert_eq!(generator.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "api_keys"])
+                .await?,
+            before
+        );
+    }
+    for input in [
+        json!({"name":"😀","prefix":"ab","expiresIn":2}),
+        json!({"configId":"nan-bounds","name":"very-long-name","prefix":"very-long-prefix","expiresIn":1}),
+    ] {
+        let accepted = call(
+            &auth,
+            request("/api-key/create", Some(input.clone()), &cookies(&owner)),
+            200,
+        )
+        .await;
+        assert_eq!(body(&accepted)["name"], input["name"]);
+        assert_eq!(body(&accepted)["prefix"], input["prefix"]);
+        assert_eq!(body(&accepted)["referenceId"], body(&owner)["user"]["id"]);
+    }
+    assert_eq!(generator.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(db.count("api_keys").await?, 2);
+    B::close(connection).await
 }
