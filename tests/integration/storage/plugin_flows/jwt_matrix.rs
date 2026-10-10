@@ -22,7 +22,8 @@ backend_tests!(
     jwt_compact_revoked_principal_signing,
     jwt_server_claim_override_replacement,
     jwt_remote_signer_selection_options,
-    jwt_custom_cache_callback_shape
+    jwt_custom_cache_callback_shape,
+    jwt_server_key_override_replacement
 );
 
 #[derive(Default)]
@@ -1489,5 +1490,96 @@ async fn jwt_custom_cache_callback_shape<B: Backend>(db: Db) -> TestResult {
     assert!(claims["snapshot"].get("version").is_none());
     assert_eq!(db.table("sessions").await?, protected);
     authenticated(&auth, &cookies(&foreign), "shape-foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn jwt_server_key_override_replacement<B: Backend>(db: Db) -> TestResult {
+    use alibi::endpoint::EndpointOptions;
+    use alibi::plugins::jwt::{JwtAlgorithm, JwtKeyPairConfig};
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let setup = super::auth_probe::fast_builder::<B>(&connection)
+        .build()
+        .await?;
+    let foreign = signup(&setup, "override-key-foreign@example.test").await;
+    let protected = db.tables(&["users", "accounts", "sessions"]).await?;
+    let jwt = JwtPlugin::with_config(JwtPluginConfig {
+        key_pair: JwtKeyPairConfig {
+            algorithm: JwtAlgorithm::Es256,
+            ..Default::default()
+        },
+        disable_private_key_encryption: true,
+        rotation_interval: Some(chrono::Duration::hours(1)),
+        ..Default::default()
+    });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(jwt)
+        .build()
+        .await?;
+    for (overrides, algorithm, encrypted) in [
+        (None, jsonwebtoken::Algorithm::ES256, false),
+        (Some(json!({})), jsonwebtoken::Algorithm::EdDSA, true),
+        (
+            Some(json!({"rotationInterval":7200})),
+            jsonwebtoken::Algorithm::EdDSA,
+            true,
+        ),
+        (
+            Some(json!({"keyPairConfig":{"alg":"ES256"}})),
+            jsonwebtoken::Algorithm::ES256,
+            true,
+        ),
+        (
+            Some(json!({"disablePrivateKeyEncryption":true})),
+            jsonwebtoken::Algorithm::EdDSA,
+            false,
+        ),
+        (None, jsonwebtoken::Algorithm::ES256, false),
+    ] {
+        let mut input = json!({"payload":{"sub":"per-call-key-owner"}});
+        if let Some(overrides) = overrides {
+            input["overrideOptions"] = json!({"jwks":overrides});
+        }
+        let endpoint = JwtPlugin::sign_endpoint(parse_value("{}")?)
+            .with_body_value(parse_value(&input.to_string())?);
+        let token = auth
+            .dispatch_endpoint(endpoint, EndpointOptions::default())
+            .await?
+            .decode()?
+            .token;
+        let header = jsonwebtoken::decode_header(&token)?;
+        assert_eq!(header.alg, algorithm);
+        let id = header.kid.as_deref().unwrap();
+        assert_eq!(db.count("jwks").await?, 1);
+        let private = db
+            .text("SELECT private_key FROM jwks WHERE id=$1", &[id])
+            .await?
+            .unwrap();
+        let private: Value = serde_json::from_str(&private)?;
+        assert_eq!(private.is_string(), encrypted);
+        assert_eq!(private.is_object(), !encrypted);
+        let keys: jsonwebtoken::jwk::JwkSet =
+            serde_json::from_value(body(&call(&auth, request("/jwks", None, ""), 200).await))?;
+        let mut validation = jsonwebtoken::Validation::new(algorithm);
+        validation.set_audience(&[ORIGIN]);
+        validation.set_issuer(&[ORIGIN]);
+        let claims = jsonwebtoken::decode::<Value>(
+            &token,
+            &jsonwebtoken::DecodingKey::from_jwk(keys.find(id).unwrap())?,
+            &validation,
+        )?
+        .claims;
+        assert_eq!(claims["sub"], "per-call-key-owner");
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions"]).await?,
+            protected
+        );
+        assert_eq!(db.execute("DELETE FROM jwks WHERE id=$1", &[id]).await?, 1);
+    }
+    authenticated(
+        &auth,
+        &cookies(&foreign),
+        "override-key-foreign@example.test",
+    )
+    .await;
     B::close(connection).await
 }
