@@ -19,7 +19,8 @@ backend_tests!(
     two_factor_pending_unverified_totp_backup_recovery,
     two_factor_account_lock_pending_only_scope,
     two_factor_configured_account_lock_policy,
-    two_factor_otp_account_budget_coupling
+    two_factor_otp_account_budget_coupling,
+    two_factor_pending_orphan_owner_proof_retention
 );
 
 #[derive(Default)]
@@ -1353,5 +1354,107 @@ async fn two_factor_otp_account_budget_coupling<B: Backend>(db: Db) -> TestResul
         401,
     )
     .await;
+    B::close(connection).await
+}
+
+async fn two_factor_pending_orphan_owner_proof_retention<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(TwoFactorPlugin::with_config(TwoFactorConfig {
+            skip_verification_on_enable: true,
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let signed = signup(&auth, "orphan@example.test").await;
+    let id = body(&signed)["user"]["id"].as_str().unwrap().to_owned();
+    let (_, enrollment, _) = enroll(&auth, &cookies(&signed)).await;
+    let pending = sign_in(&auth, "orphan@example.test", json!({}), "").await;
+    let key=db.text("SELECT identifier FROM verifications WHERE value=$1 AND identifier LIKE '2fa-%' AND identifier NOT LIKE '2fa-attempts-%'",&[&id]).await?.unwrap();
+    _ = db
+        .execute(
+            "UPDATE verifications SET value='missing-physical-owner' WHERE identifier=$1",
+            &[&key],
+        )
+        .await?;
+    let before = db
+        .tables(&[
+            "two_factor",
+            "verifications",
+            "users",
+            "accounts",
+            "sessions",
+        ])
+        .await?;
+    let denied = call(
+        &auth,
+        request(
+            "/two-factor/verify-backup-code",
+            Some(json!({"code":enrollment["backupCodes"][0]})),
+            &cookies(&pending),
+        ),
+        401,
+    )
+    .await;
+    assert_eq!(body(&denied)["code"], "INVALID_TWO_FACTOR_COOKIE");
+    assert_eq!(
+        db.tables(&[
+            "two_factor",
+            "verifications",
+            "users",
+            "accounts",
+            "sessions"
+        ])
+        .await?,
+        before
+    );
+    _ = db
+        .execute(
+            "UPDATE verifications SET value=$1 WHERE identifier=$2",
+            &[&id, &key],
+        )
+        .await?;
+    let done = call(
+        &auth,
+        request(
+            "/two-factor/verify-backup-code",
+            Some(json!({"code":enrollment["backupCodes"][0]})),
+            &cookies(&pending),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&done)["user"]["id"], id);
+    authenticated(&auth, &cookies(&done), "orphan@example.test").await;
+    let stable = db
+        .tables(&[
+            "two_factor",
+            "verifications",
+            "users",
+            "accounts",
+            "sessions",
+        ])
+        .await?;
+    let _ = call(
+        &auth,
+        request(
+            "/two-factor/verify-backup-code",
+            Some(json!({"code":enrollment["backupCodes"][0]})),
+            &cookies(&pending),
+        ),
+        401,
+    )
+    .await;
+    assert_eq!(
+        db.tables(&[
+            "two_factor",
+            "verifications",
+            "users",
+            "accounts",
+            "sessions"
+        ])
+        .await?,
+        stable
+    );
     B::close(connection).await
 }
