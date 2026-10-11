@@ -33,7 +33,8 @@ backend_tests!(
     api_key_secondary_sdk_delete_index_scope,
     api_key_stale_reference_index_authority,
     api_key_selected_list_storage_isolation,
-    api_key_multistore_sort_pagination
+    api_key_multistore_sort_pagination,
+    api_key_wire_date_projection
 );
 
 fn raw(path: &str, text: &str, cookie: &str) -> AuthRequest {
@@ -3405,5 +3406,172 @@ async fn api_key_multistore_sort_pagination<B: Backend>(db: Db) -> TestResult {
             protected
         );
     }
+    B::close(connection).await
+}
+
+async fn api_key_wire_date_projection<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(ApiKeyPlugin::with_config(ApiKeyConfig {
+            enable_session_for_api_keys: true,
+            defer_updates: false,
+            rate_limit: RateLimitDefaults {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let owner = signup(&auth, "key-date-owner@example.test").await;
+    let foreign = signup(&auth, "key-date-foreign@example.test").await;
+    let issued = body(
+        &call(
+            &auth,
+            request(
+                "/api-key/create",
+                Some(json!({"name":"Date owner"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await,
+    );
+    let foreign_key = body(
+        &call(
+            &auth,
+            request(
+                "/api-key/create",
+                Some(json!({"name":"Foreign"})),
+                &cookies(&foreign),
+            ),
+            200,
+        )
+        .await,
+    );
+    let id = issued["id"].as_str().unwrap();
+    let dates = [
+        (
+            "createdAt",
+            "created_at",
+            "2026-10-01T00:00:00.016562+00:00",
+            "2026-10-01T00:00:00.016Z",
+        ),
+        (
+            "updatedAt",
+            "updated_at",
+            "2026-10-01T00:01:00.489730Z",
+            "2026-10-01T00:01:00.489Z",
+        ),
+        (
+            "lastRequest",
+            "last_request",
+            "2026-10-01T00:02:00.290730Z",
+            "2026-10-01T00:02:00.290Z",
+        ),
+        (
+            "lastRefillAt",
+            "last_refill_at",
+            "2026-10-01T05:33:00.123456+05:30",
+            "2026-10-01T00:03:00.123Z",
+        ),
+        (
+            "expiresAt",
+            "expires_at",
+            "2099-10-01T00:04:00.456789+00:00",
+            "2099-10-01T00:04:00.456Z",
+        ),
+    ];
+    for (_, column, stored, _) in dates {
+        _ = db
+            .execute(
+                &format!("UPDATE api_keys SET {column}=$1 WHERE id=$2"),
+                &[stored, id],
+            )
+            .await?;
+    }
+    let physical = db.table("api_keys").await?;
+    let principals = db.tables(&["users", "accounts", "sessions"]).await?;
+    let mut get = request("/api-key/get", None, &cookies(&owner));
+    _ = get.query.insert("id".into(), id.into());
+    let projected = body(&call(&auth, get.clone(), 200).await);
+    for (field, _, _, expected) in dates {
+        assert_eq!(projected[field], expected);
+    }
+    let listed = body(&call(&auth, request("/api-key/list", None, &cookies(&owner)), 200).await);
+    assert_eq!(
+        listed["apiKeys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|k| k["id"] == id)
+            .unwrap(),
+        &projected
+    );
+    _ = get.headers.insert("cookie".into(), cookies(&foreign));
+    let denied = call(&auth, get, 404).await;
+    assert_eq!(body(&denied)["code"], "KEY_NOT_FOUND");
+    assert_eq!(db.table("api_keys").await?, physical);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        principals
+    );
+    let verified = Box::pin(auth.dispatch_endpoint(
+        ApiKeyPlugin::verify_endpoint(&ApiKeyVerificationInput {
+            key: issued["key"].as_str().unwrap().into(),
+            config_id: None,
+            permissions: None,
+        })?,
+        EndpointOptions::default(),
+    ))
+    .await?
+    .decode()?;
+    assert!(verified.valid);
+    let key = serde_json::to_value(verified.key.unwrap())?;
+    for field in ["createdAt", "lastRefillAt", "expiresAt"] {
+        assert_eq!(key[field], projected[field]);
+    }
+    let mut input = request("/get-session", None, &cookies(&owner));
+    _ = input
+        .headers
+        .insert("x-api-key".into(), issued["key"].as_str().unwrap().into());
+    let from = chrono::Utc::now().timestamp_millis();
+    let virtual_session = body(&call(&auth, input, 200).await);
+    let to = chrono::Utc::now().timestamp_millis();
+    assert_eq!(virtual_session["user"]["id"], body(&owner)["user"]["id"]);
+    assert_eq!(
+        virtual_session["session"]["expiresAt"],
+        "2099-10-01T00:04:00.456Z"
+    );
+    for field in ["createdAt", "updatedAt"] {
+        let actual = chrono::DateTime::parse_from_rfc3339(
+            virtual_session["session"][field].as_str().unwrap(),
+        )?
+        .timestamp_millis();
+        assert!((from..=to).contains(&actual));
+    }
+    for (_, column, stored, _) in dates
+        .iter()
+        .filter(|(field, _, _, _)| ["createdAt", "lastRefillAt", "expiresAt"].contains(field))
+    {
+        assert_eq!(
+            db.text(&format!("SELECT {column} FROM api_keys WHERE id=$1"), &[id])
+                .await?
+                .as_deref(),
+            Some(*stored)
+        );
+    }
+    let foreign_rows: Vec<Value> = serde_json::from_str(&physical)?;
+    let after: Vec<Value> = serde_json::from_str(&db.table("api_keys").await?)?;
+    assert_eq!(
+        after.iter().find(|r| r["id"] == foreign_key["id"]),
+        foreign_rows.iter().find(|r| r["id"] == foreign_key["id"])
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        principals
+    );
+    authenticated(&auth, &cookies(&owner), "key-date-owner@example.test").await;
+    authenticated(&auth, &cookies(&foreign), "key-date-foreign@example.test").await;
     B::close(connection).await
 }
