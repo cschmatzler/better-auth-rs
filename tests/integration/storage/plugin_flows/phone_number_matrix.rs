@@ -21,6 +21,7 @@ backend_tests!(
     phone_missing_otp_sender_precedes_application_validation,
     phone_external_verifier_cannot_authorize_local_password_reset,
     phone_verifier_rejection_preserves_local_proof_until_successful_retry,
+    phone_callback_context_preserves_proof_consumption_and_committed_owner,
     revoked_compact_owner_consumes_local_phone_proof_without_recreating_browser
 );
 
@@ -1090,6 +1091,169 @@ async fn phone_verifier_rejection_preserves_local_proof_until_successful_retry<B
         B::close(connection).await?;
     }
     Ok(())
+}
+
+async fn phone_callback_context_preserves_proof_consumption_and_committed_owner<B: Backend>(
+    db: Db,
+) -> TestResult {
+    struct Application {
+        raw: crate::storage::Raw,
+        sent: Mutex<Vec<PhoneOtpDelivery>>,
+        events: Mutex<Vec<(&'static str, AuthRequest, bool)>>,
+    }
+    impl Application {
+        async fn capture(
+            &self,
+            phase: &'static str,
+            c: &CallbackContext,
+            number: &str,
+        ) -> AuthResult<bool> {
+            let live = self
+                .raw
+                .count_where(
+                    "SELECT COUNT(*) FROM verifications WHERE identifier=$1",
+                    &[number],
+                )
+                .await
+                .map_err(|e| AuthError::internal(e.to_string()))?
+                == 1;
+            self.events
+                .lock()
+                .unwrap()
+                .push((phase, c.request.clone().unwrap(), live));
+            Ok(live)
+        }
+    }
+    #[async_trait]
+    impl SendPhoneOtp for Application {
+        async fn send(&self, d: &PhoneOtpDelivery, c: &CallbackContext) -> AuthResult<()> {
+            assert!(self.capture("sender", c, &d.phone_number).await?);
+            self.sent.lock().unwrap().push(d.clone());
+            Ok(())
+        }
+    }
+    #[async_trait]
+    impl PhoneOtpVerifier for Application {
+        async fn verify(&self, d: &PhoneOtpDelivery, c: &CallbackContext) -> AuthResult<bool> {
+            let live = self.capture("verifier", c, &d.phone_number).await?;
+            Ok(live
+                && self
+                    .sent
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|sent| sent.phone_number == d.phone_number && sent.code == d.code))
+        }
+    }
+    #[async_trait]
+    impl PhoneVerificationHook for Application {
+        async fn verified(
+            &self,
+            d: &PhoneNumberVerification,
+            c: &CallbackContext,
+        ) -> AuthResult<()> {
+            assert!(!self.capture("completed", c, &d.phone_number).await?);
+            assert_eq!(self.raw.count_where("SELECT COUNT(*) FROM users WHERE id=$1 AND phone_number=$2 AND phone_number_verified=1",&[&d.user.id,&d.phone_number]).await.map_err(|e| AuthError::internal(e.to_string()))?,1);
+            assert_eq!(
+                self.raw
+                    .count_where("SELECT COUNT(*) FROM sessions", &[])
+                    .await
+                    .map_err(|e| AuthError::internal(e.to_string()))?,
+                0
+            );
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let application = Arc::new(Application {
+        raw: db.raw.clone(),
+        sent: Mutex::new(Vec::new()),
+        events: Mutex::new(Vec::new()),
+    });
+    let auth = fast_builder::<B>(&connection)
+        .plugin(PhoneNumberPlugin::new(PhoneNumberConfig {
+            send_otp: Some(application.clone()),
+            verify_otp: Some(application.clone()),
+            callback_on_verification: Some(application.clone()),
+            sign_up_on_verification: Some(Arc::new(Identity)),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let marked = |path: &str, input: Value| {
+        let mut request = super::request(path, Some(input), "")
+            .with_url(url::Url::parse(&format!("{ORIGIN}/api/auth{path}")).unwrap());
+        _ = request
+            .headers
+            .insert("x-callback-probe".into(), "issue207".into());
+        request
+    };
+    let number = "+15550000207";
+    let sent = marked("/phone-number/send-otp", json!({"phoneNumber":number}));
+    _ = call(&auth, sent.clone(), 200).await;
+    let delivery = application.sent.lock().unwrap().last().unwrap().clone();
+    let before = db
+        .tables(&["users", "accounts", "sessions", "verifications"])
+        .await?;
+    _ = call(
+        &auth,
+        marked(
+            "/phone-number/verify",
+            json!({"phoneNumber":"+15550000208","code":delivery.code}),
+        ),
+        400,
+    )
+    .await;
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "verifications"])
+            .await?,
+        before
+    );
+    let verify = marked(
+        "/phone-number/verify",
+        json!({"phoneNumber":number,"code":delivery.code}),
+    );
+    let accepted = call(&auth, verify.clone(), 200).await;
+    let events = application.events.lock().unwrap().clone();
+    assert_eq!(
+        events
+            .iter()
+            .map(|(phase, _, live)| (*phase, *live))
+            .collect::<Vec<_>>(),
+        [
+            ("sender", true),
+            ("verifier", false),
+            ("verifier", true),
+            ("completed", false)
+        ]
+    );
+    for (index, (_, actual, _)) in events.iter().enumerate() {
+        let expected = if index == 0 { &sent } else { &verify };
+        assert_eq!(actual.url(), expected.url());
+        assert_eq!(actual.method, HttpMethod::Post);
+        assert_eq!(actual.headers["x-callback-probe"], "issue207");
+        if index != 1 {
+            assert_eq!(actual.body, expected.body);
+        }
+    }
+    let current = body(
+        &call(
+            &auth,
+            request("/get-session", None, &cookies(&accepted)),
+            200,
+        )
+        .await,
+    );
+    assert_eq!(current["user"]["id"], body(&accepted)["user"]["id"]);
+    assert_eq!(current["user"]["phoneNumber"], number);
+    assert_eq!(current["user"]["phoneNumberVerified"], true);
+    assert_eq!(db.count("accounts").await?, 0);
+    assert_eq!(db.count("sessions").await?, 1);
+    assert_eq!(db.count("verifications").await?, 0);
+    let stable = db.tables(&["users", "accounts", "sessions"]).await?;
+    _ = call(&auth, verify, 400).await;
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, stable);
+    B::close(connection).await
 }
 
 async fn revoked_compact_owner_consumes_local_phone_proof_without_recreating_browser<B: Backend>(
