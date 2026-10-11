@@ -21,7 +21,8 @@ backend_tests!(
     device_overlapping_reviews_retain_first_claim_authority,
     device_custom_user_codes_prefer_exact_lookup,
     device_user_code_collision_retries_without_replacing_grant,
-    device_issuance_retains_prebound_owner_authority
+    device_issuance_retains_prebound_owner_authority,
+    device_application_result_owns_consumed_receipt_identity
 );
 
 type Events = Arc<Mutex<Vec<Value>>>;
@@ -1673,6 +1674,168 @@ async fn device_issuance_retains_prebound_owner_authority<B: Backend>(db: Db) ->
         let now: Vec<Value> = serde_json::from_str(now)?;
         assert!(before.iter().all(|r| now.contains(r)));
     }
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn device_application_result_owns_consumed_receipt_identity<B: Backend>(
+    db: Db,
+) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    _=db.execute("CREATE TABLE completion_receipts (grant_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, audience TEXT NOT NULL, nonce TEXT NOT NULL)",&[]).await?;
+    let events = Events::default();
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(
+            DeviceAuthorizationPlugin::new()
+                .interval(chrono::Duration::zero())
+                .grant(Grant(events)),
+        )
+        .build()
+        .await?;
+    let owner = signup(&auth, "owner@example.test").await;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let owner_id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+    let baseline = db.tables(&["users", "accounts", "sessions"]).await?;
+    for expired in [false, true] {
+        let nonce = if expired {
+            "expired-nonce"
+        } else {
+            "actual-nonce"
+        };
+        let issued = body(
+            &call(
+                &auth,
+                request(
+                    "/device/code",
+                    Some(json!({"audience":"application-api","nonce":nonce})),
+                    "",
+                ),
+                200,
+            )
+            .await,
+        );
+        let code = issued["device_code"].as_str().unwrap();
+        let uc = issued["user_code"].as_str().unwrap();
+        let id = db
+            .text("SELECT id FROM device_code WHERE device_code=$1", &[code])
+            .await?
+            .unwrap();
+        let mut review = request("/device", None, &cookies(&owner));
+        review.set_query_pairs([("user_code", uc)]);
+        _ = call(&auth, review, 200).await;
+        _ = call(
+            &auth,
+            request(
+                "/device/approve",
+                Some(json!({"userCode":uc})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+        if expired {
+            db.set_timestamp(
+                "device_code",
+                "expires_at",
+                ("device_code", code),
+                chrono::Utc::now() - chrono::Duration::minutes(1),
+            )
+            .await?;
+            assert!(
+                redeem_device_code(
+                    auth.context(),
+                    code,
+                    &Policy {
+                        nonce: json!(nonce),
+                        reject_preparation: false
+                    }
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(db.count("completion_receipts").await?, 1);
+            assert_eq!(rows(&db, code).await?, 0);
+            continue;
+        }
+        assert!(
+            redeem_device_code(
+                auth.context(),
+                code,
+                &Policy {
+                    nonce: json!("foreign-nonce"),
+                    reject_preparation: false
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(rows(&db, code).await?, 1);
+        assert_eq!(db.count("completion_receipts").await?, 0);
+        assert!(
+            redeem_device_code(
+                auth.context(),
+                code,
+                &Policy {
+                    nonce: json!(nonce),
+                    reject_preparation: true
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(rows(&db, code).await?, 1);
+        assert_eq!(db.count("completion_receipts").await?, 0);
+        let result = redeem_device_code(
+            auth.context(),
+            code,
+            &Policy {
+                nonce: json!(nonce),
+                reject_preparation: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.claimed_device_code.device_code.id, id);
+        assert_eq!(
+            result.claimed_device_code.device_code.user_id.as_deref(),
+            Some(owner_id.as_str())
+        );
+        assert_eq!(result.user.id(), owner_id);
+        assert_eq!(
+            result.claimed_device_code.fields,
+            object(json!({"grantAudience":"application-api","grantNonce":nonce}))
+        );
+        assert_eq!(result.authorization_context, json!({"nonce":nonce}));
+        assert_eq!(
+            result.redemption_context,
+            json!({"audience":"application-api"})
+        );
+        assert_eq!(rows(&db, code).await?, 0);
+        assert_eq!(db.execute("INSERT INTO completion_receipts (grant_id,user_id,audience,nonce) VALUES ($1,$2,$3,$4)",&[&result.claimed_device_code.device_code.id,result.user.id().as_ref(),result.claimed_device_code.fields["grantAudience"].as_str().unwrap(),result.authorization_context["nonce"].as_str().unwrap()]).await?,1);
+        assert_eq!(
+            db.text("SELECT grant_id FROM completion_receipts", &[])
+                .await?
+                .as_deref(),
+            Some(id.as_str())
+        );
+        assert!(
+            redeem_device_code(
+                auth.context(),
+                code,
+                &Policy {
+                    nonce: json!(nonce),
+                    reject_preparation: false
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(db.count("completion_receipts").await?, 1);
+    }
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        baseline
+    );
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
 }
