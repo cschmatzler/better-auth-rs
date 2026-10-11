@@ -23,7 +23,8 @@ backend_tests!(
     phone_verifier_rejection_preserves_local_proof_until_successful_retry,
     phone_callback_context_preserves_proof_consumption_and_committed_owner,
     revoked_compact_owner_consumes_local_phone_proof_without_recreating_browser,
-    phone_background_notification_lifecycle
+    phone_background_notification_lifecycle,
+    phone_trusted_device_completion_forwards_rotated_owned_proof
 );
 
 #[derive(Default)]
@@ -1629,4 +1630,184 @@ async fn phone_background_notification_lifecycle<B: Backend>(db: Db) -> TestResu
         }
     }
     Ok(())
+}
+
+async fn phone_trusted_device_completion_forwards_rotated_owned_proof<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::plugins::{
+        TwoFactorPlugin,
+        two_factor::{SendTwoFactorOtp, TwoFactorConfig},
+    };
+    #[derive(Default)]
+    struct Factor(Mutex<Vec<String>>);
+    #[async_trait]
+    impl SendTwoFactorOtp for Factor {
+        async fn send(&self, _: &alibi::UserView, code: &str) -> AuthResult<()> {
+            self.0.lock().unwrap().push(code.into());
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let outbox = Arc::new(Outbox::default());
+    let factor = Arc::new(Factor::default());
+    let auth = fast_builder::<B>(&connection)
+        .plugin(PhoneNumberPlugin::new(PhoneNumberConfig {
+            send_otp: Some(outbox.clone()),
+            require_verification: true,
+            ..Default::default()
+        }))
+        .plugin(TwoFactorPlugin::with_config(TwoFactorConfig {
+            send_otp: Some(factor.clone()),
+            skip_verification_on_enable: true,
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let number = "+15556667777";
+    let signed = call(&auth,request("/sign-up/email",Some(json!({"email":"trusted-phone@example.test","name":"Phone owner","password":PASSWORD,"phoneNumber":number})),""),200).await;
+    let id = body(&signed)["user"]["id"].as_str().unwrap().to_owned();
+    let foreign = signup(&auth, "trusted-phone-foreign@example.test").await;
+    let _ = call(
+        &auth,
+        request(
+            "/phone-number/send-otp",
+            Some(json!({"phoneNumber":number})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    let _ = call(
+        &auth,
+        request(
+            "/phone-number/verify",
+            Some(json!({"phoneNumber":number,"code":outbox.last().code,"disableSession":true})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    let _ = call(
+        &auth,
+        request(
+            "/two-factor/enable",
+            Some(json!({"password":PASSWORD,"method":"otp"})),
+            &cookies(&signed),
+        ),
+        200,
+    )
+    .await;
+    let pending = call(
+        &auth,
+        request(
+            "/sign-in/phone-number",
+            Some(json!({"phoneNumber":number,"password":PASSWORD,"rememberMe":false})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&pending)["twoFactorRedirect"], true);
+    assert!(body(&pending).get("token").is_none());
+    let _ = call(
+        &auth,
+        request("/two-factor/send-otp", Some(json!({})), &cookies(&pending)),
+        200,
+    )
+    .await;
+    let code = factor.0.lock().unwrap().last().unwrap().clone();
+    let done = call(
+        &auth,
+        request(
+            "/two-factor/verify-otp",
+            Some(json!({"code":code,"trustDevice":true})),
+            &cookies(&pending),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&done)["user"]["id"], id);
+    authenticated(&auth, &cookies(&done), "trusted-phone@example.test").await;
+    let original = cookies(&done)
+        .split("; ")
+        .find(|h| h.starts_with("better-auth.trust_device="))
+        .unwrap()
+        .to_owned();
+    let old_key = db.text("SELECT identifier FROM verifications WHERE identifier LIKE 'trust-device-%' AND value=$1",&[&id]).await?.unwrap();
+    let foreign_state = db
+        .text(
+            "SELECT token FROM sessions WHERE user_id=$1",
+            &[body(&foreign)["user"]["id"].as_str().unwrap()],
+        )
+        .await?;
+    let trusted = call(
+        &auth,
+        request(
+            "/sign-in/phone-number",
+            Some(json!({"phoneNumber":number,"password":PASSWORD})),
+            &original,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&trusted)["user"]["id"], id);
+    assert_ne!(body(&trusted)["token"], body(&done)["token"]);
+    assert!(body(&trusted).get("twoFactorRedirect").is_none());
+    let rotated = cookies(&trusted)
+        .split("; ")
+        .find(|h| h.starts_with("better-auth.trust_device="))
+        .unwrap()
+        .to_owned();
+    assert_ne!(rotated, original);
+    assert!(
+        auth.store()
+            .get_latest_verification_by_identifier(&old_key)
+            .await?
+            .is_none()
+    );
+    let next_key = db.text("SELECT identifier FROM verifications WHERE identifier LIKE 'trust-device-%' AND value=$1",&[&id]).await?.unwrap();
+    assert_ne!(old_key, next_key);
+    authenticated(&auth, &cookies(&trusted), "trusted-phone@example.test").await;
+    let count = db.count("sessions").await?;
+    let replay = call(
+        &auth,
+        request(
+            "/sign-in/phone-number",
+            Some(json!({"phoneNumber":number,"password":PASSWORD})),
+            &original,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&replay)["twoFactorRedirect"], true);
+    assert_eq!(db.count("sessions").await?, count);
+    assert!(
+        auth.store()
+            .get_latest_verification_by_identifier(&next_key)
+            .await?
+            .is_some()
+    );
+    let fresh = call(
+        &auth,
+        request(
+            "/sign-in/phone-number",
+            Some(json!({"phoneNumber":number,"password":PASSWORD})),
+            &rotated,
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&fresh)["user"]["id"], id);
+    assert!(body(&fresh).get("twoFactorRedirect").is_none());
+    authenticated(&auth, &cookies(&fresh), "trusted-phone@example.test").await;
+    assert_eq!(
+        db.text(
+            "SELECT token FROM sessions WHERE user_id=$1",
+            &[body(&foreign)["user"]["id"].as_str().unwrap()]
+        )
+        .await?,
+        foreign_state
+    );
+    B::close(connection).await
 }
