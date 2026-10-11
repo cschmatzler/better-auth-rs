@@ -17,7 +17,9 @@ backend_tests!(
     anonymous_transfer_uses_original_completed_snapshot,
     anonymous_transfer_failure_preserves_committed_login,
     anonymous_database_hook_errors_preserve_stage_commit,
-    anonymous_issuance_ignores_tampered_browser_preference
+    anonymous_issuance_ignores_tampered_browser_preference,
+    anonymous_transfer_retains_cached_old_projection_and_new_completed_owner,
+    anonymous_passwordless_completion_paths_transfer_actual_owner
 );
 
 #[derive(Default)]
@@ -788,4 +790,484 @@ async fn anonymous_issuance_ignores_tampered_browser_preference<B: Backend>(db: 
     authenticated(&auth, &cookies(&owner), "owner@example.test").await;
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
+}
+
+async fn anonymous_transfer_retains_cached_old_projection_and_new_completed_owner<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::plugins::MultiSessionPlugin;
+    use alibi::{CookieCacheConfig, CookieCacheStrategy};
+    struct Capture(Mutex<Vec<Value>>);
+    #[async_trait::async_trait]
+    impl LinkAnonymousAccount for Capture {
+        async fn link(&self, l: &AnonymousLink, _: &AuthRequest) -> AuthResult<()> {
+            self.0.lock().unwrap().push(json!({"oldUser":l.anonymous_user,"oldSession":l.anonymous_session,"newUser":l.new_user,"newSession":l.new_session}));
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let config = AuthConfig::new(SECRET)
+        .base_url(ORIGIN)
+        .session_cookie_cache(CookieCacheConfig {
+            enabled: true,
+            strategy: CookieCacheStrategy::Compact,
+            ..Default::default()
+        });
+    let linker = Arc::new(Capture(Mutex::new(Vec::new())));
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(AnonymousPlugin::with_config(AnonymousConfig {
+            on_link_account: Some(linker.clone()),
+            ..Default::default()
+        }))
+        .plugin(MultiSessionPlugin::new())
+        .build()
+        .await?;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let baseline = db.tables(&["users", "accounts", "sessions"]).await?;
+    let anon = call(
+        &auth,
+        request("/sign-in/anonymous", Some(json!({})), ""),
+        200,
+    )
+    .await;
+    let jar = cookies(&anon);
+    let original = body(&call(&auth, request("/get-session", None, &jar), 200).await);
+    let old_id = original["user"]["id"].as_str().unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE users SET name='Physical Changed Anonymous' WHERE id=$1",
+            &[old_id]
+        )
+        .await?,
+        1
+    );
+    let completed=call(&auth,request("/sign-up/email",Some(json!({"email":"upgrade@example.test","name":"Completed Real Owner","password":PASSWORD})),&jar),200).await;
+    let new = body(&completed);
+    let receipts = linker.0.lock().unwrap().clone();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["oldUser"], original["user"]);
+    assert_eq!(receipts[0]["oldSession"], original["session"]);
+    assert_eq!(receipts[0]["newUser"], new["user"]);
+    assert_eq!(receipts[0]["newSession"]["token"], new["token"]);
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM users WHERE id=$1", &[old_id])
+            .await?,
+        0
+    );
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM sessions WHERE user_id=$1", &[old_id])
+            .await?,
+        0
+    );
+    let id = new["user"]["id"].as_str().unwrap();
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM sessions WHERE user_id=$1", &[id])
+            .await?,
+        1
+    );
+    assert!(
+        completed
+            .headers
+            .get_all("set-cookie")
+            .any(|x| x.contains("_multi-") && !x.contains("Max-Age=0"))
+    );
+    let read = body(
+        &call(
+            &auth,
+            request("/get-session", None, &cookies(&completed)),
+            200,
+        )
+        .await,
+    );
+    assert_eq!(read["user"], new["user"]);
+    assert_eq!(read["session"]["token"], new["token"]);
+    let after = db.tables(&["users", "accounts", "sessions"]).await?;
+    for (before, now) in baseline.iter().zip(after.iter()) {
+        let before: Vec<Value> = serde_json::from_str(before)?;
+        let now: Vec<Value> = serde_json::from_str(now)?;
+        assert!(before.iter().all(|x| now.contains(x)));
+    }
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn anonymous_passwordless_completion_paths_transfer_actual_owner<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use super::passwordless::Mailbox;
+    use alibi::plugins::{
+        email_otp::{EmailOtpConfig, EmailOtpDelivery, EmailOtpPlugin},
+        magic_link::{MagicLinkConfig, MagicLinkDelivery, MagicLinkPlugin},
+        phone_number::{PhoneNumberConfig, PhoneNumberPlugin, PhoneOtpDelivery},
+    };
+    struct Capture(Mutex<Vec<Value>>);
+    #[async_trait::async_trait]
+    impl LinkAnonymousAccount for Capture {
+        async fn link(&self, a: &AnonymousLink, r: &AuthRequest) -> AuthResult<()> {
+            self.0.lock().unwrap().push(json!({"oldUser":a.anonymous_user,"oldSession":a.anonymous_session,"newUser":a.new_user,"newSession":a.new_session,"path":r.path}));
+            Ok(())
+        }
+    }
+    for method in ["magic", "email-otp-verification", "phone"] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let magic = Arc::new(Mailbox::<MagicLinkDelivery>::default());
+        let email = Arc::new(Mailbox::<EmailOtpDelivery>::default());
+        let phone = Arc::new(Mailbox::<PhoneOtpDelivery>::default());
+        let capture = Arc::new(Capture(Mutex::new(Vec::new())));
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(alibi::plugins::SessionManagementPlugin::new())
+            .plugin(MagicLinkPlugin::new(MagicLinkConfig {
+                send_magic_link: Some(magic.clone()),
+                ..Default::default()
+            }))
+            .plugin(EmailOtpPlugin::new(EmailOtpConfig {
+                send_verification_otp: Some(email.clone()),
+                auto_sign_in_after_verification: true,
+                ..Default::default()
+            }))
+            .plugin(PhoneNumberPlugin::new(PhoneNumberConfig {
+                send_otp: Some(phone.clone()),
+                ..Default::default()
+            }))
+            .plugin(AnonymousPlugin::with_config(AnonymousConfig {
+                on_link_account: Some(capture.clone()),
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let number = "+15552224444";
+        let target = call(&auth,request("/sign-up/email",Some(json!({"email":"passwordless-target@example.test","password":PASSWORD,"name":"Target","phoneNumber":number})),""),200).await;
+        let target_id = body(&target)["user"]["id"].as_str().unwrap().to_owned();
+        let foreign = signup(&auth, "passwordless-foreign@example.test").await;
+        let foreign_id = body(&foreign)["user"]["id"].as_str().unwrap().to_owned();
+        let foreign_token = db
+            .text(
+                "SELECT token FROM sessions WHERE user_id=$1",
+                &[&foreign_id],
+            )
+            .await?;
+        let anonymous = call(
+            &auth,
+            request("/sign-in/anonymous", Some(json!({})), ""),
+            200,
+        )
+        .await;
+        let old_id = body(&anonymous)["user"]["id"].as_str().unwrap().to_owned();
+        let original = body(
+            &call(
+                &auth,
+                request("/get-session", None, &cookies(&anonymous)),
+                200,
+            )
+            .await,
+        );
+        let mut redeem = match method {
+            "magic" => {
+                let _ = call(
+                    &auth,
+                    request(
+                        "/sign-in/magic-link",
+                        Some(json!({"email":"passwordless-target@example.test"})),
+                        "",
+                    ),
+                    200,
+                )
+                .await;
+                let url = url::Url::parse(&magic.take().url)?;
+                let mut r = request("/magic-link/verify", None, &cookies(&anonymous));
+                r.query.extend(url.query_pairs().into_owned());
+                r
+            }
+            "email-otp-verification" => {
+                let _=call(&auth,request("/email-otp/send-verification-otp",Some(json!({"email":"passwordless-target@example.test","type":"email-verification"})),""),200).await;
+                request(
+                    "/email-otp/verify-email",
+                    Some(
+                        json!({"email":"passwordless-target@example.test","otp":email.take().otp}),
+                    ),
+                    &cookies(&anonymous),
+                )
+            }
+            _ => {
+                let _ = call(
+                    &auth,
+                    request(
+                        "/phone-number/send-otp",
+                        Some(json!({"phoneNumber":number})),
+                        "",
+                    ),
+                    200,
+                )
+                .await;
+                request(
+                    "/phone-number/verify",
+                    Some(json!({"phoneNumber":number,"code":phone.take().code})),
+                    &cookies(&anonymous),
+                )
+            }
+        };
+        _ = redeem
+            .headers
+            .insert("x-anonymous-marker".into(), method.into());
+        let before = db.tables(&["users", "accounts", "sessions"]).await?;
+        let mut invalid = redeem.clone();
+        if method == "magic" {
+            _ = invalid
+                .query
+                .insert("token".into(), "unissued-token".into());
+        } else {
+            let mut b: Value = serde_json::from_slice(invalid.body.as_ref().unwrap())?;
+            b[if method == "phone" { "code" } else { "otp" }] = json!("unissued-code");
+            invalid.body = Some(serde_json::to_vec(&b)?);
+        }
+        let denied = call(&auth, invalid, if method == "magic" { 302 } else { 400 }).await;
+        assert!(denied.headers.get_all("set-cookie").next().is_none());
+        assert!(capture.0.lock().unwrap().is_empty());
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+        let done = call(
+            &auth,
+            redeem.clone(),
+            if method == "magic" { 302 } else { 200 },
+        )
+        .await;
+        let current = body(&call(&auth, request("/get-session", None, &cookies(&done)), 200).await);
+        assert_eq!(current["user"]["id"], target_id);
+        let receipts = capture.0.lock().unwrap().clone();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0]["oldUser"], original["user"]);
+        assert_eq!(receipts[0]["oldSession"], original["session"]);
+        assert_eq!(receipts[0]["newUser"]["id"], target_id);
+        assert_eq!(
+            receipts[0]["newSession"]["token"],
+            current["session"]["token"]
+        );
+        assert!(
+            receipts[0]["path"]
+                .as_str()
+                .unwrap()
+                .ends_with(match method {
+                    "magic" => "/magic-link/verify",
+                    "phone" => "/phone-number/verify",
+                    _ => "/email-otp/verify-email",
+                })
+        );
+        assert_eq!(
+            db.count_where("SELECT COUNT(*) FROM users WHERE id=$1", &[&old_id])
+                .await?,
+            0
+        );
+        assert_eq!(
+            db.count_where("SELECT COUNT(*) FROM sessions WHERE user_id=$1", &[&old_id])
+                .await?,
+            0
+        );
+        let count = db.count("sessions").await?;
+        let _ = call(&auth, redeem, if method == "magic" { 302 } else { 400 }).await;
+        assert_eq!(capture.0.lock().unwrap().len(), 1);
+        assert_eq!(db.count("sessions").await?, count);
+        assert_eq!(
+            db.text(
+                "SELECT token FROM sessions WHERE user_id=$1",
+                &[&foreign_id]
+            )
+            .await?,
+            foreign_token
+        );
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "passwordless-foreign@example.test",
+        )
+        .await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(feature = "seaorm")]
+async fn anonymous_new_owner_callback_retains_hidden_application_fields() -> TestResult {
+    use alibi::AuthSession;
+    #[expect(
+        unreachable_pub,
+        reason = "SeaORM derives require public model and relation types within the application schema"
+    )]
+    mod application_user {
+        use alibi::seaorm::sea_orm::{self, entity::prelude::*};
+        use chrono::{DateTime, Utc};
+        #[derive(
+            Clone, Debug, PartialEq, serde::Serialize, alibi::seaorm::AuthEntity, DeriveEntityModel,
+        )]
+        #[sea_orm(table_name = "users")]
+        #[auth(role = "user", secondary_storage)]
+        #[serde(rename_all = "camelCase")]
+        pub struct Model {
+            #[sea_orm(primary_key, auto_increment = false)]
+            pub id: String,
+            pub name: Option<String>,
+            pub email: Option<String>,
+            pub email_verified: bool,
+            pub image: Option<String>,
+            pub username: Option<String>,
+            pub display_username: Option<String>,
+            pub two_factor_enabled: Option<bool>,
+            pub role: Option<String>,
+            pub banned: Option<bool>,
+            pub ban_reason: Option<String>,
+            pub ban_expires: Option<DateTime<Utc>>,
+            #[sea_orm(column_type = "JsonBinary")]
+            pub metadata: alibi::seaorm::JsonMetadata,
+            pub is_anonymous: Option<bool>,
+            pub phone_number: Option<String>,
+            pub phone_number_verified: Option<bool>,
+            pub last_login_method: Option<String>,
+            pub created_at: DateTime<Utc>,
+            pub updated_at: DateTime<Utc>,
+            #[sea_orm(column_name = "cargo_label")]
+            pub cargo_label: Option<String>,
+            #[sea_orm(column_name = "cargo_hidden")]
+            pub cargo_hidden: Option<String>,
+        }
+        #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+        pub enum Relation {}
+        impl ActiveModelBehavior for ActiveModel {}
+    }
+    type Bundled = <crate::storage::SeaOrm as Backend>::Schema;
+    struct ApplicationSchema;
+    impl AuthSchema for ApplicationSchema {
+        type User = application_user::Model;
+        type Session = <Bundled as AuthSchema>::Session;
+        type Account = <Bundled as AuthSchema>::Account;
+        type Verification = <Bundled as AuthSchema>::Verification;
+    }
+    struct Hook(crate::storage::Raw);
+    #[async_trait::async_trait]
+    impl<H: alibi::store::HookBackend> DatabaseHooks<ApplicationSchema, H> for Hook {
+        async fn after_create_session(
+            &self,
+            s: &<ApplicationSchema as AuthSchema>::Session,
+            c: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<()> {
+            if c.request
+                .as_ref()
+                .is_some_and(|r| r.path.ends_with("/sign-up/email"))
+            {
+                _=self.0.execute("UPDATE users SET name='Stored Hook Name',cargo_label='Application Stored',cargo_hidden='Stored Secret' WHERE id=$1",&[s.user_id().as_ref()]).await.map_err(|e|alibi::AuthError::internal(e.to_string()))?;
+            }
+            Ok(())
+        }
+    }
+    struct Capture(Mutex<Vec<Value>>);
+    #[async_trait::async_trait]
+    impl LinkAnonymousAccount for Capture {
+        async fn link(&self, a: &AnonymousLink, _: &AuthRequest) -> AuthResult<()> {
+            self.0.lock().unwrap().push(
+                json!({"oldUser":a.anonymous_user,"newUser":a.new_user,"newSession":a.new_session}),
+            );
+            Ok(())
+        }
+    }
+    let db = Db::sqlite().await?;
+    let (connection, _) = db.migrated::<crate::storage::SeaOrm>(SECRET).await?;
+    _ = db
+        .execute("ALTER TABLE users ADD COLUMN cargo_label TEXT", &[])
+        .await?;
+    _ = db
+        .execute("ALTER TABLE users ADD COLUMN cargo_hidden TEXT", &[])
+        .await?;
+    let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    use alibi::field_policy::FieldConfig;
+    _ = config.user.additional_fields.insert(
+        "cargoLabel".into(),
+        FieldConfig::new(json!({"type":"string"}))
+            .field_name("cargo_label")
+            .default_value(json!("Application Original")),
+    );
+    _ = config.user.additional_fields.insert(
+        "cargoHidden".into(),
+        FieldConfig::new(json!({"type":"string"}))
+            .field_name("cargo_hidden")
+            .default_value(json!("Application Secret"))
+            .hidden(),
+    );
+    let capture = Arc::new(Capture(Mutex::new(Vec::new())));
+    let store = alibi::seaorm::SeaOrmStore::<ApplicationSchema>::new(
+        Arc::new(config.clone()),
+        connection.clone(),
+    )
+    .hook(Hook(db.raw.clone()));
+    let auth = AuthBuilder::new(config)
+        .store(store)
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(alibi::plugins::SessionManagementPlugin::new())
+        .plugin(AnonymousPlugin::with_config(AnonymousConfig {
+            on_link_account: Some(capture.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let foreign = signup(&auth, "hidden-foreign@example.test").await;
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    let anonymous = call(
+        &auth,
+        request("/sign-in/anonymous", Some(json!({})), ""),
+        200,
+    )
+    .await;
+    let old_id = body(&anonymous)["user"]["id"].as_str().unwrap().to_owned();
+    let done=call(&auth,request("/sign-up/email",Some(json!({"email":"hidden-owner@example.test","name":"Original New Owner","password":PASSWORD})),&cookies(&anonymous)),200).await;
+    let public = body(&done);
+    assert_eq!(public["user"]["name"], "Original New Owner");
+    assert_eq!(public["user"]["cargoLabel"], "Application Original");
+    assert!(public["user"].get("cargoHidden").is_none());
+    let receipts = capture.0.lock().unwrap().clone();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["oldUser"]["id"], old_id);
+    assert_eq!(receipts[0]["newUser"]["id"], public["user"]["id"]);
+    assert_eq!(receipts[0]["newUser"]["name"], "Original New Owner");
+    assert_eq!(receipts[0]["newUser"]["cargoLabel"], "Application Original");
+    assert_eq!(receipts[0]["newUser"]["cargoHidden"], "Application Secret");
+    assert_eq!(receipts[0]["newSession"]["token"], public["token"]);
+    let id = public["user"]["id"].as_str().unwrap();
+    assert_eq!(
+        db.text("SELECT name FROM users WHERE id=$1", &[id])
+            .await?
+            .as_deref(),
+        Some("Stored Hook Name")
+    );
+    assert_eq!(
+        db.text("SELECT cargo_hidden FROM users WHERE id=$1", &[id])
+            .await?
+            .as_deref(),
+        Some("Stored Secret")
+    );
+    let current = body(&call(&auth, request("/get-session", None, &cookies(&done)), 200).await);
+    assert_eq!(current["user"]["name"], "Stored Hook Name");
+    assert_eq!(current["user"]["cargoLabel"], "Application Stored");
+    assert!(current["user"].get("cargoHidden").is_none());
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM users WHERE id=$1", &[&old_id])
+            .await?,
+        0
+    );
+    let after = db.tables(&["users", "accounts", "sessions"]).await?;
+    for (prior, current) in before.into_iter().zip(after) {
+        let prior: Vec<Value> = serde_json::from_str(&prior)?;
+        let current: Vec<Value> = serde_json::from_str(&current)?;
+        for row in prior {
+            assert!(current.contains(&row));
+        }
+    }
+    authenticated(&auth, &cookies(&foreign), "hidden-foreign@example.test").await;
+    <crate::storage::SeaOrm as Backend>::close(connection).await
 }
