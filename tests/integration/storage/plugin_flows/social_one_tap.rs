@@ -12,6 +12,7 @@ backend_tests!(
     one_tap_token_admission_matrix,
     one_tap_identity_outcomes,
     one_tap_account_cookie_and_remember_state,
+    one_tap_callback_rejection_before_jwks,
     one_tap_client_id_array_authority
 );
 
@@ -485,6 +486,87 @@ async fn one_tap_account_cookie_and_remember_state<B: Backend>(db: Db) -> TestRe
                 && !header.contains("Max-Age=0"))
     );
     trace.assert("social/one-tap-cookies");
+    B::close(connection).await
+}
+
+async fn one_tap_callback_rejection_before_jwks<B: Backend>(db: Db) -> TestResult {
+    fn runtime<B: Backend>(
+        connection: &B::Connection,
+        account: AccountConfig,
+        one_tap: OneTapConfig,
+        google: Option<OAuthProvider>,
+    ) -> AuthBuilder<B::Schema> {
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN).account(account);
+        let mut b = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(OneTapPlugin::with_config(one_tap));
+        if let Some(g) = google {
+            b = b.plugin(OAuthPlugin::new().add_provider("google", g));
+        }
+        b
+    }
+
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let remote = Tap::start().await;
+    let auth = runtime::<B>(
+        &connection,
+        AccountConfig::default(),
+        remote.config(Some(OneTapClientId::Single("tap-client".into())), false),
+        None,
+    )
+    .build()
+    .await?;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "verifications"])
+        .await?;
+    let signed = token(json!({}));
+    for (body, media, status) in [
+        (
+            json!({"idToken":signed,"callbackURL":"https://foreign.example/path"}),
+            Some("application/json"),
+            403,
+        ),
+        (json!({"idToken":true}), Some("application/json"), 400),
+        (
+            json!({"idToken":signed,"callbackURL":false}),
+            Some("application/json"),
+            400,
+        ),
+        (json!({"idToken":signed}), None, 415),
+        (json!({"idToken":signed}), Some("text/plain"), 415),
+    ] {
+        let mut r = request("/one-tap/callback", Some(body), "");
+        if let Some(media) = media {
+            _ = r.headers.insert("content-type".into(), media.into());
+        } else {
+            _ = r.headers.remove("content-type");
+        }
+        let denied = call(&auth, r, status).await;
+        assert!(denied.headers.get_all("set-cookie").next().is_none());
+        assert!(remote.remote.requests.lock().unwrap().is_empty());
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+    }
+    let done = call(
+        &auth,
+        request(
+            "/one-tap/callback",
+            Some(json!({"idToken":signed,"callbackURL":"/accepted"})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(remote.remote.requests.lock().unwrap().len(), 1);
+    authenticated(&auth, &cookies(&done), "tap@example.test").await;
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
 }
 
