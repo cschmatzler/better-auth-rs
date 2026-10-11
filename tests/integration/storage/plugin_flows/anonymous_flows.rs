@@ -18,7 +18,8 @@ backend_tests!(
     anonymous_transfer_failure_preserves_committed_login,
     anonymous_database_hook_errors_preserve_stage_commit,
     anonymous_issuance_ignores_tampered_browser_preference,
-    anonymous_transfer_retains_cached_old_projection_and_new_completed_owner
+    anonymous_transfer_retains_cached_old_projection_and_new_completed_owner,
+    anonymous_passwordless_completion_paths_transfer_actual_owner
 );
 
 #[derive(Default)]
@@ -892,4 +893,202 @@ async fn anonymous_transfer_retains_cached_old_projection_and_new_completed_owne
     }
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
+}
+
+async fn anonymous_passwordless_completion_paths_transfer_actual_owner<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use super::passwordless::Mailbox;
+    use alibi::plugins::{
+        email_otp::{EmailOtpConfig, EmailOtpDelivery, EmailOtpPlugin},
+        magic_link::{MagicLinkConfig, MagicLinkDelivery, MagicLinkPlugin},
+        phone_number::{PhoneNumberConfig, PhoneNumberPlugin, PhoneOtpDelivery},
+    };
+    struct Capture(Mutex<Vec<Value>>);
+    #[async_trait::async_trait]
+    impl LinkAnonymousAccount for Capture {
+        async fn link(&self, a: &AnonymousLink, r: &AuthRequest) -> AuthResult<()> {
+            self.0.lock().unwrap().push(json!({"oldUser":a.anonymous_user,"oldSession":a.anonymous_session,"newUser":a.new_user,"newSession":a.new_session,"path":r.path}));
+            Ok(())
+        }
+    }
+    for method in ["magic", "email-otp-verification", "phone"] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let magic = Arc::new(Mailbox::<MagicLinkDelivery>::default());
+        let email = Arc::new(Mailbox::<EmailOtpDelivery>::default());
+        let phone = Arc::new(Mailbox::<PhoneOtpDelivery>::default());
+        let capture = Arc::new(Capture(Mutex::new(Vec::new())));
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(alibi::plugins::SessionManagementPlugin::new())
+            .plugin(MagicLinkPlugin::new(MagicLinkConfig {
+                send_magic_link: Some(magic.clone()),
+                ..Default::default()
+            }))
+            .plugin(EmailOtpPlugin::new(EmailOtpConfig {
+                send_verification_otp: Some(email.clone()),
+                auto_sign_in_after_verification: true,
+                ..Default::default()
+            }))
+            .plugin(PhoneNumberPlugin::new(PhoneNumberConfig {
+                send_otp: Some(phone.clone()),
+                ..Default::default()
+            }))
+            .plugin(AnonymousPlugin::with_config(AnonymousConfig {
+                on_link_account: Some(capture.clone()),
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let number = "+15552224444";
+        let target = call(&auth,request("/sign-up/email",Some(json!({"email":"passwordless-target@example.test","password":PASSWORD,"name":"Target","phoneNumber":number})),""),200).await;
+        let target_id = body(&target)["user"]["id"].as_str().unwrap().to_owned();
+        let foreign = signup(&auth, "passwordless-foreign@example.test").await;
+        let foreign_id = body(&foreign)["user"]["id"].as_str().unwrap().to_owned();
+        let foreign_token = db
+            .text(
+                "SELECT token FROM sessions WHERE user_id=$1",
+                &[&foreign_id],
+            )
+            .await?;
+        let anonymous = call(
+            &auth,
+            request("/sign-in/anonymous", Some(json!({})), ""),
+            200,
+        )
+        .await;
+        let old_id = body(&anonymous)["user"]["id"].as_str().unwrap().to_owned();
+        let original = body(
+            &call(
+                &auth,
+                request("/get-session", None, &cookies(&anonymous)),
+                200,
+            )
+            .await,
+        );
+        let mut redeem = match method {
+            "magic" => {
+                let _ = call(
+                    &auth,
+                    request(
+                        "/sign-in/magic-link",
+                        Some(json!({"email":"passwordless-target@example.test"})),
+                        "",
+                    ),
+                    200,
+                )
+                .await;
+                let url = url::Url::parse(&magic.take().url)?;
+                let mut r = request("/magic-link/verify", None, &cookies(&anonymous));
+                r.query.extend(url.query_pairs().into_owned());
+                r
+            }
+            "email-otp-verification" => {
+                let _=call(&auth,request("/email-otp/send-verification-otp",Some(json!({"email":"passwordless-target@example.test","type":"email-verification"})),""),200).await;
+                request(
+                    "/email-otp/verify-email",
+                    Some(
+                        json!({"email":"passwordless-target@example.test","otp":email.take().otp}),
+                    ),
+                    &cookies(&anonymous),
+                )
+            }
+            _ => {
+                let _ = call(
+                    &auth,
+                    request(
+                        "/phone-number/send-otp",
+                        Some(json!({"phoneNumber":number})),
+                        "",
+                    ),
+                    200,
+                )
+                .await;
+                request(
+                    "/phone-number/verify",
+                    Some(json!({"phoneNumber":number,"code":phone.take().code})),
+                    &cookies(&anonymous),
+                )
+            }
+        };
+        _ = redeem
+            .headers
+            .insert("x-anonymous-marker".into(), method.into());
+        let before = db.tables(&["users", "accounts", "sessions"]).await?;
+        let mut invalid = redeem.clone();
+        if method == "magic" {
+            _ = invalid
+                .query
+                .insert("token".into(), "unissued-token".into());
+        } else {
+            let mut b: Value = serde_json::from_slice(invalid.body.as_ref().unwrap())?;
+            b[if method == "phone" { "code" } else { "otp" }] = json!("unissued-code");
+            invalid.body = Some(serde_json::to_vec(&b)?);
+        }
+        let denied = call(&auth, invalid, if method == "magic" { 302 } else { 400 }).await;
+        assert!(denied.headers.get_all("set-cookie").next().is_none());
+        assert!(capture.0.lock().unwrap().is_empty());
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+        let done = call(
+            &auth,
+            redeem.clone(),
+            if method == "magic" { 302 } else { 200 },
+        )
+        .await;
+        let current = body(&call(&auth, request("/get-session", None, &cookies(&done)), 200).await);
+        assert_eq!(current["user"]["id"], target_id);
+        let receipts = capture.0.lock().unwrap().clone();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0]["oldUser"], original["user"]);
+        assert_eq!(receipts[0]["oldSession"], original["session"]);
+        assert_eq!(receipts[0]["newUser"]["id"], target_id);
+        assert_eq!(
+            receipts[0]["newSession"]["token"],
+            current["session"]["token"]
+        );
+        assert!(
+            receipts[0]["path"]
+                .as_str()
+                .unwrap()
+                .ends_with(match method {
+                    "magic" => "/magic-link/verify",
+                    "phone" => "/phone-number/verify",
+                    _ => "/email-otp/verify-email",
+                })
+        );
+        assert_eq!(
+            db.count_where("SELECT COUNT(*) FROM users WHERE id=$1", &[&old_id])
+                .await?,
+            0
+        );
+        assert_eq!(
+            db.count_where("SELECT COUNT(*) FROM sessions WHERE user_id=$1", &[&old_id])
+                .await?,
+            0
+        );
+        let count = db.count("sessions").await?;
+        let _ = call(&auth, redeem, if method == "magic" { 302 } else { 400 }).await;
+        assert_eq!(capture.0.lock().unwrap().len(), 1);
+        assert_eq!(db.count("sessions").await?, count);
+        assert_eq!(
+            db.text(
+                "SELECT token FROM sessions WHERE user_id=$1",
+                &[&foreign_id]
+            )
+            .await?,
+            foreign_token
+        );
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "passwordless-foreign@example.test",
+        )
+        .await;
+        B::close(connection).await?;
+    }
+    Ok(())
 }
