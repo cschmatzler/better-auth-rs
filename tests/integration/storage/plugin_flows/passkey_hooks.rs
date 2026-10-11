@@ -21,7 +21,9 @@ backend_tests!(
     passkey_authentication_hooks,
     passkey_session_freshness,
     passkey_input_types,
-    passkey_auth_callback_reassignment_keeps_verified_owner
+    passkey_auth_callback_reassignment_keeps_verified_owner,
+    passkey_registration_forces_credential_properties_over_static_false,
+    passkey_verification_freshness_retains_issued_proof
 );
 
 type Observed = (usize, u32, bool, bool, bool);
@@ -736,4 +738,163 @@ async fn passkey_auth_callback_reassignment_keeps_verified_owner<B: Backend>(db:
     authenticated(&auth, &cookies(&owner), "owner@example.test").await;
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
+}
+
+async fn passkey_registration_forces_credential_properties_over_static_false<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::plugins::passkey::PasskeyExtensions;
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(
+            PasskeyPlugin::new()
+                .origins(vec![ORIGIN.into()])
+                .registration(PasskeyRegistrationConfig {
+                    extensions: Some(PasskeyExtensions::Static(json!({"credProps":false}))),
+                    ..Default::default()
+                })
+                .authentication(PasskeyAuthenticationConfig {
+                    extensions: Some(PasskeyExtensions::Static(
+                        json!({"appid":"https://extensions.fixture.test/static"}),
+                    )),
+                    after_verification: None,
+                }),
+        )
+        .build()
+        .await?;
+    let owner = signup(&auth, "extension-owner@example.test").await;
+    let owner_id = body(&owner)["user"]["id"].clone();
+    let options = call(
+        &auth,
+        request("/passkey/generate-register-options", None, &cookies(&owner)),
+        200,
+    )
+    .await;
+    assert_eq!(body(&options)["extensions"], json!({"credProps":true}));
+    let (key, shape) = keyed(205);
+    let registered = call(&auth,request("/passkey/verify-registration",Some(json!({"response":proof(&key,&shape,&body(&options)["challenge"]),"name":"Extension key"})),&format!("{}; {}",cookies(&owner),cookies(&options))),200).await;
+    assert_eq!(body(&registered)["userId"], owner_id);
+    _ = call(
+        &auth,
+        request("/sign-out", Some(json!({})), &cookies(&owner)),
+        200,
+    )
+    .await;
+    let authentication = call(
+        &auth,
+        request("/passkey/generate-authenticate-options", None, ""),
+        200,
+    )
+    .await;
+    assert_eq!(
+        body(&authentication)["extensions"],
+        json!({"appid":"https://extensions.fixture.test/static"})
+    );
+    let client = json!({"type":"webauthn.get","challenge":body(&authentication)["challenge"],"origin":ORIGIN});
+    let signed_in = call(&auth,request("/passkey/verify-authentication",Some(json!({"response":key.assertion(&client,"localhost",USER_PRESENT|USER_VERIFIED|BACKUP_ELIGIBLE,2)})),&cookies(&authentication)),200).await;
+    let current = body(
+        &call(
+            &auth,
+            request("/get-session", None, &cookies(&signed_in)),
+            200,
+        )
+        .await,
+    );
+    assert_eq!(current["user"]["id"], owner_id);
+    assert_eq!(current["user"]["email"], "extension-owner@example.test");
+    assert_eq!(db.count("passkeys").await?, 1);
+    assert_eq!(db.count("verifications").await?, 0);
+    B::close(connection).await
+}
+
+async fn passkey_verification_freshness_retains_issued_proof<B: Backend>(db: Db) -> TestResult {
+    for zero in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        config.session.fresh_age = Some(if zero {
+            chrono::Duration::zero()
+        } else {
+            chrono::Duration::days(1)
+        });
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(PasskeyPlugin::new().origins(vec![ORIGIN.into()]))
+            .build()
+            .await?;
+        let owner = signup(&auth, "owner@example.test").await;
+        let foreign = signup(&auth, "foreign@example.test").await;
+        let jar = cookies(&owner);
+        let options = call(
+            &auth,
+            request("/passkey/generate-register-options", None, &jar),
+            200,
+        )
+        .await;
+        let (key, shape) = keyed(108);
+        let signed = proof(&key, &shape, &body(&options)["challenge"]);
+        let challenge = cookies(&options);
+        let token = body(&owner)["token"].as_str().unwrap().to_owned();
+        db.set_timestamp(
+            "sessions",
+            "created_at",
+            ("token", &token),
+            chrono::Utc::now() - chrono::Duration::days(3),
+        )
+        .await?;
+        let before = db
+            .tables(&["users", "accounts", "sessions", "passkeys", "verifications"])
+            .await?;
+        let old = request(
+            "/passkey/verify-registration",
+            Some(json!({"response":signed,"name":"Actual Ceremony"})),
+            &format!("{jar}; {challenge}"),
+        );
+        let accepted = if zero {
+            call(&auth, old, 200).await
+        } else {
+            let stale = call(&auth, old, 403).await;
+            assert_eq!(body(&stale)["code"], "SESSION_NOT_FRESH");
+            assert!(stale.headers.get_all("set-cookie").next().is_none());
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions", "passkeys", "verifications"])
+                    .await?,
+                before
+            );
+            let fresh = call(
+                &auth,
+                request(
+                    "/sign-in/email",
+                    Some(json!({"email":"owner@example.test","password":PASSWORD})),
+                    "",
+                ),
+                200,
+            )
+            .await;
+            call(
+                &auth,
+                request(
+                    "/passkey/verify-registration",
+                    Some(json!({"response":signed,"name":"Actual Ceremony"})),
+                    &format!("{}; {challenge}", cookies(&fresh)),
+                ),
+                200,
+            )
+            .await
+        };
+        assert_eq!(accepted.status, 200);
+        let id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            db.count_where("SELECT COUNT(*) FROM passkeys WHERE user_id=$1", &[&id])
+                .await?,
+            1
+        );
+        assert_eq!(db.count("verifications").await?, 0);
+        authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+        B::close(connection).await?;
+    }
+    Ok(())
 }

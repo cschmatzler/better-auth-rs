@@ -21,7 +21,9 @@ use std::collections::BTreeMap;
 backend_tests!(
     passkey_attestation_shapes,
     passkey_option_policy,
-    passkey_stored_credential_failures
+    passkey_stored_credential_failures,
+    passkey_resolver_physical_request_context,
+    passkey_extension_rejection_before_challenge_write
 );
 
 type Edit = Box<dyn Fn(&mut Value)>;
@@ -876,5 +878,177 @@ async fn passkey_stored_credential_failures<B: Backend>(db: Db) -> TestResult {
         ),
     );
     trace.assert("passkey/stored-credential-failures");
+    B::close(connection).await
+}
+
+async fn passkey_resolver_physical_request_context<B: Backend>(db: Db) -> TestResult {
+    struct Capture(Mutex<Vec<Value>>);
+    #[async_trait::async_trait]
+    impl PasskeyExtensionsResolver for Capture {
+        async fn resolve(&self, c: &PasskeyOptionsContext<'_>) -> AuthResult<Value> {
+            let marker = c.request.headers.get("x-option-marker").unwrap();
+            self.0.lock().unwrap().push(json!({"path":c.request.path,"method":format!("{:?}",c.request.method),"marker":marker,"user":c.user,"baseURL":c.auth_config.base_url}));
+            Ok(if c.request.path.ends_with("generate-register-options") {
+                json!({"credProps":false,"minPinLength":true,"appid":marker})
+            } else {
+                json!({"appid":marker})
+            })
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let capture = Arc::new(Capture(Mutex::new(Vec::new())));
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(
+            PasskeyPlugin::new()
+                .origins(vec![ORIGIN.into()])
+                .registration(PasskeyRegistrationConfig {
+                    extensions: Some(PasskeyExtensions::Resolver(capture.clone())),
+                    ..Default::default()
+                })
+                .authentication(alibi::plugins::passkey::PasskeyAuthenticationConfig {
+                    extensions: Some(PasskeyExtensions::Resolver(capture.clone())),
+                    after_verification: None,
+                }),
+        )
+        .build()
+        .await?;
+    let owner = signup(&auth, "owner@example.test").await;
+    let jar = cookies(&owner);
+    for (path, marker, cookie) in [
+        (
+            "/passkey/generate-register-options",
+            "real-registration",
+            jar.as_str(),
+        ),
+        (
+            "/passkey/generate-authenticate-options",
+            "real-authentication",
+            jar.as_str(),
+        ),
+        (
+            "/passkey/generate-authenticate-options",
+            "guest-authentication",
+            "",
+        ),
+    ] {
+        let mut r = request(path, None, cookie);
+        _ = r.headers.insert("x-option-marker".into(), marker.into());
+        let options = call(&auth, r, 200).await;
+        assert_eq!(body(&options)["extensions"]["appid"], marker);
+        if path.ends_with("register-options") {
+            assert_eq!(body(&options)["extensions"]["credProps"], true);
+            assert_eq!(body(&options)["extensions"]["minPinLength"], true);
+        }
+        let receipt = capture.0.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(receipt["path"], path);
+        assert_eq!(receipt["method"], "Get");
+        assert_eq!(receipt["marker"], marker);
+        assert_eq!(receipt["baseURL"], ORIGIN);
+        assert_eq!(
+            receipt["user"],
+            if cookie.is_empty() {
+                Value::Null
+            } else {
+                body(&owner)["user"].clone()
+            }
+        );
+        assert!(options.headers.get_all("set-cookie").next().is_some());
+    }
+    assert_eq!(capture.0.lock().unwrap().len(), 3);
+    authenticated(&auth, &jar, "owner@example.test").await;
+    B::close(connection).await
+}
+
+async fn passkey_extension_rejection_before_challenge_write<B: Backend>(db: Db) -> TestResult {
+    struct Resolver(Mutex<&'static str>);
+    #[async_trait::async_trait]
+    impl PasskeyExtensionsResolver for Resolver {
+        async fn resolve(&self, _: &PasskeyOptionsContext<'_>) -> AuthResult<Value> {
+            match *self.0.lock().unwrap() {
+                "internal" => Err(AuthError::internal("private resolver error")),
+                "coded" => Err(AuthError::Api {
+                    status: 403,
+                    code: Some("APPLICATION_EXTENSIONS_DENIED".into()),
+                    message: "Application option policy denied".into(),
+                }),
+                _ => Ok(json!({})),
+            }
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let resolver = Arc::new(Resolver(Mutex::new("ok")));
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(
+            PasskeyPlugin::new()
+                .origins(vec![ORIGIN.into()])
+                .registration(PasskeyRegistrationConfig {
+                    extensions: Some(PasskeyExtensions::Resolver(resolver.clone())),
+                    ..Default::default()
+                })
+                .authentication(alibi::plugins::passkey::PasskeyAuthenticationConfig {
+                    extensions: Some(PasskeyExtensions::Resolver(resolver.clone())),
+                    after_verification: None,
+                }),
+        )
+        .build()
+        .await?;
+    let owner = signup(&auth, "owner@example.test").await;
+    let jar = cookies(&owner);
+    let before = db
+        .tables(&["users", "accounts", "sessions", "passkeys", "verifications"])
+        .await?;
+    for mode in ["internal", "coded"] {
+        *resolver.0.lock().unwrap() = mode;
+        for path in [
+            "/passkey/generate-register-options",
+            "/passkey/generate-authenticate-options",
+        ] {
+            let denied = call(
+                &auth,
+                request(path, None, &jar),
+                if mode == "internal" { 500 } else { 403 },
+            )
+            .await;
+            if mode == "internal" {
+                assert!(denied.body.is_empty());
+            } else {
+                assert_eq!(body(&denied)["code"], "APPLICATION_EXTENSIONS_DENIED");
+            }
+            assert!(denied.headers.get_all("set-cookie").next().is_none());
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions", "passkeys", "verifications"])
+                    .await?,
+                before
+            );
+            authenticated(&auth, &jar, "owner@example.test").await;
+        }
+    }
+    *resolver.0.lock().unwrap() = "ok";
+    let options = call(
+        &auth,
+        request("/passkey/generate-register-options", None, &jar),
+        200,
+    )
+    .await;
+    let key = Authenticator::new(107, "recovered-option-key");
+    let shape = Shape {
+        flags: USER_PRESENT | USER_VERIFIED | ATTESTED,
+        ..Default::default()
+    };
+    let client = client(&body(&options)["challenge"]);
+    let bytes = serde_json::to_vec(&client)?;
+    let proof = key.registration(&client, &shape.build(&key, &bytes), false);
+    _ = call(
+        &auth,
+        request(
+            "/passkey/verify-registration",
+            Some(json!({"response":proof,"name":"Recovered Ceremony"})),
+            &format!("{jar}; {}", cookies(&options)),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(db.count("passkeys").await?, 1);
+    assert_eq!(db.count("verifications").await?, 0);
     B::close(connection).await
 }
