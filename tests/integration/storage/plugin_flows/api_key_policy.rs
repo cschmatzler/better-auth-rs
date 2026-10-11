@@ -22,7 +22,8 @@ backend_tests!(
     static_org_update_requires_update_action_and_preserves_key_identity,
     static_org_delete_requires_delete_action_and_revokes_only_selected_key,
     disabled_custom_key_expiration_retains_default_lifetime_through_rename,
-    banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_authority
+    banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_authority,
+    api_key_sql_usage_failure_transport
 );
 
 fn raw(path: &str, text: &str, cookie: &str) -> AuthRequest {
@@ -1894,4 +1895,142 @@ async fn banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_autho
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     authenticated(&auth, &cookies(&admin), "admin@example.test").await;
     B::close(connection).await
+}
+
+async fn api_key_sql_usage_failure_transport<B: Backend>(db: Db) -> TestResult {
+    #[derive(Default)]
+    struct Observer(std::sync::atomic::AtomicUsize);
+    impl BackgroundTaskHandler for Observer {
+        fn handle(&self, task: BackgroundTaskCompletion) -> AuthResult<()> {
+            _ = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(task);
+            Ok(())
+        }
+    }
+    for defer_updates in [false, true] {
+        for phase in ["request_count", "updated_at"] {
+            let db = db.fresh().await?;
+            let (connection, _) = db.migrated::<B>(SECRET).await?;
+            let observer = Arc::new(Observer::default());
+            let config = AuthConfig::new(SECRET)
+                .base_url(ORIGIN)
+                .background_tasks(observer.clone());
+            let auth = AuthBuilder::new(config.clone())
+                .store(B::store(Arc::new(config), &connection))
+                .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+                .plugin(super::auth_probe::fast_password())
+                .plugin(alibi::plugins::SessionManagementPlugin::new())
+                .plugin(ApiKeyPlugin::with_config(ApiKeyConfig {
+                    defer_updates,
+                    enable_session_for_api_keys: true,
+                    ..Default::default()
+                }))
+                .build()
+                .await?;
+            let owner = signup(&auth, "usage-veto-owner@example.test").await;
+            let foreign = signup(&auth, "usage-veto-foreign@example.test").await;
+            let issued = serde_json::to_value(Box::pin(auth.dispatch_endpoint(
+                ApiKeyPlugin::create_endpoint(&serde_json::from_value(json!({"userId":body(&owner)["user"]["id"],"remaining":30,"rateLimitMax":10,"permissions":{"vault":["read"]}}))?)?,
+                EndpointOptions::default(),
+            )).await?.decode()?)?;
+            let foreign_key = body(
+                &call(
+                    &auth,
+                    request(
+                        "/api-key/create",
+                        Some(json!({"name":"Foreign quota"})),
+                        &cookies(&foreign),
+                    ),
+                    200,
+                )
+                .await,
+            );
+            let id = issued["id"].as_str().unwrap();
+            let secret = issued["key"].as_str().unwrap();
+            _ = db
+                .execute(
+                    "UPDATE api_keys SET updated_at='2001-01-01T00:00:00Z' WHERE id=$1",
+                    &[id],
+                )
+                .await?;
+            _=db.execute(&format!("CREATE TRIGGER usage_veto BEFORE UPDATE OF {phase} ON api_keys WHEN NEW.id='{id}' BEGIN SELECT RAISE(ABORT,'native usage veto'); END"),&[]).await?;
+            let principals = db.tables(&["users", "accounts", "sessions"]).await?;
+            let before = db.table("api_keys").await?;
+            let denied = Box::pin(auth.dispatch_endpoint(
+                ApiKeyPlugin::verify_endpoint(&ApiKeyVerificationInput {
+                    key: secret.into(),
+                    config_id: None,
+                    permissions: Some(serde_json::from_value(json!({"vault":["write"]}))?),
+                })?,
+                EndpointOptions::default(),
+            ))
+            .await?
+            .decode()?;
+            assert!(!denied.valid);
+            assert_eq!(serde_json::to_value(denied.error)?["code"], "KEY_NOT_FOUND");
+            assert_eq!(db.table("api_keys").await?, before);
+            let invalid = Box::pin(auth.dispatch_endpoint(
+                ApiKeyPlugin::verify_endpoint(&ApiKeyVerificationInput {
+                    key: secret.into(),
+                    config_id: None,
+                    permissions: None,
+                })?,
+                EndpointOptions::default(),
+            ))
+            .await?
+            .decode()?;
+            assert!(!invalid.valid);
+            assert!(invalid.key.is_none());
+            assert_eq!(
+                serde_json::to_value(invalid.error)?,
+                json!({"code":"INVALID_API_KEY","message":{"code":"INVALID_API_KEY","message":"Invalid API key."}})
+            );
+            let mut input = request("/get-session", None, &cookies(&owner));
+            _ = input.headers.insert("x-api-key".into(), secret.into());
+            let error = call(&auth, input, 500).await;
+            assert!(error.body.is_empty());
+            assert!(error.headers.get_all("set-cookie").next().is_none());
+            assert_eq!(observer.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(
+                db.text("SELECT updated_at FROM api_keys WHERE id=$1", &[id])
+                    .await?
+                    .as_deref(),
+                Some("2001-01-01T00:00:00Z")
+            );
+            let rows: Vec<Value> = serde_json::from_str(&before)?;
+            let after: Vec<Value> = serde_json::from_str(&db.table("api_keys").await?)?;
+            assert_eq!(
+                after.iter().find(|r| r["id"] == foreign_key["id"]),
+                rows.iter().find(|r| r["id"] == foreign_key["id"])
+            );
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions"]).await?,
+                principals
+            );
+            _ = db.execute("DROP TRIGGER usage_veto", &[]).await?;
+            let retry = Box::pin(auth.dispatch_endpoint(
+                ApiKeyPlugin::verify_endpoint(&ApiKeyVerificationInput {
+                    key: secret.into(),
+                    config_id: None,
+                    permissions: None,
+                })?,
+                EndpointOptions::default(),
+            ))
+            .await?
+            .decode()?;
+            assert!(retry.valid);
+            assert_eq!(
+                retry.key.unwrap().reference_id,
+                body(&owner)["user"]["id"].as_str().unwrap()
+            );
+            assert_eq!(
+                observer.0.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(defer_updates)
+            );
+            authenticated(&auth, &cookies(&owner), "usage-veto-owner@example.test").await;
+            authenticated(&auth, &cookies(&foreign), "usage-veto-foreign@example.test").await;
+            B::close(connection).await?;
+        }
+    }
+    Ok(())
 }
