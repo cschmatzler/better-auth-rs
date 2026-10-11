@@ -27,7 +27,8 @@ backend_tests!(
     scoped_cache_chunks_obey_wire_capacity_and_retirement,
     cache_version_issuance_failure_preserves_anonymous_principal,
     browser_cache_ttl_requires_authenticated_preference,
-    cache_raw_and_specific_max_age_keep_distinct_lifetimes
+    cache_raw_and_specific_max_age_keep_distinct_lifetimes,
+    verification_renews_original_cached_snapshot_and_publishes_it_to_later_hooks
 );
 postgres_tests!(
     every_strategy_serves_reads_from_the_cookie_and_rejects_tampering,
@@ -921,4 +922,171 @@ async fn cache_raw_and_specific_max_age_keep_distinct_lifetimes<B: Backend>(db: 
         B::close(connection).await?;
     }
     Ok(())
+}
+
+async fn verification_renews_original_cached_snapshot_and_publishes_it_to_later_hooks<
+    B: Backend,
+>(
+    db: Db,
+) -> TestResult {
+    fn fast_cached<B: Backend>(
+        connection: &B::Connection,
+        strategy: CookieCacheStrategy,
+        tweak: impl FnOnce(&mut AuthConfig),
+    ) -> AuthBuilder<B::Schema> {
+        let mut config = AuthConfig::new(SECRET)
+            .base_url(ORIGIN)
+            .session_cookie_cache(CookieCacheConfig {
+                enabled: true,
+                strategy,
+                ..Default::default()
+            });
+        tweak(&mut config);
+        AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+    }
+
+    use alibi::plugins::{
+        EmailVerificationConfig, EmailVerificationPlugin, MultiSessionPlugin, SendVerificationEmail,
+    };
+    use alibi::wire::UserView;
+    struct Inbox(Mutex<Option<String>>);
+    #[async_trait]
+    impl SendVerificationEmail for Inbox {
+        async fn send(&self, _: &UserView, _: &str, token: &str) -> AuthResult<()> {
+            *self.0.lock().unwrap() = Some(token.into());
+            Ok(())
+        }
+    }
+    struct Publication(Arc<Mutex<Vec<Value>>>);
+    #[async_trait]
+    impl<S: AuthSchema> AuthPlugin<S> for Publication {
+        fn name(&self) -> &'static str {
+            "verified-cache-publication"
+        }
+        fn routes(&self) -> Vec<AuthRoute> {
+            Vec::new()
+        }
+        async fn on_request(
+            &self,
+            _: &AuthRequest,
+            _: &AuthContext<S>,
+        ) -> AuthResult<Option<AuthResponse>> {
+            Ok(None)
+        }
+        async fn after_request(
+            &self,
+            r: &AuthRequest,
+            _: &AuthContext<S>,
+            response: AuthResponse,
+        ) -> AuthResult<AuthResponse> {
+            if let Some(s) = published_session_snapshot(r) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(json!({"user":s.user(),"session":s.session()}));
+            }
+            Ok(response)
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let inbox = Arc::new(Inbox(Mutex::new(None)));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let auth = fast_cached::<B>(&connection, CookieCacheStrategy::Compact, |_| {})
+        .plugin(EmailVerificationPlugin::with_config(
+            EmailVerificationConfig {
+                send_verification_email: Some(inbox.clone()),
+                send_on_sign_up: Some(false),
+                auto_sign_in_after_verification: true,
+                ..Default::default()
+            },
+        ))
+        .plugin(alibi::plugins::UserManagementPlugin::new())
+        .plugin(MultiSessionPlugin::new())
+        .plugin(Publication(seen.clone()))
+        .build()
+        .await?;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let baseline = db.tables(&["users", "accounts", "sessions"]).await?;
+    let owner=call(&auth,request("/sign-up/email",Some(json!({"email":"owner@example.test","name":"Original Cached Name","password":PASSWORD})),""),200).await;
+    let id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+    let jar = cookies(&owner)
+        .split("; ")
+        .filter(|x| !x.contains("_multi-"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let original = body(&call(&auth, request("/get-session", None, &jar), 200).await);
+    seen.lock().unwrap().clear();
+    _ = call(
+        &auth,
+        request(
+            "/send-verification-email",
+            Some(json!({"email":"owner@example.test"})),
+            &jar,
+        ),
+        200,
+    )
+    .await;
+    let token = inbox.0.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE users SET name='Physical Later Name' WHERE id=$1",
+            &[&id]
+        )
+        .await?,
+        1
+    );
+    let before = db.tables(&["accounts", "sessions"]).await?;
+    let mut proof = request("/verify-email", None, &jar);
+    proof.set_query_pairs([("token", token.as_str())]);
+    let verified = call(&auth, proof, 200).await;
+    let value = cookies(&verified)
+        .split("; ")
+        .find_map(|p| {
+            p.strip_prefix("better-auth.session_data=")
+                .map(str::to_owned)
+        })
+        .unwrap();
+    let decoded = alibi::session::cookie_cache::decode_compact(&value, SECRET).unwrap();
+    let mut expected = original["user"].clone();
+    expected["emailVerified"] = json!(true);
+    assert_eq!(serde_json::to_value(&decoded.user)?, expected);
+    assert_eq!(serde_json::to_value(&decoded.session)?, original["session"]);
+    assert!(
+        verified
+            .headers
+            .get_all("set-cookie")
+            .any(|x| x.contains("_multi-") && !x.contains("Max-Age=0"))
+    );
+    let receipts = seen.lock().unwrap().clone();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["user"], expected);
+    assert_eq!(receipts[0]["session"], original["session"]);
+    assert_eq!(
+        db.text("SELECT name FROM users WHERE id=$1", &[&id])
+            .await?
+            .as_deref(),
+        Some("Physical Later Name")
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM users WHERE id=$1 AND email_verified=true",
+            &[&id]
+        )
+        .await?,
+        1
+    );
+    assert_eq!(db.tables(&["accounts", "sessions"]).await?, before);
+    let after = db.tables(&["users", "accounts", "sessions"]).await?;
+    for (before, now) in baseline.iter().zip(after.iter()) {
+        let before: Vec<Value> = serde_json::from_str(before)?;
+        let now: Vec<Value> = serde_json::from_str(now)?;
+        assert!(before.iter().all(|x| now.contains(x)));
+    }
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+    B::close(connection).await
 }
