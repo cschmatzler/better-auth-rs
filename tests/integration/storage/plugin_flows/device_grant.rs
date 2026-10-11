@@ -16,7 +16,8 @@ backend_tests!(
     device_missing_owner_preserves_approved_grant_for_recovery,
     device_empty_application_codes_complete_real_grant,
     device_fractional_durations_preserve_persisted_milliseconds,
-    revoked_compact_browser_claims_and_completes_only_its_device_grant
+    revoked_compact_browser_claims_and_completes_only_its_device_grant,
+    device_poller_session_metadata
 );
 
 type Events = Arc<Mutex<Vec<Value>>>;
@@ -1045,6 +1046,123 @@ async fn revoked_compact_browser_claims_and_completes_only_its_device_grant<B: B
             let now: Vec<Value> = serde_json::from_str(now)?;
             assert!(before.iter().all(|x| now.contains(x)));
         }
+        authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn device_poller_session_metadata<B: Backend>(db: Db) -> TestResult {
+    for disabled in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        config.advanced.ip_address.trusted_proxies = vec!["10.0.0.0/8".into()];
+        config.advanced.ip_address.disable_ip_tracking = disabled;
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(DeviceAuthorizationPlugin::new().interval(chrono::Duration::zero()))
+            .build()
+            .await?;
+        let owner = signup(&auth, "owner@example.test").await;
+        let foreign = signup(&auth, "foreign@example.test").await;
+        let baseline = db.tables(&["users", "accounts", "sessions"]).await?;
+        let issued = body(
+            &call(
+                &auth,
+                request(
+                    "/device/code",
+                    Some(json!({"client_id":"metadata-client"})),
+                    "",
+                ),
+                200,
+            )
+            .await,
+        );
+        let code = issued["device_code"].as_str().unwrap();
+        let user_code = issued["user_code"].as_str().unwrap();
+        let mut review = request("/device", None, &cookies(&owner));
+        review.set_query_pairs([("user_code", user_code)]);
+        _ = call(&auth, review, 200).await;
+        _ = call(
+            &auth,
+            request(
+                "/device/approve",
+                Some(json!({"userCode":user_code})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+        let grant = db.table("device_code").await?;
+        _=call(&auth,request("/device/token",Some(json!({"grant_type":"urn:ietf:params:oauth:grant-type:device_code","device_code":code,"client_id":"wrong-client"})),""),400).await;
+        assert_eq!(db.table("device_code").await?, grant);
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions"]).await?,
+            baseline
+        );
+        let mut poll = request(
+            "/device/token",
+            Some(
+                json!({"grant_type":"urn:ietf:params:oauth:grant-type:device_code","device_code":code,"client_id":"metadata-client"}),
+            ),
+            "",
+        );
+        poll.headers.extend([
+            (
+                "x-forwarded-for".into(),
+                "203.0.113.99, 198.51.100.218, 10.2.3.4".into(),
+            ),
+            ("user-agent".into(), "device-poller".into()),
+        ]);
+        let redeemed = call(&auth, poll, 200).await;
+        assert!(redeemed.headers.get_all("set-cookie").next().is_none());
+        let token = body(&redeemed)["access_token"].as_str().unwrap().to_owned();
+        assert_eq!(
+            db.text("SELECT user_id FROM sessions WHERE token=$1", &[&token])
+                .await?
+                .as_deref(),
+            body(&owner)["user"]["id"].as_str()
+        );
+        assert_eq!(
+            db.text("SELECT ip_address FROM sessions WHERE token=$1", &[&token])
+                .await?
+                .as_deref(),
+            Some(if disabled { "" } else { "198.51.100.218" })
+        );
+        assert_eq!(
+            db.text("SELECT user_agent FROM sessions WHERE token=$1", &[&token])
+                .await?
+                .as_deref(),
+            Some("device-poller")
+        );
+        assert_eq!(rows(&db, code).await?, 0);
+        let after = db.tables(&["users", "accounts", "sessions"]).await?;
+        for (before, now) in baseline.iter().zip(after.iter()) {
+            let before: Vec<Value> = serde_json::from_str(before)?;
+            let now: Vec<Value> = serde_json::from_str(now)?;
+            assert!(before.iter().all(|r| now.contains(r)));
+        }
+        let replay=call(&auth,request("/device/token",Some(json!({"grant_type":"urn:ietf:params:oauth:grant-type:device_code","device_code":code,"client_id":"metadata-client"})),""),400).await;
+        assert_eq!(body(&replay)["error"], "invalid_grant");
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, after);
+        _ = call(
+            &auth,
+            request(
+                "/revoke-session",
+                Some(json!({"token":token})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions"]).await?,
+            baseline
+        );
         authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
         B::close(connection).await?;
     }
