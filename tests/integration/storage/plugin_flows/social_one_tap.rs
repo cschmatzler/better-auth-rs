@@ -17,7 +17,8 @@ backend_tests!(
     one_tap_enabled_two_factor_session,
     one_tap_required_verification_delivery,
     one_tap_returning_profile_and_browser_ownership,
-    one_tap_disabled_signup_existing_account
+    one_tap_disabled_signup_existing_account,
+    one_tap_strict_upgrade_admits_only_next_request
 );
 
 struct DenyList;
@@ -1032,5 +1033,105 @@ async fn one_tap_disabled_signup_existing_account<B: Backend>(db: Db) -> TestRes
         authenticated(auth, &cookies(&done), "tap@example.test").await;
     }
     authenticated(&enabled, &cookies(&foreign), "foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn one_tap_strict_upgrade_admits_only_next_request<B: Backend>(db: Db) -> TestResult {
+    fn runtime<B: Backend>(
+        connection: &B::Connection,
+        account: AccountConfig,
+        one_tap: OneTapConfig,
+        google: Option<OAuthProvider>,
+    ) -> AuthBuilder<B::Schema> {
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN).account(account);
+        let mut b = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(OneTapPlugin::with_config(one_tap));
+        if let Some(g) = google {
+            b = b.plugin(OAuthPlugin::new().add_provider("google", g));
+        }
+        b
+    }
+
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let remote = Tap::start().await;
+    let mut google = OAuthProvider::google("tap-client", "secret");
+    google.require_email_verification = true;
+    let auth = runtime::<B>(
+        &connection,
+        AccountConfig::default(),
+        remote.config(None, false),
+        Some(google),
+    )
+    .build()
+    .await?;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    let first = tap(&auth, json!({"email_verified":false}), "").await;
+    assert_eq!(first.status, 403);
+    assert_eq!(body(&first)["code"], "EMAIL_NOT_VERIFIED");
+    assert!(first.headers.get_all("set-cookie").next().is_none());
+    let id = db
+        .text("SELECT id FROM users WHERE email=$1", &["tap@example.test"])
+        .await?
+        .unwrap();
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM users WHERE id=$1 AND email_verified=false",
+            &[&id]
+        )
+        .await?,
+        1
+    );
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM sessions WHERE user_id=$1", &[&id])
+            .await?,
+        0
+    );
+    let second = tap(&auth, json!({"email_verified":true}), "").await;
+    assert_eq!(second.status, 403);
+    assert_eq!(body(&second)["code"], "EMAIL_NOT_VERIFIED");
+    assert!(second.headers.get_all("set-cookie").next().is_none());
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM users WHERE id=$1 AND email_verified=true",
+            &[&id]
+        )
+        .await?,
+        1
+    );
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM sessions WHERE user_id=$1", &[&id])
+            .await?,
+        0
+    );
+    let third = tap(&auth, json!({"email_verified":true}), "").await;
+    assert_eq!(third.status, 200);
+    assert_eq!(body(&third)["user"]["id"], id);
+    assert_eq!(body(&third)["user"]["emailVerified"], true);
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM sessions WHERE user_id=$1", &[&id])
+            .await?,
+        1
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM accounts WHERE provider_id='google' AND user_id=$1",
+            &[&id]
+        )
+        .await?,
+        1
+    );
+    authenticated(&auth, &cookies(&third), "tap@example.test").await;
+    let after = db.tables(&["users", "accounts", "sessions"]).await?;
+    for (before, now) in before.iter().zip(after.iter()) {
+        let before: Vec<Value> = serde_json::from_str(before)?;
+        let now: Vec<Value> = serde_json::from_str(now)?;
+        assert!(before.iter().all(|r| now.contains(r)));
+    }
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
 }
