@@ -15,7 +15,8 @@ backend_tests!(
     device_decision_and_issuance_edges,
     device_missing_owner_preserves_approved_grant_for_recovery,
     device_empty_application_codes_complete_real_grant,
-    device_fractional_durations_preserve_persisted_milliseconds
+    device_fractional_durations_preserve_persisted_milliseconds,
+    device_custom_user_codes_prefer_exact_lookup
 );
 
 type Events = Arc<Mutex<Vec<Value>>>;
@@ -908,5 +909,104 @@ async fn device_fractional_durations_preserve_persisted_milliseconds<B: Backend>
         }
         assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, stable);
     }
+    B::close(connection).await
+}
+
+async fn device_custom_user_codes_prefer_exact_lookup<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let exact = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(
+            DeviceAuthorizationPlugin::new()
+                .interval(chrono::Duration::zero())
+                .generate_user_code_async_with(|| async { Ok(" café-Code! ".into()) }),
+        )
+        .build()
+        .await?;
+    let normal = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(DeviceAuthorizationPlugin::new().interval(chrono::Duration::zero()))
+        .build()
+        .await?;
+    let owner = signup(&exact, "owner@example.test").await;
+    let jar = cookies(&owner);
+    let issue = body(
+        &call(
+            &exact,
+            request(
+                "/device/code",
+                Some(json!({"client_id":"exact-client"})),
+                "",
+            ),
+            200,
+        )
+        .await,
+    );
+    let code = issue["device_code"].as_str().unwrap();
+    let uc = issue["user_code"].as_str().unwrap();
+    assert_eq!(uc, " café-Code! ");
+    let before = db.table("device_code").await?;
+    let mut alias = request("/device", None, &jar);
+    alias.set_query_pairs([("user_code", "CAFCODE")]);
+    _ = call(&exact, alias, 400).await;
+    assert_eq!(db.table("device_code").await?, before);
+    let mut review = request("/device", None, &jar);
+    review.set_query_pairs([("user_code", uc)]);
+    let viewed = call(&exact, review, 200).await;
+    assert_eq!(body(&viewed)["user_code"], uc);
+    _ = call(
+        &exact,
+        request("/device/approve", Some(json!({"userCode":uc})), &jar),
+        200,
+    )
+    .await;
+    let poll = request(
+        "/device/token",
+        Some(
+            json!({"grant_type":"urn:ietf:params:oauth:grant-type:device_code","device_code":code,"client_id":"exact-client"}),
+        ),
+        "",
+    );
+    let done = call(&exact, poll.clone(), 200).await;
+    assert_eq!(
+        db.text(
+            "SELECT user_id FROM sessions WHERE token=$1",
+            &[body(&done)["access_token"].as_str().unwrap()]
+        )
+        .await?
+        .as_deref(),
+        body(&owner)["user"]["id"].as_str()
+    );
+    assert_eq!(rows(&db, code).await?, 0);
+    _ = call(&exact, poll, 400).await;
+    let generated = body(
+        &call(
+            &normal,
+            request(
+                "/device/code",
+                Some(json!({"client_id":"normalized-client"})),
+                "",
+            ),
+            200,
+        )
+        .await,
+    );
+    let uc = generated["user_code"].as_str().unwrap();
+    let alias = uc
+        .to_lowercase()
+        .chars()
+        .map(|c| format!("{c}."))
+        .collect::<String>();
+    let mut review = request("/device", None, &jar);
+    review.set_query_pairs([("user_code", alias.as_str())]);
+    let viewed = call(&normal, review, 200).await;
+    assert_eq!(body(&viewed)["user_code"], alias);
+    assert_eq!(
+        db.text(
+            "SELECT user_id FROM device_code WHERE device_code=$1",
+            &[generated["device_code"].as_str().unwrap()]
+        )
+        .await?
+        .as_deref(),
+        body(&owner)["user"]["id"].as_str()
+    );
     B::close(connection).await
 }
