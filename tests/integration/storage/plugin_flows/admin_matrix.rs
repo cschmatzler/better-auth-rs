@@ -28,7 +28,8 @@ backend_tests!(
     admin_create_role_selector_precedence,
     admin_array_filter_sql_operands,
     admin_repeated_query_validation_before_auth,
-    admin_date_callback_error_identity
+    admin_date_callback_error_identity,
+    admin_impersonation_operator_metadata
 );
 
 async fn promote<S: AuthSchema>(auth: &Alibi<S>, response: &AuthResponse, role: &str) -> String {
@@ -1990,5 +1991,106 @@ async fn admin_date_callback_error_identity<B: Backend>(db: Db) -> TestResult {
         "date-callback-foreign@example.test",
     )
     .await;
+    B::close(connection).await
+}
+
+async fn admin_impersonation_operator_metadata<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    config.advanced.ip_address.trusted_proxies = vec!["10.0.0.0/8".into()];
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(AdminPlugin::new())
+        .build()
+        .await?;
+    let operator = signup(&auth, "operator@example.test").await;
+    let operator_id = promote(&auth, &operator, "admin").await;
+    let target = signup(&auth, "target@example.test").await;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let target_id = body(&target)["user"]["id"].as_str().unwrap().to_owned();
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    _ = call(
+        &auth,
+        request(
+            "/admin/impersonate-user",
+            Some(json!({"userId":operator_id})),
+            &cookies(&target),
+        ),
+        403,
+    )
+    .await;
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    let mut input = request(
+        "/admin/impersonate-user",
+        Some(json!({"userId":target_id})),
+        &cookies(&operator),
+    );
+    input.headers.extend([
+        (
+            "x-forwarded-for".into(),
+            "203.0.113.99, 198.51.100.224, 10.2.3.4".into(),
+        ),
+        ("user-agent".into(), "admin-browser".into()),
+    ]);
+    let impersonated = call(&auth, input, 200).await;
+    let jar = cookies(&impersonated);
+    let current = body(&call(&auth, request("/get-session", None, &jar), 200).await);
+    assert_eq!(current["user"]["id"], target_id);
+    let token = current["session"]["token"].as_str().unwrap();
+    assert_eq!(
+        db.text("SELECT user_id FROM sessions WHERE token=$1", &[token])
+            .await?
+            .as_deref(),
+        Some(target_id.as_str())
+    );
+    assert_eq!(
+        db.text(
+            "SELECT impersonated_by FROM sessions WHERE token=$1",
+            &[token]
+        )
+        .await?
+        .as_deref(),
+        Some(operator_id.as_str())
+    );
+    assert_eq!(
+        db.text("SELECT ip_address FROM sessions WHERE token=$1", &[token])
+            .await?
+            .as_deref(),
+        Some("198.51.100.224")
+    );
+    assert_eq!(
+        db.text("SELECT user_agent FROM sessions WHERE token=$1", &[token])
+            .await?
+            .as_deref(),
+        Some("admin-browser")
+    );
+    let after = db.tables(&["users", "accounts", "sessions"]).await?;
+    for (before, now) in before.iter().zip(after.iter()) {
+        let before: Vec<Value> = serde_json::from_str(before)?;
+        let now: Vec<Value> = serde_json::from_str(now)?;
+        assert!(before.iter().all(|r| now.contains(r)));
+    }
+    let stopped = call(
+        &auth,
+        request("/admin/stop-impersonating", Some(json!({})), &jar),
+        200,
+    )
+    .await;
+    let restored = body(
+        &call(
+            &auth,
+            request("/get-session", None, &cookies(&stopped)),
+            200,
+        )
+        .await,
+    );
+    assert_eq!(restored["user"]["id"], operator_id);
+    assert_eq!(restored["session"]["token"], body(&operator)["token"]);
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    authenticated(&auth, &cookies(&target), "target@example.test").await;
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
 }
