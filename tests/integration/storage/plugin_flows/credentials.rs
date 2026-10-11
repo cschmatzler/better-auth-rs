@@ -13,7 +13,8 @@ backend_tests!(
     cookie_emission_failure_preserves_endpoint_commit_stage,
     username_unicode_identity_admission,
     username_readonly_registration_admission,
-    application_id_policy_owns_signup_principals_and_verification
+    application_id_policy_owns_signup_principals_and_verification,
+    rate_storage_failures_preserve_signup_and_recovery_authority
 );
 postgres_tests!(
     username_signup_lookup_and_denials_share_normalized_identity,
@@ -1189,6 +1190,222 @@ async fn application_id_policy_owns_signup_principals_and_verification<B: Backen
                 assert!(before.iter().all(|r| now.contains(r)));
             }
         }
+        authenticated(&setup, &cookies(&foreign), "foreign@example.test").await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn rate_storage_failures_preserve_signup_and_recovery_authority<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::middleware::{
+        CacheRateLimitStorage, EndpointRateLimit, RateLimitConfig, RateLimitResolver, RateLimitRule,
+    };
+    use alibi::store::{CacheAdapter, MemoryCacheAdapter};
+    use alibi::{AuthError, AuthResult};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Cache {
+        memory: MemoryCacheAdapter,
+        missing: bool,
+        failing: AtomicBool,
+        calls: Mutex<Vec<&'static str>>,
+    }
+    #[async_trait::async_trait]
+    impl CacheAdapter for Cache {
+        async fn set(&self, k: &str, v: &str, t: chrono::Duration) -> AuthResult<()> {
+            self.calls.lock().unwrap().push("set");
+            self.memory.set(k, v, t).await
+        }
+        async fn get(&self, k: &str) -> AuthResult<Option<String>> {
+            self.calls.lock().unwrap().push("get");
+            self.memory.get(k).await
+        }
+        async fn delete(&self, k: &str) -> AuthResult<()> {
+            self.calls.lock().unwrap().push("delete");
+            self.memory.delete(k).await
+        }
+        async fn exists(&self, k: &str) -> AuthResult<bool> {
+            self.memory.exists(k).await
+        }
+        async fn expire(&self, k: &str, t: chrono::Duration) -> AuthResult<()> {
+            self.memory.expire(k, t).await
+        }
+        async fn clear(&self) -> AuthResult<()> {
+            self.memory.clear().await
+        }
+        async fn increment(&self, k: &str, t: std::time::Duration) -> AuthResult<f64> {
+            self.calls.lock().unwrap().push("increment");
+            if self.missing || self.failing.load(Ordering::SeqCst) {
+                return Err(AuthError::internal(if self.missing {
+                    "atomic cache increment is not supported by this adapter"
+                } else {
+                    "atomic counter outage"
+                }));
+            }
+            self.memory.increment(k, t).await
+        }
+    }
+
+    struct Missing(Arc<Cache>);
+    #[async_trait::async_trait]
+    impl CacheAdapter for Missing {
+        async fn set(&self, k: &str, v: &str, t: chrono::Duration) -> AuthResult<()> {
+            self.0.set(k, v, t).await
+        }
+        async fn get(&self, k: &str) -> AuthResult<Option<String>> {
+            self.0.get(k).await
+        }
+        async fn delete(&self, k: &str) -> AuthResult<()> {
+            self.0.delete(k).await
+        }
+        async fn exists(&self, k: &str) -> AuthResult<bool> {
+            self.0.exists(k).await
+        }
+        async fn expire(&self, k: &str, t: chrono::Duration) -> AuthResult<()> {
+            self.0.expire(k, t).await
+        }
+        async fn clear(&self) -> AuthResult<()> {
+            self.0.clear().await
+        }
+    }
+    #[derive(Debug)]
+    struct Resolver;
+    #[async_trait::async_trait]
+    impl RateLimitResolver for Resolver {
+        async fn resolve(
+            &self,
+            r: &AuthRequest,
+            _: &EndpointRateLimit,
+        ) -> AuthResult<Option<EndpointRateLimit>> {
+            Ok(
+                (r.headers.get("x-rate-bypass").map(String::as_str) != Some("yes")).then_some(
+                    EndpointRateLimit {
+                        window_seconds: 60.0,
+                        max_requests: 2.0,
+                    },
+                ),
+            )
+        }
+    }
+    for missing in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let setup = super::auth_probe::fast_builder::<B>(&connection)
+            .build()
+            .await?;
+        let foreign = signup(&setup, "foreign@example.test").await;
+        let before = db
+            .tables(&["users", "accounts", "sessions", "verifications"])
+            .await?;
+        let cache = Arc::new(Cache {
+            memory: MemoryCacheAdapter::new(),
+            missing,
+            failing: AtomicBool::new(true),
+            calls: Mutex::new(Vec::new()),
+        });
+        let unavailable: Arc<dyn CacheAdapter> = if missing {
+            Arc::new(Missing(cache.clone()))
+        } else {
+            cache.clone()
+        };
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(
+                RateLimitConfig::new()
+                    .storage(Arc::new(CacheRateLimitStorage::new(unavailable)))
+                    .rule("/sign-up/email", RateLimitRule::Dynamic(Arc::new(Resolver)))
+                    .rule("/get-session", RateLimitRule::Disabled),
+            )
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .build()
+            .await?;
+        let failed=auth.handle_request(request("/sign-up/email",Some(json!({"email":"failed@example.test","password":PASSWORD,"name":"No Authority"})),"")).await;
+        assert!(failed.is_err());
+        assert_eq!(
+            *cache.calls.lock().unwrap(),
+            if missing {
+                Vec::new()
+            } else {
+                vec!["increment"]
+            }
+        );
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+        let mut bypass = request(
+            "/sign-up/email",
+            Some(
+                json!({"email":"bypass@example.test","password":PASSWORD,"name":"Bypassed Owner"}),
+            ),
+            "",
+        );
+        _ = bypass.headers.insert("x-rate-bypass".into(), "yes".into());
+        let owner = call(&auth, bypass, 200).await;
+        assert_eq!(
+            *cache.calls.lock().unwrap(),
+            if missing {
+                Vec::new()
+            } else {
+                vec!["increment"]
+            }
+        );
+        authenticated(&auth, &cookies(&owner), "bypass@example.test").await;
+        cache.failing.store(false, Ordering::SeqCst);
+        let ready_cache = if missing {
+            Arc::new(Cache {
+                memory: MemoryCacheAdapter::new(),
+                missing: false,
+                failing: AtomicBool::new(false),
+                calls: Mutex::new(Vec::new()),
+            })
+        } else {
+            cache.clone()
+        };
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        let ready = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(
+                RateLimitConfig::new()
+                    .storage(Arc::new(CacheRateLimitStorage::new(ready_cache.clone())))
+                    .rule("/sign-up/email", RateLimitRule::Dynamic(Arc::new(Resolver)))
+                    .rule("/get-session", RateLimitRule::Disabled),
+            )
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .build()
+            .await?;
+        let first = signup(&ready, "first@example.test").await;
+        let second = signup(&ready, "second@example.test").await;
+        let committed = db
+            .tables(&["users", "accounts", "sessions", "verifications"])
+            .await?;
+        let denied = call(
+            &ready,
+            request(
+                "/sign-up/email",
+                Some(json!({"email":"blocked@example.test","password":PASSWORD,"name":"Blocked"})),
+                "",
+            ),
+            429,
+        )
+        .await;
+        assert!(denied.headers.get_all("set-cookie").next().is_none());
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            committed
+        );
+        let calls = ready_cache.calls.lock().unwrap().clone();
+        assert!(calls.iter().all(|c| *c == "increment"));
+        assert_eq!(calls.len(), if missing { 3 } else { 4 });
+        authenticated(&ready, &cookies(&owner), "bypass@example.test").await;
+        authenticated(&ready, &cookies(&first), "first@example.test").await;
+        authenticated(&ready, &cookies(&second), "second@example.test").await;
         authenticated(&setup, &cookies(&foreign), "foreign@example.test").await;
         B::close(connection).await?;
     }
