@@ -12,7 +12,8 @@ backend_tests!(
     email_otp_issuance_and_request_validation,
     email_otp_change_email_policy,
     email_otp_hooks_and_reset_edges,
-    email_otp_configured_quota_blocks_delivery_and_resets_at_configured_window
+    email_otp_configured_quota_blocks_delivery_and_resets_at_configured_window,
+    verification_otp_cache_set_failure
 );
 
 #[derive(Default)]
@@ -418,4 +419,138 @@ async fn email_otp_configured_quota_blocks_delivery_and_resets_at_configured_win
     assert_eq!(db.count("verifications").await?, 3);
     assert_eq!(db.count("sessions").await?, 0);
     B::close(connection).await
+}
+
+async fn verification_otp_cache_set_failure<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{
+        CacheAdapter, DatabaseHookContext, DatabaseHooks, HookControl, MemoryCacheAdapter,
+    };
+    use alibi::verification::{
+        VerificationCreation, VerificationIdentifierStrategy, VerificationSnapshot,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Cache {
+        memory: MemoryCacheAdapter,
+        fail_set: AtomicBool,
+        fail_get: AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl CacheAdapter for Cache {
+        async fn set(&self, k: &str, v: &str, t: chrono::Duration) -> AuthResult<()> {
+            if self.fail_set.load(Ordering::SeqCst) {
+                return Err(AuthError::internal("configured cache outage"));
+            }
+            self.memory.set(k, v, t).await
+        }
+        async fn get(&self, k: &str) -> AuthResult<Option<String>> {
+            if self.fail_get.load(Ordering::SeqCst) {
+                return Err(AuthError::internal("configured cache outage"));
+            }
+            self.memory.get(k).await
+        }
+        async fn get_and_delete(&self, k: &str) -> AuthResult<Option<String>> {
+            self.memory.get_and_delete(k).await
+        }
+        async fn delete(&self, k: &str) -> AuthResult<()> {
+            self.memory.delete(k).await
+        }
+        async fn exists(&self, k: &str) -> AuthResult<bool> {
+            self.memory.exists(k).await
+        }
+        async fn expire(&self, k: &str, t: chrono::Duration) -> AuthResult<()> {
+            self.memory.expire(k, t).await
+        }
+        async fn clear(&self) -> AuthResult<()> {
+            self.memory.clear().await
+        }
+    }
+
+    #[derive(Clone)]
+    struct Hook(Arc<Mutex<Vec<&'static str>>>);
+    #[async_trait::async_trait]
+    impl<S: AuthSchema, H: alibi::store::HookBackend> DatabaseHooks<S, H> for Hook {
+        async fn before_create_verification_record(
+            &self,
+            _: &mut VerificationCreation,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<HookControl> {
+            self.0.lock().unwrap().push("before");
+            Ok(HookControl::Continue)
+        }
+        async fn after_create_verification_record(
+            &self,
+            _: &VerificationSnapshot,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<()> {
+            self.0.lock().unwrap().push("after");
+            Ok(())
+        }
+    }
+    for physical in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let cache = Arc::new(Cache {
+            memory: MemoryCacheAdapter::new(),
+            fail_set: AtomicBool::new(true),
+            fail_get: AtomicBool::new(false),
+        });
+        let hook = Hook(Arc::new(Mutex::new(Vec::new())));
+        let mailbox = Arc::new(Mailbox::default());
+        let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        config.verification.secondary_storage = Some(cache.clone());
+        config.verification.store_in_database = physical;
+        config.verification.store_identifier.default = VerificationIdentifierStrategy::Hashed;
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::hook(
+                B::store(Arc::new(config), &connection),
+                hook.clone(),
+            ))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(plugin(&mailbox, EmailOtpConfig::default()))
+            .build()
+            .await?;
+        let foreign = signup(&auth, "foreign@example.test").await;
+        let baseline = db.tables(&["users", "accounts", "sessions"]).await?;
+        let failed = call(
+            &auth,
+            request(
+                "/email-otp/send-verification-otp",
+                Some(json!({"email":"undelivered@example.test","type":"sign-in"})),
+                "",
+            ),
+            500,
+        )
+        .await;
+        assert!(failed.headers.get_all("set-cookie").next().is_none());
+        assert!(mailbox.0.lock().unwrap().is_empty());
+        assert_eq!(*hook.0.lock().unwrap(), ["before", "before"]);
+        assert_eq!(db.count("verifications").await?, i64::from(physical));
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions"]).await?,
+            baseline
+        );
+        cache.fail_set.store(false, Ordering::SeqCst);
+        let denied = call(
+            &auth,
+            request(
+                "/sign-in/email-otp",
+                Some(json!({"email":"undelivered@example.test","otp":"undelivered-proof"})),
+                "",
+            ),
+            400,
+        )
+        .await;
+        assert_eq!(body(&denied)["code"], "INVALID_OTP");
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions"]).await?,
+            baseline
+        );
+        assert!(mailbox.0.lock().unwrap().is_empty());
+        authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+        B::close(connection).await?;
+    }
+    Ok(())
 }
