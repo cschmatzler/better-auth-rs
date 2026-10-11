@@ -14,7 +14,8 @@ backend_tests!(
     one_tap_account_cookie_and_remember_state,
     one_tap_callback_rejection_before_jwks,
     one_tap_client_id_array_authority,
-    one_tap_enabled_two_factor_session
+    one_tap_enabled_two_factor_session,
+    one_tap_required_verification_delivery
 );
 
 struct DenyList;
@@ -736,4 +737,126 @@ async fn one_tap_enabled_two_factor_session<B: Backend>(db: Db) -> TestResult {
     }
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
+}
+
+async fn one_tap_required_verification_delivery<B: Backend>(db: Db) -> TestResult {
+    fn runtime<B: Backend>(
+        connection: &B::Connection,
+        account: AccountConfig,
+        one_tap: OneTapConfig,
+        google: Option<OAuthProvider>,
+    ) -> AuthBuilder<B::Schema> {
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN).account(account);
+        let mut b = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(OneTapPlugin::with_config(one_tap));
+        if let Some(g) = google {
+            b = b.plugin(OAuthPlugin::new().add_provider("google", g));
+        }
+        b
+    }
+
+    use alibi::plugins::{EmailVerificationConfig, EmailVerificationPlugin, SendVerificationEmail};
+    use alibi::wire::UserView;
+    struct Inbox {
+        db: crate::storage::Raw,
+        seen: Mutex<Vec<(String, String)>>,
+    }
+    #[async_trait::async_trait]
+    impl SendVerificationEmail for Inbox {
+        async fn send(&self, u: &UserView, url: &str, t: &str) -> AuthResult<()> {
+            assert_eq!(
+                self.db
+                    .count_where("SELECT COUNT(*) FROM users WHERE id=$1", &[&u.id])
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                self.db
+                    .count_where(
+                        "SELECT COUNT(*) FROM accounts WHERE user_id=$1 AND provider_id='google'",
+                        &[&u.id]
+                    )
+                    .await
+                    .unwrap(),
+                1
+            );
+            self.seen.lock().unwrap().push((url.into(), t.into()));
+            Ok(())
+        }
+    }
+    for send in [None, Some(false)] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let remote = Tap::start().await;
+        let inbox = Arc::new(Inbox {
+            db: db.raw.clone(),
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut google = OAuthProvider::google("tap-client", "secret");
+        google.require_email_verification = true;
+        let auth = runtime::<B>(
+            &connection,
+            AccountConfig::default(),
+            remote.config(None, false),
+            Some(google),
+        )
+        .plugin(EmailVerificationPlugin::with_config(
+            EmailVerificationConfig {
+                send_verification_email: Some(inbox.clone()),
+                send_on_sign_up: send,
+                ..Default::default()
+            },
+        ))
+        .build()
+        .await?;
+        let signed = token(json!({"email_verified":false}));
+        let denied = call(
+            &auth,
+            request(
+                "/one-tap/callback",
+                Some(json!({"idToken":signed,"callbackURL":"/body-target"})),
+                "",
+            ),
+            403,
+        )
+        .await;
+        assert_eq!(body(&denied)["code"], "EMAIL_NOT_VERIFIED");
+        assert!(denied.headers.get_all("set-cookie").next().is_none());
+        assert_eq!(db.count("users").await?, 1);
+        assert_eq!(db.count("accounts").await?, 1);
+        assert_eq!(db.count("sessions").await?, 0);
+        let receipts = inbox.seen.lock().unwrap().clone();
+        assert_eq!(receipts.len(), usize::from(send.is_none()));
+        if let Some((url, proof)) = receipts.first() {
+            let url = url::Url::parse(url)?;
+            assert_eq!(
+                url.query_pairs()
+                    .find(|(k, _)| k == "callbackURL")
+                    .unwrap()
+                    .1,
+                "/"
+            );
+            let mut verify = request("/verify-email", None, "");
+            verify.set_query_pairs([("token", proof.as_str())]);
+            _ = call(&auth, verify, 200).await;
+            let done = call(
+                &auth,
+                request("/one-tap/callback", Some(json!({"idToken":signed})), ""),
+                200,
+            )
+            .await;
+            assert_eq!(body(&done)["user"]["emailVerified"], true);
+            assert_eq!(db.count("users").await?, 1);
+            assert_eq!(db.count("accounts").await?, 1);
+            assert_eq!(db.count("sessions").await?, 1);
+            authenticated(&auth, &cookies(&done), "tap@example.test").await;
+        }
+        B::close(connection).await?;
+    }
+    Ok(())
 }
