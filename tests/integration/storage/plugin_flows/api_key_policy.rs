@@ -23,6 +23,20 @@ backend_tests!(
     static_org_delete_requires_delete_action_and_revokes_only_selected_key,
     disabled_custom_key_expiration_retains_default_lifetime_through_rename,
     banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_authority,
+    api_key_builtin_fractional_generation,
+    api_key_raw_default_expiration,
+    api_key_fractional_policy_bounds,
+    api_key_start_bytes_through_update,
+    api_key_installed_reference_principal,
+    api_key_public_callback_500_identity,
+    api_key_secondary_index_expiration,
+    api_key_secondary_sdk_delete_index_scope,
+    api_key_stale_reference_index_authority,
+    api_key_selected_list_storage_isolation,
+    api_key_multistore_sort_pagination,
+    api_key_wire_date_projection,
+    api_key_permission_date_projection,
+    api_key_sql_usage_failure_transport,
     api_key_org_loader_failure_denial
 );
 
@@ -1895,6 +1909,1954 @@ async fn banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_autho
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     authenticated(&auth, &cookies(&admin), "admin@example.test").await;
     B::close(connection).await
+}
+
+async fn api_key_builtin_fractional_generation<B: Backend>(db: Db) -> TestResult {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest as _, Sha256};
+    for (length, expected) in [
+        (0.5, Some(1)),
+        (2.5, Some(3)),
+        (0.0, Some(64)),
+        (f64::NAN, Some(64)),
+        (-1.0, None),
+        (f64::NEG_INFINITY, None),
+    ] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(ApiKeyPlugin::with_config(ApiKeyConfig {
+                key_length: length,
+                prefix: Some("gen_".into()),
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let owner = signup(&auth, "builtin@example.test").await;
+        let before = db
+            .tables(&["users", "accounts", "sessions", "api_keys"])
+            .await?;
+        let response = call(
+            &auth,
+            request(
+                "/api-key/create",
+                Some(json!({"name":"Builtin"})),
+                &cookies(&owner),
+            ),
+            if expected.is_some() { 200 } else { 500 },
+        )
+        .await;
+        if let Some(expected) = expected {
+            let key = body(&response)["key"].as_str().unwrap().to_owned();
+            let suffix = key.strip_prefix("gen_").unwrap();
+            assert_eq!(suffix.len(), expected);
+            assert!(suffix.bytes().all(|byte| byte.is_ascii_alphabetic()));
+            assert_eq!(
+                db.text("SELECT key FROM api_keys", &[]).await?.as_deref(),
+                Some(
+                    URL_SAFE_NO_PAD
+                        .encode(Sha256::digest(key.as_bytes()))
+                        .as_str()
+                )
+            );
+            assert_eq!(body(&response)["referenceId"], body(&owner)["user"]["id"]);
+            assert_eq!(db.count("api_keys").await?, 1);
+        } else {
+            assert!(response.body.is_empty());
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions", "api_keys"])
+                    .await?,
+                before
+            );
+        }
+        B::close(connection).await?;
+    }
+    struct Generator(Mutex<Vec<(String, Option<String>)>>);
+    #[async_trait::async_trait]
+    impl ApiKeyGenerator for Generator {
+        async fn generate_key(&self, o: &ApiKeyGenerationOptions<'_>) -> AuthResult<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((o.length.to_string(), o.prefix.map(str::to_owned)));
+            Ok("application-owned-secret-material".into())
+        }
+    }
+    for (length, expected) in [
+        (0.25, "0.25"),
+        (f64::INFINITY, "inf"),
+        (f64::NEG_INFINITY, "-inf"),
+        (f64::NAN, "64"),
+    ] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let generator = Arc::new(Generator(Mutex::new(Vec::new())));
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(ApiKeyPlugin::with_config(ApiKeyConfig {
+                key_length: length,
+                prefix: Some("gen_".into()),
+                custom_key_generator: Some(generator.clone()),
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let owner = signup(&auth, "custom-length@example.test").await;
+        let created = call(
+            &auth,
+            request("/api-key/create", Some(json!({})), &cookies(&owner)),
+            200,
+        )
+        .await;
+        assert_eq!(body(&created)["key"], "application-owned-secret-material");
+        assert_eq!(
+            *generator.0.lock().unwrap(),
+            [(expected.into(), Some("gen_".into()))]
+        );
+        assert_eq!(
+            db.text("SELECT key FROM api_keys", &[]).await?.as_deref(),
+            Some(
+                URL_SAFE_NO_PAD
+                    .encode(Sha256::digest(b"application-owned-secret-material"))
+                    .as_str()
+            )
+        );
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn api_key_raw_default_expiration<B: Backend>(db: Db) -> TestResult {
+    struct Generator(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl ApiKeyGenerator for Generator {
+        async fn generate_key(&self, _: &ApiKeyGenerationOptions<'_>) -> AuthResult<String> {
+            _ = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("default-expiry-secret-material".into())
+        }
+    }
+    for expiry in [
+        60.125,
+        0.0,
+        f64::NAN,
+        -3600.125,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let generator = Arc::new(Generator(std::sync::atomic::AtomicUsize::new(0)));
+        let plugin = ApiKeyPlugin::with_config(ApiKeyConfig {
+            custom_key_generator: Some(generator.clone()),
+            defer_updates: false,
+            key_expiration: KeyExpirationConfig {
+                default_expires_in: Some(expiry),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(plugin.clone())
+            .build()
+            .await?;
+        let owner = signup(&auth, "default-expiry@example.test").await;
+        let before = db
+            .tables(&["users", "accounts", "sessions", "api_keys"])
+            .await?;
+        let response = call(
+            &auth,
+            request("/api-key/create", Some(json!({})), &cookies(&owner)),
+            if expiry.is_infinite() { 500 } else { 200 },
+        )
+        .await;
+        assert_eq!(generator.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        if expiry.is_infinite() {
+            assert!(response.body.is_empty());
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions", "api_keys"])
+                    .await?,
+                before
+            );
+        } else if expiry == 0.0 || expiry.is_nan() {
+            assert!(body(&response)["expiresAt"].is_null());
+            assert!(
+                db.text("SELECT expires_at FROM api_keys", &[])
+                    .await?
+                    .is_none()
+            );
+        } else {
+            let issued = body(&response);
+            let created =
+                chrono::DateTime::parse_from_rfc3339(issued["createdAt"].as_str().unwrap())?;
+            let expires =
+                chrono::DateTime::parse_from_rfc3339(issued["expiresAt"].as_str().unwrap())?;
+            let millis = (expires - created).num_milliseconds();
+            if expiry.is_sign_positive() {
+                assert!((60_100..=60_175).contains(&millis), "{millis}");
+            } else {
+                assert!((-3_600_150..=-3_600_100).contains(&millis), "{millis}");
+                let rejected = plugin
+                    .verify_api_key(
+                        &VerifyApiKey {
+                            key: issued["key"].as_str().unwrap(),
+                            config_id: Some("default"),
+                            permissions: None,
+                        },
+                        auth.context(),
+                    )
+                    .await
+                    .unwrap_err();
+                match rejected {
+                    ApiKeyVerificationError::Validation(error) => {
+                        assert_eq!(serde_json::to_value(error)?["code"], "KEY_EXPIRED")
+                    }
+                    _ => panic!("expiry must reject as KEY_EXPIRED"),
+                }
+                assert_eq!(db.count("api_keys").await?, 0);
+            }
+        }
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn api_key_fractional_policy_bounds<B: Backend>(db: Db) -> TestResult {
+    struct Generator(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl ApiKeyGenerator for Generator {
+        async fn generate_key(&self, _: &ApiKeyGenerationOptions<'_>) -> AuthResult<String> {
+            Ok(format!(
+                "fractional-policy-secret-{}",
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ))
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let generator = Arc::new(Generator(std::sync::atomic::AtomicUsize::new(0)));
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(
+            ApiKeyPlugin::with_config(ApiKeyConfig {
+                custom_key_generator: Some(generator.clone()),
+                min_prefix_length: 1.5,
+                max_prefix_length: 2.5,
+                min_name_length: 1.5,
+                max_name_length: 3.5,
+                key_expiration: KeyExpirationConfig {
+                    min_expires_in: 1.5 / 86400.0,
+                    max_expires_in: 3.5 / 86400.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .configuration(ApiKeyConfig {
+                config_id: "nan-bounds".into(),
+                custom_key_generator: Some(generator.clone()),
+                min_prefix_length: f64::NAN,
+                max_prefix_length: f64::NAN,
+                min_name_length: f64::NAN,
+                max_name_length: f64::NAN,
+                key_expiration: KeyExpirationConfig {
+                    min_expires_in: f64::NAN,
+                    max_expires_in: f64::NAN,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .build()
+        .await?;
+    let owner = signup(&auth, "fractional-policy@example.test").await;
+    for input in [
+        json!({"name":"x"}),
+        json!({"name":"four"}),
+        json!({"prefix":"x"}),
+        json!({"prefix":"abc"}),
+        json!({"expiresIn":1}),
+        json!({"expiresIn":4}),
+    ] {
+        let before = db
+            .tables(&["users", "accounts", "sessions", "api_keys"])
+            .await?;
+        let denied = call(
+            &auth,
+            request("/api-key/create", Some(input), &cookies(&owner)),
+            400,
+        )
+        .await;
+        assert!(body(&denied)["code"].is_string());
+        assert_eq!(generator.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "api_keys"])
+                .await?,
+            before
+        );
+    }
+    for input in [
+        json!({"name":"😀","prefix":"ab","expiresIn":2}),
+        json!({"configId":"nan-bounds","name":"very-long-name","prefix":"very-long-prefix","expiresIn":1}),
+    ] {
+        let accepted = call(
+            &auth,
+            request("/api-key/create", Some(input.clone()), &cookies(&owner)),
+            200,
+        )
+        .await;
+        assert_eq!(body(&accepted)["name"], input["name"]);
+        assert_eq!(body(&accepted)["prefix"], input["prefix"]);
+        assert_eq!(body(&accepted)["referenceId"], body(&owner)["user"]["id"]);
+    }
+    assert_eq!(generator.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(db.count("api_keys").await?, 2);
+    B::close(connection).await
+}
+
+async fn api_key_start_bytes_through_update<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let plugin = ApiKeyPlugin::with_config(ApiKeyConfig {
+        custom_key_generator: Some(Arc::new(Surrogate::default())),
+        starting_characters_length: 1.5,
+        store_starting_characters: true,
+        rate_limit: RateLimitDefaults {
+            enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(plugin.clone())
+        .build()
+        .await?;
+    let owner = signup(&auth, "start-bytes@example.test").await;
+    let created = call(
+        &auth,
+        request(
+            "/api-key/create",
+            Some(json!({"name":"Original"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let issued = body(&created);
+    let id = issued["id"].as_str().unwrap();
+    let start = issued["start"].clone();
+    assert!(start.is_string());
+    assert_eq!(
+        db.text("SELECT HEX(start) FROM api_keys WHERE id=$1", &[id])
+            .await?
+            .as_deref(),
+        Some("EDA0BD")
+    );
+    assert_eq!(
+        db.text("SELECT TYPEOF(start) FROM api_keys WHERE id=$1", &[id])
+            .await?
+            .as_deref(),
+        Some("text")
+    );
+    let mut get = request("/api-key/get", None, &cookies(&owner));
+    get.set_query_pairs([("id", id)]);
+    assert_eq!(body(&call(&auth, get, 200).await)["start"], start);
+    assert_eq!(
+        body(&call(&auth, request("/api-key/list", None, &cookies(&owner)), 200).await)["apiKeys"]
+            [0]["start"],
+        start
+    );
+    let renamed = call(
+        &auth,
+        request(
+            "/api-key/update",
+            Some(json!({"keyId":id,"name":"Renamed"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&renamed)["start"], start);
+    assert_eq!(body(&renamed)["name"], "Renamed");
+    let verified = plugin
+        .verify_api_key(
+            &VerifyApiKey {
+                key: issued["key"].as_str().unwrap(),
+                config_id: Some("default"),
+                permissions: None,
+            },
+            auth.context(),
+        )
+        .await?;
+    assert_eq!(serde_json::to_value(verified)?["start"], start);
+    assert_eq!(
+        db.text("SELECT HEX(start) FROM api_keys WHERE id=$1", &[id])
+            .await?
+            .as_deref(),
+        Some("EDA0BD")
+    );
+    assert_eq!(
+        db.text("SELECT TYPEOF(start) FROM api_keys WHERE id=$1", &[id])
+            .await?
+            .as_deref(),
+        Some("text")
+    );
+    assert_eq!(db.count("api_keys").await?, 1);
+    authenticated(&auth, &cookies(&owner), "start-bytes@example.test").await;
+    B::close(connection).await
+}
+
+async fn api_key_installed_reference_principal<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let plugin = ApiKeyPlugin::with_config(ApiKeyConfig {
+        enable_session_for_api_keys: true,
+        defer_updates: false,
+        rate_limit: RateLimitDefaults {
+            enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(plugin.clone())
+        .build()
+        .await?;
+    let owner = signup(&auth, "installed-owner@example.test").await;
+    let foreign = signup(&auth, "installed-foreign@example.test").await;
+    let created = Box::pin(auth.dispatch_endpoint(
+        ApiKeyPlugin::create_endpoint(&serde_json::from_value(
+            json!({"userId":body(&owner)["user"]["id"],"remaining":8}),
+        )?)?,
+        EndpointOptions::default(),
+    ))
+    .await?
+    .decode()?;
+    let protected = db.tables(&["users", "accounts", "sessions"]).await?;
+    for (index, reference) in [
+        body(&foreign)["user"]["id"].as_str().unwrap(),
+        "installed-missing-user",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        _ = db
+            .execute(
+                "UPDATE api_keys SET reference_id=$1 WHERE id=$2",
+                &[reference, &created.api_key.id],
+            )
+            .await?;
+        let checked = plugin
+            .verify_api_key(
+                &VerifyApiKey {
+                    key: &created.key,
+                    config_id: Some("default"),
+                    permissions: None,
+                },
+                auth.context(),
+            )
+            .await?;
+        assert_eq!(checked.reference_id, reference);
+        assert_eq!(checked.remaining, Some(if index == 0 { 7.0 } else { 5.0 }));
+        let mut input = request("/get-session", None, &cookies(&owner));
+        _ = input
+            .headers
+            .insert("x-api-key".into(), created.key.clone());
+        let response = call(&auth, input, if index == 0 { 200 } else { 401 }).await;
+        if index == 0 {
+            let current = body(&response);
+            assert_eq!(current["user"]["id"], reference);
+            assert_eq!(current["session"]["userId"], reference);
+            assert_eq!(current["session"]["id"], created.api_key.id);
+            assert_eq!(current["session"]["token"], created.key);
+        } else {
+            assert_eq!(body(&response)["code"], "INVALID_REFERENCE_ID_FROM_API_KEY");
+        }
+        assert_eq!(
+            db.text(
+                "SELECT CAST(remaining AS TEXT) FROM api_keys WHERE id=$1",
+                &[&created.api_key.id]
+            )
+            .await?
+            .as_deref(),
+            Some(if index == 0 { "6.0" } else { "4.0" })
+        );
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions"]).await?,
+            protected
+        );
+    }
+    authenticated(&auth, &cookies(&owner), "installed-owner@example.test").await;
+    authenticated(&auth, &cookies(&foreign), "installed-foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn api_key_public_callback_500_identity<B: Backend>(db: Db) -> TestResult {
+    struct Application {
+        mode: Mutex<&'static str>,
+        lookups: std::sync::atomic::AtomicUsize,
+    }
+    fn failure(code: &str) -> AuthError {
+        AuthError::Api {
+            status: 500,
+            code: Some(code.into()),
+            message: "Application policy failed".into(),
+        }
+    }
+    #[async_trait::async_trait]
+    impl ApiKeyGenerator for Application {
+        async fn generate_key(&self, _: &ApiKeyGenerationOptions<'_>) -> AuthResult<String> {
+            if *self.mode.lock().unwrap() == "generator" {
+                return Err(failure("APPLICATION_GENERATOR_FAILED"));
+            }
+            Ok("public-policy-secret-material".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl ApiKeyValidator for Application {
+        async fn validate(&self, c: &ApiKeyCallbackContext<'_>, key: &str) -> AuthResult<bool> {
+            assert_eq!(key, "public-policy-secret-material");
+            if let Some(r) = c.request {
+                assert_eq!(
+                    r.headers.get("x-policy-marker").map(String::as_str),
+                    Some("actual-request")
+                );
+            }
+            if *self.mode.lock().unwrap() == "validator" {
+                return Err(failure("APPLICATION_VALIDATOR_FAILED"));
+            }
+            Ok(true)
+        }
+    }
+    impl ApiKeyGetter for Application {
+        fn get_key(&self, c: &ApiKeyCallbackContext<'_>) -> AuthResult<Option<String>> {
+            let Some(request) = c.request else {
+                return Ok(None);
+            };
+            let Some(key) = request.headers.get("x-application-key") else {
+                return Ok(None);
+            };
+            let lookup = self
+                .lookups
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mode = *self.mode.lock().unwrap();
+            if mode == "getter-match" || (mode == "getter-handler" && lookup == 1) {
+                return Err(failure("APPLICATION_GETTER_FAILED"));
+            }
+            Ok(Some(key.clone()))
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let application = Arc::new(Application {
+        mode: Mutex::new("generator"),
+        lookups: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let plugin = ApiKeyPlugin::with_config(ApiKeyConfig {
+        key_length: 16.0,
+        custom_key_generator: Some(application.clone()),
+        custom_api_key_validator: Some(application.clone()),
+        custom_api_key_getter: Some(application.clone()),
+        enable_session_for_api_keys: true,
+        rate_limit: RateLimitDefaults {
+            enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(plugin.clone())
+        .build()
+        .await?;
+    let owner = signup(&auth, "public-policy@example.test").await;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "api_keys"])
+        .await?;
+    let response = call(
+        &auth,
+        request("/api-key/create", Some(json!({})), &cookies(&owner)),
+        500,
+    )
+    .await;
+    assert_eq!(
+        body(&response),
+        json!({"code":"APPLICATION_GENERATOR_FAILED","message":"Application policy failed"})
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "api_keys"])
+            .await?,
+        before
+    );
+    *application.mode.lock().unwrap() = "accept";
+    let created = call(
+        &auth,
+        request("/api-key/create", Some(json!({})), &cookies(&owner)),
+        200,
+    )
+    .await;
+    let key = body(&created)["key"].as_str().unwrap().to_owned();
+    let before = db
+        .tables(&["users", "accounts", "sessions", "api_keys"])
+        .await?;
+    *application.mode.lock().unwrap() = "validator";
+    let explicit = Box::pin(auth.dispatch_endpoint(
+        ApiKeyPlugin::verify_endpoint(&ApiKeyVerificationInput {
+            key: key.clone(),
+            config_id: Some("default".into()),
+            permissions: None,
+        })?,
+        EndpointOptions::default(),
+    ))
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(explicit.error,AuthError::Api { status:500,ref code,ref message } if code.as_deref()==Some("APPLICATION_VALIDATOR_FAILED") && message=="Application policy failed")
+    );
+    let implicit = Box::pin(auth.dispatch_endpoint(
+        ApiKeyPlugin::verify_endpoint(&ApiKeyVerificationInput {
+            key: key.clone(),
+            config_id: None,
+            permissions: None,
+        })?,
+        EndpointOptions::default(),
+    ))
+    .await?
+    .decode()?;
+    assert!(!implicit.valid);
+    assert_eq!(
+        serde_json::to_value(implicit.error)?["code"],
+        "APPLICATION_VALIDATOR_FAILED"
+    );
+    for (mode, expected) in [
+        ("validator", Some("APPLICATION_VALIDATOR_FAILED")),
+        ("getter-handler", Some("APPLICATION_GETTER_FAILED")),
+        ("getter-match", None),
+    ] {
+        *application.mode.lock().unwrap() = mode;
+        application
+            .lookups
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        let mut input = request("/get-session", None, &cookies(&owner));
+        input.headers.extend([
+            ("x-application-key".into(), key.clone()),
+            ("x-policy-marker".into(), "actual-request".into()),
+        ]);
+        let denied = call(&auth, input, 500).await;
+        if let Some(code) = expected {
+            assert_eq!(
+                body(&denied),
+                json!({"code":code,"message":"Application policy failed"})
+            );
+        } else {
+            assert_eq!(
+                body(&denied)["message"],
+                "An error occurred during hook matcher execution. Check the logs for more details."
+            );
+        }
+        assert_eq!(
+            application
+                .lookups
+                .load(std::sync::atomic::Ordering::SeqCst),
+            if mode == "getter-match" { 1 } else { 2 }
+        );
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "api_keys"])
+                .await?,
+            before
+        );
+    }
+    B::close(connection).await
+}
+
+async fn api_key_secondary_index_expiration<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{CacheAdapter, MemoryCacheAdapter};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest as _, Sha256};
+    struct ApplicationStorage {
+        cache: MemoryCacheAdapter,
+        writes: Mutex<Vec<(String, Option<i64>)>>,
+        keys: Mutex<std::collections::BTreeSet<String>>,
+        fail_get: Mutex<Option<String>>,
+    }
+    impl ApplicationStorage {
+        fn new() -> Self {
+            Self {
+                cache: MemoryCacheAdapter::new(),
+                writes: Mutex::new(Vec::new()),
+                keys: Mutex::new(Default::default()),
+                fail_get: Mutex::new(None),
+            }
+        }
+        async fn snapshot(&self) -> AuthResult<std::collections::BTreeMap<String, String>> {
+            let keys = self
+                .keys
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut snapshot = std::collections::BTreeMap::new();
+            for key in keys {
+                if let Some(value) = self.cache.get(&key).await? {
+                    _ = snapshot.insert(key, value);
+                }
+            }
+            Ok(snapshot)
+        }
+    }
+    #[async_trait::async_trait]
+    impl ApiKeyStorage for ApplicationStorage {
+        async fn get(&self, key: &str) -> AuthResult<Option<String>> {
+            if self
+                .fail_get
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|prefix| key.starts_with(prefix))
+            {
+                return Err(AuthError::internal("Application key storage unavailable"));
+            }
+            self.cache.get(key).await
+        }
+        async fn set(
+            &self,
+            key: &str,
+            value: &str,
+            ttl: Option<chrono::Duration>,
+        ) -> AuthResult<()> {
+            _ = self.keys.lock().unwrap().insert(key.into());
+            self.writes
+                .lock()
+                .unwrap()
+                .push((key.into(), ttl.map(|ttl| ttl.num_seconds())));
+            match ttl {
+                Some(ttl) => self.cache.set(key, value, ttl).await,
+                None => self.cache.set_without_expiry(key, value).await,
+            }
+        }
+        async fn delete(&self, key: &str) -> AuthResult<()> {
+            self.cache.delete(key).await
+        }
+    }
+    fn indices(key: &Value) -> [String; 3] {
+        [
+            format!(
+                "api-key:{}",
+                URL_SAFE_NO_PAD.encode(Sha256::digest(key["key"].as_str().unwrap().as_bytes()))
+            ),
+            format!("api-key:by-id:{}", key["id"].as_str().unwrap()),
+            format!("api-key:by-ref:{}", key["referenceId"].as_str().unwrap()),
+        ]
+    }
+
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let storage = Arc::new(ApplicationStorage::new());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(ApiKeyPlugin::with_config(ApiKeyConfig {
+            storage: ApiKeyStorageMode::SecondaryStorage,
+            custom_storage: Some(storage.clone()),
+            defer_updates: false,
+            key_expiration: KeyExpirationConfig {
+                min_expires_in: 0.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let owner = signup(&auth, "index-expiry@example.test").await;
+    let expiring = body(
+        &call(
+            &auth,
+            request(
+                "/api-key/create",
+                Some(json!({"name":"Expiring","expiresIn":120})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await,
+    );
+    let permanent = body(
+        &call(
+            &auth,
+            request(
+                "/api-key/create",
+                Some(json!({"name":"Permanent"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await,
+    );
+    let snapshot = storage.snapshot().await?;
+    let expiring_indices = indices(&expiring);
+    let permanent_indices = indices(&permanent);
+    assert_eq!(
+        snapshot.get(&expiring_indices[0]).unwrap(),
+        snapshot.get(&expiring_indices[1]).unwrap()
+    );
+    assert_eq!(
+        snapshot.get(&permanent_indices[0]).unwrap(),
+        snapshot.get(&permanent_indices[1]).unwrap()
+    );
+    let writes = storage.writes.lock().unwrap().clone();
+    for index in &expiring_indices[..2] {
+        assert!(
+            writes
+                .iter()
+                .filter(|(key, _)| key == index)
+                .all(|(_, ttl)| ttl.is_some_and(|seconds| (118..=120).contains(&seconds)))
+        );
+    }
+    for index in &permanent_indices {
+        assert!(
+            writes
+                .iter()
+                .filter(|(key, _)| key == index)
+                .all(|(_, ttl)| ttl.is_none())
+        );
+    }
+    let references: Vec<String> =
+        serde_json::from_str(snapshot.get(&permanent_indices[2]).unwrap())?;
+    assert_eq!(
+        references,
+        [
+            expiring["id"].as_str().unwrap(),
+            permanent["id"].as_str().unwrap()
+        ]
+    );
+    let list = body(&call(&auth, request("/api-key/list", None, &cookies(&owner)), 200).await);
+    assert_eq!(list["total"], 2);
+    assert_eq!(list["apiKeys"][0]["id"], expiring["id"]);
+    assert_eq!(list["apiKeys"][1]["id"], permanent["id"]);
+    assert_eq!(storage.snapshot().await?, snapshot);
+    assert_eq!(db.count("api_keys").await?, 0);
+    authenticated(&auth, &cookies(&owner), "index-expiry@example.test").await;
+    B::close(connection).await
+}
+
+async fn api_key_secondary_sdk_delete_index_scope<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{CacheAdapter, MemoryCacheAdapter};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest as _, Sha256};
+    struct ApplicationStorage {
+        cache: MemoryCacheAdapter,
+        writes: Mutex<Vec<(String, Option<i64>)>>,
+        keys: Mutex<std::collections::BTreeSet<String>>,
+        fail_get: Mutex<Option<String>>,
+    }
+    impl ApplicationStorage {
+        fn new() -> Self {
+            Self {
+                cache: MemoryCacheAdapter::new(),
+                writes: Mutex::new(Vec::new()),
+                keys: Mutex::new(Default::default()),
+                fail_get: Mutex::new(None),
+            }
+        }
+        async fn snapshot(&self) -> AuthResult<std::collections::BTreeMap<String, String>> {
+            let keys = self
+                .keys
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut snapshot = std::collections::BTreeMap::new();
+            for key in keys {
+                if let Some(value) = self.cache.get(&key).await? {
+                    _ = snapshot.insert(key, value);
+                }
+            }
+            Ok(snapshot)
+        }
+    }
+    #[async_trait::async_trait]
+    impl ApiKeyStorage for ApplicationStorage {
+        async fn get(&self, key: &str) -> AuthResult<Option<String>> {
+            if self
+                .fail_get
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|prefix| key.starts_with(prefix))
+            {
+                return Err(AuthError::internal("Application key storage unavailable"));
+            }
+            self.cache.get(key).await
+        }
+        async fn set(
+            &self,
+            key: &str,
+            value: &str,
+            ttl: Option<chrono::Duration>,
+        ) -> AuthResult<()> {
+            _ = self.keys.lock().unwrap().insert(key.into());
+            self.writes
+                .lock()
+                .unwrap()
+                .push((key.into(), ttl.map(|ttl| ttl.num_seconds())));
+            match ttl {
+                Some(ttl) => self.cache.set(key, value, ttl).await,
+                None => self.cache.set_without_expiry(key, value).await,
+            }
+        }
+        async fn delete(&self, key: &str) -> AuthResult<()> {
+            self.cache.delete(key).await
+        }
+    }
+    fn indices(key: &Value) -> [String; 3] {
+        [
+            format!(
+                "api-key:{}",
+                URL_SAFE_NO_PAD.encode(Sha256::digest(key["key"].as_str().unwrap().as_bytes()))
+            ),
+            format!("api-key:by-id:{}", key["id"].as_str().unwrap()),
+            format!("api-key:by-ref:{}", key["referenceId"].as_str().unwrap()),
+        ]
+    }
+
+    for fallback in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let storage = Arc::new(ApplicationStorage::new());
+        let plugin = ApiKeyPlugin::with_config(ApiKeyConfig {
+            storage: ApiKeyStorageMode::SecondaryStorage,
+            custom_storage: Some(storage.clone()),
+            fallback_to_database: fallback,
+            defer_updates: false,
+            rate_limit: RateLimitDefaults {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(plugin.clone())
+            .build()
+            .await?;
+        let owner = signup(&auth, "delete-index-owner@example.test").await;
+        let foreign = signup(&auth, "delete-index-foreign@example.test").await;
+        let selected = body(
+            &call(
+                &auth,
+                request(
+                    "/api-key/create",
+                    Some(json!({"name":"Selected"})),
+                    &cookies(&owner),
+                ),
+                200,
+            )
+            .await,
+        );
+        let sibling = body(
+            &call(
+                &auth,
+                request(
+                    "/api-key/create",
+                    Some(json!({"name":"Sibling"})),
+                    &cookies(&owner),
+                ),
+                200,
+            )
+            .await,
+        );
+        let other = body(
+            &call(
+                &auth,
+                request(
+                    "/api-key/create",
+                    Some(json!({"name":"Foreign"})),
+                    &cookies(&foreign),
+                ),
+                200,
+            )
+            .await,
+        );
+        _ = call(&auth, request("/api-key/list", None, &cookies(&owner)), 200).await;
+        _ = call(
+            &auth,
+            request("/api-key/list", None, &cookies(&foreign)),
+            200,
+        )
+        .await;
+        let before = storage.snapshot().await?;
+        let protected = db.tables(&["users", "accounts", "sessions"]).await?;
+        _ = call(
+            &auth,
+            request(
+                "/api-key/delete",
+                Some(json!({"keyId":selected["id"]})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+        let after = storage.snapshot().await?;
+        let selected_indices = indices(&selected);
+        let sibling_indices = indices(&sibling);
+        let other_indices = indices(&other);
+        assert!(!after.contains_key(&selected_indices[0]));
+        assert!(!after.contains_key(&selected_indices[1]));
+        for index in &sibling_indices[..2] {
+            assert_eq!(after.get(index), before.get(index));
+        }
+        for index in &other_indices {
+            assert_eq!(after.get(index), before.get(index));
+        }
+        if fallback {
+            assert!(!after.contains_key(&selected_indices[2]));
+            assert_eq!(db.count("api_keys").await?, 2);
+        } else {
+            assert_eq!(
+                serde_json::from_str::<Vec<String>>(after.get(&selected_indices[2]).unwrap())?,
+                [sibling["id"].as_str().unwrap()]
+            );
+            assert_eq!(db.count("api_keys").await?, 0);
+        }
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions"]).await?,
+            protected
+        );
+        assert!(
+            plugin
+                .verify_api_key(
+                    &VerifyApiKey {
+                        key: selected["key"].as_str().unwrap(),
+                        config_id: Some("default"),
+                        permissions: None
+                    },
+                    auth.context()
+                )
+                .await
+                .is_err()
+        );
+        for key in [&sibling, &other] {
+            assert_eq!(
+                plugin
+                    .verify_api_key(
+                        &VerifyApiKey {
+                            key: key["key"].as_str().unwrap(),
+                            config_id: Some("default"),
+                            permissions: None
+                        },
+                        auth.context()
+                    )
+                    .await?
+                    .id,
+                key["id"].as_str().unwrap()
+            );
+        }
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn api_key_stale_reference_index_authority<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{CacheAdapter, MemoryCacheAdapter};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest as _, Sha256};
+    struct ApplicationStorage {
+        cache: MemoryCacheAdapter,
+        writes: Mutex<Vec<(String, Option<i64>)>>,
+        keys: Mutex<std::collections::BTreeSet<String>>,
+        fail_get: Mutex<Option<String>>,
+    }
+    impl ApplicationStorage {
+        fn new() -> Self {
+            Self {
+                cache: MemoryCacheAdapter::new(),
+                writes: Mutex::new(Vec::new()),
+                keys: Mutex::new(Default::default()),
+                fail_get: Mutex::new(None),
+            }
+        }
+        async fn snapshot(&self) -> AuthResult<std::collections::BTreeMap<String, String>> {
+            let keys = self
+                .keys
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut snapshot = std::collections::BTreeMap::new();
+            for key in keys {
+                if let Some(value) = self.cache.get(&key).await? {
+                    _ = snapshot.insert(key, value);
+                }
+            }
+            Ok(snapshot)
+        }
+    }
+    #[async_trait::async_trait]
+    impl ApiKeyStorage for ApplicationStorage {
+        async fn get(&self, key: &str) -> AuthResult<Option<String>> {
+            if self
+                .fail_get
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|prefix| key.starts_with(prefix))
+            {
+                return Err(AuthError::internal("Application key storage unavailable"));
+            }
+            self.cache.get(key).await
+        }
+        async fn set(
+            &self,
+            key: &str,
+            value: &str,
+            ttl: Option<chrono::Duration>,
+        ) -> AuthResult<()> {
+            _ = self.keys.lock().unwrap().insert(key.into());
+            self.writes
+                .lock()
+                .unwrap()
+                .push((key.into(), ttl.map(|ttl| ttl.num_seconds())));
+            match ttl {
+                Some(ttl) => self.cache.set(key, value, ttl).await,
+                None => self.cache.set_without_expiry(key, value).await,
+            }
+        }
+        async fn delete(&self, key: &str) -> AuthResult<()> {
+            self.cache.delete(key).await
+        }
+    }
+    fn indices(key: &Value) -> [String; 3] {
+        [
+            format!(
+                "api-key:{}",
+                URL_SAFE_NO_PAD.encode(Sha256::digest(key["key"].as_str().unwrap().as_bytes()))
+            ),
+            format!("api-key:by-id:{}", key["id"].as_str().unwrap()),
+            format!("api-key:by-ref:{}", key["referenceId"].as_str().unwrap()),
+        ]
+    }
+
+    for fallback in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let storage = Arc::new(ApplicationStorage::new());
+        let auth = super::auth_probe::fast_builder::<B>(&connection)
+            .plugin(ApiKeyPlugin::with_config(ApiKeyConfig {
+                storage: ApiKeyStorageMode::SecondaryStorage,
+                custom_storage: Some(storage.clone()),
+                fallback_to_database: fallback,
+                defer_updates: false,
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let owner = signup(&auth, "stale-index-owner@example.test").await;
+        let foreign = signup(&auth, "stale-index-foreign@example.test").await;
+        let own = body(
+            &call(
+                &auth,
+                request(
+                    "/api-key/create",
+                    Some(json!({"name":"Own"})),
+                    &cookies(&owner),
+                ),
+                200,
+            )
+            .await,
+        );
+        let other = body(
+            &call(
+                &auth,
+                request(
+                    "/api-key/create",
+                    Some(json!({"name":"Foreign"})),
+                    &cookies(&foreign),
+                ),
+                200,
+            )
+            .await,
+        );
+        _ = call(&auth, request("/api-key/list", None, &cookies(&owner)), 200).await;
+        let own_index = indices(&own)[2].clone();
+        storage
+            .cache
+            .set_without_expiry(
+                &own_index,
+                &serde_json::to_string(&vec![other["id"].as_str().unwrap()])?,
+            )
+            .await?;
+        let before = storage.snapshot().await?;
+        let protected = db
+            .tables(&["users", "accounts", "sessions", "api_keys"])
+            .await?;
+        let list = body(&call(&auth, request("/api-key/list", None, &cookies(&owner)), 200).await);
+        assert_eq!(list["apiKeys"], json!([]));
+        assert_eq!(list["total"], 0);
+        assert_eq!(storage.snapshot().await?, before);
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "api_keys"])
+                .await?,
+            protected
+        );
+        let mut get = request("/api-key/get", None, &cookies(&owner));
+        get.set_query_pairs([("id", other["id"].as_str().unwrap())]);
+        assert_eq!(body(&call(&auth, get, 404).await)["code"], "KEY_NOT_FOUND");
+        assert_eq!(storage.snapshot().await?, before);
+        authenticated(&auth, &cookies(&owner), "stale-index-owner@example.test").await;
+        authenticated(
+            &auth,
+            &cookies(&foreign),
+            "stale-index-foreign@example.test",
+        )
+        .await;
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn api_key_selected_list_storage_isolation<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{CacheAdapter, MemoryCacheAdapter};
+    struct ApplicationStorage {
+        cache: MemoryCacheAdapter,
+        writes: Mutex<Vec<(String, Option<i64>)>>,
+        keys: Mutex<std::collections::BTreeSet<String>>,
+        fail_get: Mutex<Option<String>>,
+    }
+    impl ApplicationStorage {
+        fn new() -> Self {
+            Self {
+                cache: MemoryCacheAdapter::new(),
+                writes: Mutex::new(Vec::new()),
+                keys: Mutex::new(Default::default()),
+                fail_get: Mutex::new(None),
+            }
+        }
+        async fn snapshot(&self) -> AuthResult<std::collections::BTreeMap<String, String>> {
+            let keys = self
+                .keys
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut snapshot = std::collections::BTreeMap::new();
+            for key in keys {
+                if let Some(value) = self.cache.get(&key).await? {
+                    _ = snapshot.insert(key, value);
+                }
+            }
+            Ok(snapshot)
+        }
+    }
+    #[async_trait::async_trait]
+    impl ApiKeyStorage for ApplicationStorage {
+        async fn get(&self, key: &str) -> AuthResult<Option<String>> {
+            if self
+                .fail_get
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|prefix| key.starts_with(prefix))
+            {
+                return Err(AuthError::internal("Application key storage unavailable"));
+            }
+            self.cache.get(key).await
+        }
+        async fn set(
+            &self,
+            key: &str,
+            value: &str,
+            ttl: Option<chrono::Duration>,
+        ) -> AuthResult<()> {
+            _ = self.keys.lock().unwrap().insert(key.into());
+            self.writes
+                .lock()
+                .unwrap()
+                .push((key.into(), ttl.map(|ttl| ttl.num_seconds())));
+            match ttl {
+                Some(ttl) => self.cache.set(key, value, ttl).await,
+                None => self.cache.set_without_expiry(key, value).await,
+            }
+        }
+        async fn delete(&self, key: &str) -> AuthResult<()> {
+            self.cache.delete(key).await
+        }
+    }
+
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let storage = Arc::new(ApplicationStorage::new());
+    let isolated = Arc::new(ApplicationStorage::new());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(
+            ApiKeyPlugin::with_config(ApiKeyConfig {
+                storage: ApiKeyStorageMode::SecondaryStorage,
+                custom_storage: Some(storage.clone()),
+                defer_updates: false,
+                ..Default::default()
+            })
+            .configuration(ApiKeyConfig {
+                config_id: "isolated".into(),
+                storage: ApiKeyStorageMode::SecondaryStorage,
+                custom_storage: Some(isolated.clone()),
+                defer_updates: false,
+                ..Default::default()
+            }),
+        )
+        .build()
+        .await?;
+    let owner = signup(&auth, "isolated-list@example.test").await;
+    let selected = body(
+        &call(
+            &auth,
+            request(
+                "/api-key/create",
+                Some(json!({"name":"Selected"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await,
+    );
+    _ = call(
+        &auth,
+        request(
+            "/api-key/create",
+            Some(json!({"configId":"isolated","name":"Other store"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let before = storage.snapshot().await?;
+    let other_before = isolated.snapshot().await?;
+    let protected = db
+        .tables(&["users", "accounts", "sessions", "api_keys"])
+        .await?;
+    *isolated.fail_get.lock().unwrap() = Some("api-key:by-ref:".into());
+    let mut input = request("/api-key/list", None, &cookies(&owner));
+    input.set_query_pairs([("configId", "default")]);
+    let list = body(&call(&auth, input, 200).await);
+    assert_eq!(list["total"], 1);
+    assert_eq!(list["apiKeys"][0]["id"], selected["id"]);
+    assert_eq!(storage.snapshot().await?, before);
+    assert_eq!(isolated.snapshot().await?, other_before);
+    let denied = call(&auth, request("/api-key/list", None, &cookies(&owner)), 500).await;
+    assert!(denied.body.is_empty());
+    assert_eq!(storage.snapshot().await?, before);
+    assert_eq!(isolated.snapshot().await?, other_before);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "api_keys"])
+            .await?,
+        protected
+    );
+    *isolated.fail_get.lock().unwrap() = None;
+    assert_eq!(
+        body(&call(&auth, request("/api-key/list", None, &cookies(&owner)), 200).await)["total"],
+        2
+    );
+    B::close(connection).await
+}
+
+async fn api_key_multistore_sort_pagination<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{CacheAdapter, MemoryCacheAdapter};
+    struct ApplicationStorage {
+        cache: MemoryCacheAdapter,
+        writes: Mutex<Vec<(String, Option<i64>)>>,
+        keys: Mutex<std::collections::BTreeSet<String>>,
+        fail_get: Mutex<Option<String>>,
+    }
+    impl ApplicationStorage {
+        fn new() -> Self {
+            Self {
+                cache: MemoryCacheAdapter::new(),
+                writes: Mutex::new(Vec::new()),
+                keys: Mutex::new(Default::default()),
+                fail_get: Mutex::new(None),
+            }
+        }
+        async fn snapshot(&self) -> AuthResult<std::collections::BTreeMap<String, String>> {
+            let keys = self
+                .keys
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut snapshot = std::collections::BTreeMap::new();
+            for key in keys {
+                if let Some(value) = self.cache.get(&key).await? {
+                    _ = snapshot.insert(key, value);
+                }
+            }
+            Ok(snapshot)
+        }
+    }
+    #[async_trait::async_trait]
+    impl ApiKeyStorage for ApplicationStorage {
+        async fn get(&self, key: &str) -> AuthResult<Option<String>> {
+            if self
+                .fail_get
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|prefix| key.starts_with(prefix))
+            {
+                return Err(AuthError::internal("Application key storage unavailable"));
+            }
+            self.cache.get(key).await
+        }
+        async fn set(
+            &self,
+            key: &str,
+            value: &str,
+            ttl: Option<chrono::Duration>,
+        ) -> AuthResult<()> {
+            _ = self.keys.lock().unwrap().insert(key.into());
+            self.writes
+                .lock()
+                .unwrap()
+                .push((key.into(), ttl.map(|ttl| ttl.num_seconds())));
+            match ttl {
+                Some(ttl) => self.cache.set(key, value, ttl).await,
+                None => self.cache.set_without_expiry(key, value).await,
+            }
+        }
+        async fn delete(&self, key: &str) -> AuthResult<()> {
+            self.cache.delete(key).await
+        }
+    }
+
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let storage = Arc::new(ApplicationStorage::new());
+    let isolated = Arc::new(ApplicationStorage::new());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(
+            ApiKeyPlugin::with_config(ApiKeyConfig {
+                storage: ApiKeyStorageMode::SecondaryStorage,
+                custom_storage: Some(storage.clone()),
+                defer_updates: false,
+                ..Default::default()
+            })
+            .configuration(ApiKeyConfig {
+                config_id: "isolated".into(),
+                storage: ApiKeyStorageMode::SecondaryStorage,
+                custom_storage: Some(isolated.clone()),
+                defer_updates: false,
+                ..Default::default()
+            }),
+        )
+        .build()
+        .await?;
+    let owner = signup(&auth, "store-sort@example.test").await;
+    for (config, name) in [
+        ("default", "zulu-b"),
+        ("default", "zulu-a"),
+        ("isolated", "alpha-b"),
+        ("isolated", "alpha-a"),
+    ] {
+        _ = call(
+            &auth,
+            request(
+                "/api-key/create",
+                Some(json!({"configId":config,"name":name})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await;
+    }
+    let before = storage.snapshot().await?;
+    let other_before = isolated.snapshot().await?;
+    let protected = db
+        .tables(&["users", "accounts", "sessions", "api_keys"])
+        .await?;
+    for (query, expected, total) in [
+        (
+            vec![("sortBy", "name"), ("sortDirection", "asc")],
+            vec!["zulu-a", "zulu-b", "alpha-a", "alpha-b"],
+            4,
+        ),
+        (
+            vec![
+                ("sortBy", "name"),
+                ("sortDirection", "asc"),
+                ("offset", "1"),
+                ("limit", "2"),
+            ],
+            vec!["zulu-b", "alpha-a"],
+            4,
+        ),
+        (
+            vec![
+                ("configId", "isolated"),
+                ("sortBy", "name"),
+                ("sortDirection", "asc"),
+                ("offset", "1"),
+                ("limit", "1"),
+            ],
+            vec!["alpha-b"],
+            2,
+        ),
+    ] {
+        let mut input = request("/api-key/list", None, &cookies(&owner));
+        input.set_query_pairs(query);
+        let list = body(&call(&auth, input, 200).await);
+        assert_eq!(
+            list["apiKeys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|key| key["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(list["total"], total);
+        assert_eq!(storage.snapshot().await?, before);
+        assert_eq!(isolated.snapshot().await?, other_before);
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "api_keys"])
+                .await?,
+            protected
+        );
+    }
+    B::close(connection).await
+}
+
+async fn api_key_wire_date_projection<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(ApiKeyPlugin::with_config(ApiKeyConfig {
+            enable_session_for_api_keys: true,
+            defer_updates: false,
+            rate_limit: RateLimitDefaults {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let owner = signup(&auth, "key-date-owner@example.test").await;
+    let foreign = signup(&auth, "key-date-foreign@example.test").await;
+    let issued = body(
+        &call(
+            &auth,
+            request(
+                "/api-key/create",
+                Some(json!({"name":"Date owner"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await,
+    );
+    let foreign_key = body(
+        &call(
+            &auth,
+            request(
+                "/api-key/create",
+                Some(json!({"name":"Foreign"})),
+                &cookies(&foreign),
+            ),
+            200,
+        )
+        .await,
+    );
+    let id = issued["id"].as_str().unwrap();
+    let dates = [
+        (
+            "createdAt",
+            "created_at",
+            "2026-10-01T00:00:00.016562+00:00",
+            "2026-10-01T00:00:00.016Z",
+        ),
+        (
+            "updatedAt",
+            "updated_at",
+            "2026-10-01T00:01:00.489730Z",
+            "2026-10-01T00:01:00.489Z",
+        ),
+        (
+            "lastRequest",
+            "last_request",
+            "2026-10-01T00:02:00.290730Z",
+            "2026-10-01T00:02:00.290Z",
+        ),
+        (
+            "lastRefillAt",
+            "last_refill_at",
+            "2026-10-01T05:33:00.123456+05:30",
+            "2026-10-01T00:03:00.123Z",
+        ),
+        (
+            "expiresAt",
+            "expires_at",
+            "2099-10-01T00:04:00.456789+00:00",
+            "2099-10-01T00:04:00.456Z",
+        ),
+    ];
+    for (_, column, stored, _) in dates {
+        _ = db
+            .execute(
+                &format!("UPDATE api_keys SET {column}=$1 WHERE id=$2"),
+                &[stored, id],
+            )
+            .await?;
+    }
+    let physical = db.table("api_keys").await?;
+    let principals = db.tables(&["users", "accounts", "sessions"]).await?;
+    let mut get = request("/api-key/get", None, &cookies(&owner));
+    _ = get.query.insert("id".into(), id.into());
+    let projected = body(&call(&auth, get.clone(), 200).await);
+    for (field, _, _, expected) in dates {
+        assert_eq!(projected[field], expected);
+    }
+    let listed = body(&call(&auth, request("/api-key/list", None, &cookies(&owner)), 200).await);
+    assert_eq!(
+        listed["apiKeys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|k| k["id"] == id)
+            .unwrap(),
+        &projected
+    );
+    _ = get.headers.insert("cookie".into(), cookies(&foreign));
+    let denied = call(&auth, get, 404).await;
+    assert_eq!(body(&denied)["code"], "KEY_NOT_FOUND");
+    assert_eq!(db.table("api_keys").await?, physical);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        principals
+    );
+    let verified = Box::pin(auth.dispatch_endpoint(
+        ApiKeyPlugin::verify_endpoint(&ApiKeyVerificationInput {
+            key: issued["key"].as_str().unwrap().into(),
+            config_id: None,
+            permissions: None,
+        })?,
+        EndpointOptions::default(),
+    ))
+    .await?
+    .decode()?;
+    assert!(verified.valid);
+    let key = serde_json::to_value(verified.key.unwrap())?;
+    for field in ["createdAt", "lastRefillAt", "expiresAt"] {
+        assert_eq!(key[field], projected[field]);
+    }
+    let mut input = request("/get-session", None, &cookies(&owner));
+    _ = input
+        .headers
+        .insert("x-api-key".into(), issued["key"].as_str().unwrap().into());
+    let from = chrono::Utc::now().timestamp_millis();
+    let virtual_session = body(&call(&auth, input, 200).await);
+    let to = chrono::Utc::now().timestamp_millis();
+    assert_eq!(virtual_session["user"]["id"], body(&owner)["user"]["id"]);
+    assert_eq!(
+        virtual_session["session"]["expiresAt"],
+        "2099-10-01T00:04:00.456Z"
+    );
+    for field in ["createdAt", "updatedAt"] {
+        let actual = chrono::DateTime::parse_from_rfc3339(
+            virtual_session["session"][field].as_str().unwrap(),
+        )?
+        .timestamp_millis();
+        assert!((from..=to).contains(&actual));
+    }
+    for (_, column, stored, _) in dates
+        .iter()
+        .filter(|(field, _, _, _)| ["createdAt", "lastRefillAt", "expiresAt"].contains(field))
+    {
+        assert_eq!(
+            db.text(&format!("SELECT {column} FROM api_keys WHERE id=$1"), &[id])
+                .await?
+                .as_deref(),
+            Some(*stored)
+        );
+    }
+    let foreign_rows: Vec<Value> = serde_json::from_str(&physical)?;
+    let after: Vec<Value> = serde_json::from_str(&db.table("api_keys").await?)?;
+    assert_eq!(
+        after.iter().find(|r| r["id"] == foreign_key["id"]),
+        foreign_rows.iter().find(|r| r["id"] == foreign_key["id"])
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        principals
+    );
+    authenticated(&auth, &cookies(&owner), "key-date-owner@example.test").await;
+    authenticated(&auth, &cookies(&foreign), "key-date-foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn api_key_permission_date_projection<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(ApiKeyPlugin::with_config(ApiKeyConfig {
+            defer_updates: false,
+            rate_limit: RateLimitDefaults {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let owner = signup(&auth, "permission-date-owner@example.test").await;
+    let foreign = signup(&auth, "permission-date-foreign@example.test").await;
+    let issued = serde_json::to_value(Box::pin(auth.dispatch_endpoint(
+                ApiKeyPlugin::create_endpoint(&serde_json::from_value(json!({"userId":body(&owner)["user"]["id"],"remaining":30,"permissions":{"vault":["read"]}}))?)?,
+                EndpointOptions::default(),
+            )).await?.decode()?)?;
+    let _ = call(
+        &auth,
+        request(
+            "/api-key/create",
+            Some(json!({"name":"Foreign document"})),
+            &cookies(&foreign),
+        ),
+        200,
+    )
+    .await;
+    let id = issued["id"].as_str().unwrap();
+    let secret = issued["key"].as_str().unwrap();
+    let principals = db.tables(&["users", "accounts", "sessions"]).await?;
+    let physical: Vec<Value> = serde_json::from_str(&db.table("api_keys").await?)?;
+    let hash = db
+        .text("SELECT key FROM api_keys WHERE id=$1", &[id])
+        .await?;
+    for (action, canonical) in [
+        ("2025-02-30T03:04:05Z", Some("2025-03-02T03:04:05.000Z")),
+        ("2025-01-02T24:00:00Z", Some("2025-01-03T00:00:00.000Z")),
+        (
+            "2025-01-02T03:04:05.1234567890123456789Z",
+            Some("2025-01-02T03:04:05.123Z"),
+        ),
+        ("9999-12-31T24:00:00Z", Some("+010000-01-01T00:00:00.000Z")),
+        ("0000-01-01T00:00:00Z", Some("0000-01-01T00:00:00.000Z")),
+        ("2025-13-02T03:04:05Z", None),
+        ("2025-01-02T24:00:00.0001Z", None),
+    ] {
+        let document = json!({"vault":[action],"literal":{action:"retained"}}).to_string();
+        _ = db
+            .execute(
+                "UPDATE api_keys SET permissions=$1 WHERE id=$2",
+                &[&document, id],
+            )
+            .await?;
+        let before = db.table("api_keys").await?;
+        let prior = db
+            .count_where(
+                "SELECT CAST(remaining AS INTEGER) FROM api_keys WHERE id=$1",
+                &[id],
+            )
+            .await?;
+        let checked = Box::pin(auth.dispatch_endpoint(
+            ApiKeyPlugin::verify_endpoint(&ApiKeyVerificationInput {
+                key: secret.into(),
+                config_id: Some("default".into()),
+                permissions: Some(serde_json::from_value(json!({"vault":[action]}))?),
+            })?,
+            EndpointOptions::default(),
+        ))
+        .await?
+        .decode()?;
+        assert_eq!(checked.valid, canonical.is_none());
+        if canonical.is_some() {
+            assert!(checked.key.is_none());
+            assert_eq!(
+                serde_json::to_value(checked.error)?["code"],
+                "KEY_NOT_FOUND"
+            );
+            assert_eq!(db.table("api_keys").await?, before);
+        }
+        assert_eq!(
+            db.count_where(
+                "SELECT CAST(remaining AS INTEGER) FROM api_keys WHERE id=$1",
+                &[id]
+            )
+            .await?,
+            prior - i64::from(canonical.is_none())
+        );
+        let unfiltered = Box::pin(auth.dispatch_endpoint(
+            ApiKeyPlugin::verify_endpoint(&ApiKeyVerificationInput {
+                key: secret.into(),
+                config_id: Some("default".into()),
+                permissions: None,
+            })?,
+            EndpointOptions::default(),
+        ))
+        .await?
+        .decode()?;
+        assert!(unfiltered.valid);
+        assert!(unfiltered.error.is_none());
+        assert_eq!(
+            unfiltered.key.unwrap().permissions,
+            Some(json!({"vault":[canonical.unwrap_or(action)],"literal":{action:"retained"}}))
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT CAST(remaining AS INTEGER) FROM api_keys WHERE id=$1",
+                &[id]
+            )
+            .await?,
+            prior - i64::from(canonical.is_none()) - 1
+        );
+        assert_eq!(
+            db.text("SELECT permissions FROM api_keys WHERE id=$1", &[id])
+                .await?
+                .as_deref(),
+            Some(document.as_str())
+        );
+        assert_eq!(
+            db.text("SELECT key FROM api_keys WHERE id=$1", &[id])
+                .await?,
+            hash
+        );
+        let after: Vec<Value> = serde_json::from_str(&db.table("api_keys").await?)?;
+        for row in physical.iter().filter(|r| r["id"] != id) {
+            assert!(after.contains(row));
+        }
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions"]).await?,
+            principals
+        );
+    }
+    authenticated(
+        &auth,
+        &cookies(&foreign),
+        "permission-date-foreign@example.test",
+    )
+    .await;
+    B::close(connection).await
+}
+
+async fn api_key_sql_usage_failure_transport<B: Backend>(db: Db) -> TestResult {
+    #[derive(Default)]
+    struct Observer(std::sync::atomic::AtomicUsize);
+    impl BackgroundTaskHandler for Observer {
+        fn handle(&self, task: BackgroundTaskCompletion) -> AuthResult<()> {
+            _ = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(task);
+            Ok(())
+        }
+    }
+    for defer_updates in [false, true] {
+        for phase in ["request_count", "updated_at"] {
+            let db = db.fresh().await?;
+            let (connection, _) = db.migrated::<B>(SECRET).await?;
+            let observer = Arc::new(Observer::default());
+            let config = AuthConfig::new(SECRET)
+                .base_url(ORIGIN)
+                .background_tasks(observer.clone());
+            let auth = AuthBuilder::new(config.clone())
+                .store(B::store(Arc::new(config), &connection))
+                .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+                .plugin(super::auth_probe::fast_password())
+                .plugin(alibi::plugins::SessionManagementPlugin::new())
+                .plugin(ApiKeyPlugin::with_config(ApiKeyConfig {
+                    defer_updates,
+                    enable_session_for_api_keys: true,
+                    ..Default::default()
+                }))
+                .build()
+                .await?;
+            let owner = signup(&auth, "usage-veto-owner@example.test").await;
+            let foreign = signup(&auth, "usage-veto-foreign@example.test").await;
+            let issued = serde_json::to_value(Box::pin(auth.dispatch_endpoint(
+                ApiKeyPlugin::create_endpoint(&serde_json::from_value(json!({"userId":body(&owner)["user"]["id"],"remaining":30,"rateLimitMax":10,"permissions":{"vault":["read"]}}))?)?,
+                EndpointOptions::default(),
+            )).await?.decode()?)?;
+            let foreign_key = body(
+                &call(
+                    &auth,
+                    request(
+                        "/api-key/create",
+                        Some(json!({"name":"Foreign quota"})),
+                        &cookies(&foreign),
+                    ),
+                    200,
+                )
+                .await,
+            );
+            let id = issued["id"].as_str().unwrap();
+            let secret = issued["key"].as_str().unwrap();
+            _ = db
+                .execute(
+                    "UPDATE api_keys SET updated_at='2001-01-01T00:00:00Z' WHERE id=$1",
+                    &[id],
+                )
+                .await?;
+            _=db.execute(&format!("CREATE TRIGGER usage_veto BEFORE UPDATE OF {phase} ON api_keys WHEN NEW.id='{id}' BEGIN SELECT RAISE(ABORT,'native usage veto'); END"),&[]).await?;
+            let principals = db.tables(&["users", "accounts", "sessions"]).await?;
+            let before = db.table("api_keys").await?;
+            let denied = Box::pin(auth.dispatch_endpoint(
+                ApiKeyPlugin::verify_endpoint(&ApiKeyVerificationInput {
+                    key: secret.into(),
+                    config_id: None,
+                    permissions: Some(serde_json::from_value(json!({"vault":["write"]}))?),
+                })?,
+                EndpointOptions::default(),
+            ))
+            .await?
+            .decode()?;
+            assert!(!denied.valid);
+            assert_eq!(serde_json::to_value(denied.error)?["code"], "KEY_NOT_FOUND");
+            assert_eq!(db.table("api_keys").await?, before);
+            let invalid = Box::pin(auth.dispatch_endpoint(
+                ApiKeyPlugin::verify_endpoint(&ApiKeyVerificationInput {
+                    key: secret.into(),
+                    config_id: None,
+                    permissions: None,
+                })?,
+                EndpointOptions::default(),
+            ))
+            .await?
+            .decode()?;
+            assert!(!invalid.valid);
+            assert!(invalid.key.is_none());
+            assert_eq!(
+                serde_json::to_value(invalid.error)?,
+                json!({"code":"INVALID_API_KEY","message":{"code":"INVALID_API_KEY","message":"Invalid API key."}})
+            );
+            let mut input = request("/get-session", None, &cookies(&owner));
+            _ = input.headers.insert("x-api-key".into(), secret.into());
+            let error = call(&auth, input, 500).await;
+            assert!(error.body.is_empty());
+            assert!(error.headers.get_all("set-cookie").next().is_none());
+            assert_eq!(observer.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(
+                db.text("SELECT updated_at FROM api_keys WHERE id=$1", &[id])
+                    .await?
+                    .as_deref(),
+                Some("2001-01-01T00:00:00Z")
+            );
+            let rows: Vec<Value> = serde_json::from_str(&before)?;
+            let after: Vec<Value> = serde_json::from_str(&db.table("api_keys").await?)?;
+            assert_eq!(
+                after.iter().find(|r| r["id"] == foreign_key["id"]),
+                rows.iter().find(|r| r["id"] == foreign_key["id"])
+            );
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions"]).await?,
+                principals
+            );
+            _ = db.execute("DROP TRIGGER usage_veto", &[]).await?;
+            let retry = Box::pin(auth.dispatch_endpoint(
+                ApiKeyPlugin::verify_endpoint(&ApiKeyVerificationInput {
+                    key: secret.into(),
+                    config_id: None,
+                    permissions: None,
+                })?,
+                EndpointOptions::default(),
+            ))
+            .await?
+            .decode()?;
+            assert!(retry.valid);
+            assert_eq!(
+                retry.key.unwrap().reference_id,
+                body(&owner)["user"]["id"].as_str().unwrap()
+            );
+            assert_eq!(
+                observer.0.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(defer_updates)
+            );
+            authenticated(&auth, &cookies(&owner), "usage-veto-owner@example.test").await;
+            authenticated(&auth, &cookies(&foreign), "usage-veto-foreign@example.test").await;
+            B::close(connection).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn api_key_org_loader_failure_denial<B: Backend>(db: Db) -> TestResult {
