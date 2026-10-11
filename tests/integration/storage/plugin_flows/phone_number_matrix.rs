@@ -21,7 +21,8 @@ backend_tests!(
     phone_missing_otp_sender_precedes_application_validation,
     phone_external_verifier_cannot_authorize_local_password_reset,
     phone_verifier_rejection_preserves_local_proof_until_successful_retry,
-    phone_callback_context_preserves_proof_consumption_and_committed_owner
+    phone_callback_context_preserves_proof_consumption_and_committed_owner,
+    revoked_compact_owner_consumes_local_phone_proof_without_recreating_browser
 );
 
 #[derive(Default)]
@@ -1252,5 +1253,165 @@ async fn phone_callback_context_preserves_proof_consumption_and_committed_owner<
     let stable = db.tables(&["users", "accounts", "sessions"]).await?;
     _ = call(&auth, verify, 400).await;
     assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, stable);
+    B::close(connection).await
+}
+
+async fn revoked_compact_owner_consumes_local_phone_proof_without_recreating_browser<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::{CookieCacheConfig, CookieCacheStrategy};
+    struct Receipt(Mutex<Vec<Value>>);
+    #[async_trait]
+    impl PhoneVerificationHook for Receipt {
+        async fn verified(
+            &self,
+            r: &PhoneNumberVerification,
+            _: &CallbackContext,
+        ) -> AuthResult<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(json!({"user":r.user,"phone":r.phone_number}));
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let config = AuthConfig::new(SECRET)
+        .base_url(ORIGIN)
+        .session_cookie_cache(CookieCacheConfig {
+            enabled: true,
+            strategy: CookieCacheStrategy::Compact,
+            ..Default::default()
+        });
+    let outbox = Arc::new(Outbox::default());
+    let hook = Arc::new(Receipt(Mutex::new(Vec::new())));
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(PhoneNumberPlugin::new(PhoneNumberConfig {
+            send_otp: Some(outbox.clone()),
+            callback_on_verification: Some(hook.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let baseline = db.tables(&["users", "accounts", "sessions"]).await?;
+    let owner = signup(&auth, "owner@example.test").await;
+    let id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+    let token = body(&owner)["token"].as_str().unwrap().to_owned();
+    let jar = cookies(&owner);
+    let phone = "+15550100001";
+    _ = call(
+        &auth,
+        request(
+            "/phone-number/send-otp",
+            Some(json!({"phoneNumber":phone})),
+            &jar,
+        ),
+        200,
+    )
+    .await;
+    let delivery = outbox.last();
+    assert_eq!(delivery.phone_number, phone);
+    assert_eq!(
+        db.text(
+            "SELECT value FROM verifications WHERE identifier=$1",
+            &[phone]
+        )
+        .await?
+        .as_deref(),
+        Some(format!("{}:0", delivery.code).as_str())
+    );
+    assert_eq!(
+        db.execute("DELETE FROM sessions WHERE token=$1", &[&token])
+            .await?,
+        1
+    );
+    let verified = call(
+        &auth,
+        request(
+            "/phone-number/verify",
+            Some(json!({"phoneNumber":phone,"code":delivery.code,"updatePhoneNumber":true})),
+            &jar,
+        ),
+        200,
+    )
+    .await;
+    assert!(
+        !verified
+            .headers
+            .get_all("set-cookie")
+            .any(|x| x.starts_with("better-auth.session_token=") && !x.contains("Max-Age=0"))
+    );
+    assert_eq!(
+        db.text("SELECT phone_number FROM users WHERE id=$1", &[&id])
+            .await?
+            .as_deref(),
+        Some(phone)
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM users WHERE id=$1 AND phone_number_verified=true",
+            &[&id]
+        )
+        .await?,
+        1
+    );
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM sessions WHERE user_id=$1", &[&id])
+            .await?,
+        0
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM verifications WHERE identifier=$1",
+            &[phone]
+        )
+        .await?,
+        0
+    );
+    let receipts = hook.0.lock().unwrap().clone();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["user"]["id"], id);
+    assert_eq!(receipts[0]["phone"], phone);
+    let after = db
+        .tables(&["users", "accounts", "sessions", "verifications"])
+        .await?;
+    _ = call(
+        &auth,
+        request(
+            "/phone-number/verify",
+            Some(json!({"phoneNumber":phone,"code":delivery.code,"updatePhoneNumber":true})),
+            &jar,
+        ),
+        400,
+    )
+    .await;
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "verifications"])
+            .await?,
+        after
+    );
+    assert_eq!(hook.0.lock().unwrap().len(), 1);
+    for (before, now) in baseline.iter().zip(after.iter()) {
+        let before: Vec<Value> = serde_json::from_str(before)?;
+        let now: Vec<Value> = serde_json::from_str(now)?;
+        assert!(before.iter().all(|x| now.contains(x)));
+    }
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+    let recovered = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"owner@example.test","password":PASSWORD})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&recovered)["user"]["id"], id);
     B::close(connection).await
 }
