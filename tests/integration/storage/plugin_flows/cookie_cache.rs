@@ -30,7 +30,8 @@ backend_tests!(
     cache_raw_and_specific_max_age_keep_distinct_lifetimes,
     verification_renews_original_cached_snapshot_and_publishes_it_to_later_hooks,
     pending_factor_discards_completed_cache_authority_until_genuine_otp,
-    factor_ordinary_cache_survives_revocation_while_disable_requires_physical_browser
+    factor_ordinary_cache_survives_revocation_while_disable_requires_physical_browser,
+    revoked_compact_ordinary_consumers_keep_their_query_admission_contract
 );
 postgres_tests!(
     every_strategy_serves_reads_from_the_cookie_and_rejects_tampering,
@@ -1440,5 +1441,111 @@ async fn factor_ordinary_cache_survives_revocation_while_disable_requires_physic
         assert!(before.iter().all(|x| now.contains(x)));
     }
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn revoked_compact_ordinary_consumers_keep_their_query_admission_contract<B: Backend>(
+    db: Db,
+) -> TestResult {
+    fn fast_cached<B: Backend>(
+        connection: &B::Connection,
+        strategy: CookieCacheStrategy,
+        tweak: impl FnOnce(&mut AuthConfig),
+    ) -> AuthBuilder<B::Schema> {
+        let mut config = AuthConfig::new(SECRET)
+            .base_url(ORIGIN)
+            .session_cookie_cache(CookieCacheConfig {
+                enabled: true,
+                strategy,
+                ..Default::default()
+            });
+        tweak(&mut config);
+        AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+    }
+
+    use alibi::plugins::one_time_token::OneTimeTokenPlugin;
+    use alibi::plugins::{ApiKeyPlugin, PasskeyPlugin};
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let build = |ttl| {
+        fast_cached::<B>(&connection, CookieCacheStrategy::Compact, |c| {
+            c.session.cookie_cache.as_mut().unwrap().max_age = ttl
+        })
+        .plugin(ApiKeyPlugin::with_config(Default::default()))
+        .plugin(PasskeyPlugin::new().rp_id("localhost").origin(ORIGIN))
+        .plugin(OneTimeTokenPlugin::new())
+    };
+    let auth = build(300.0).build().await?;
+    let expired_auth = build(-1.0).build().await?;
+    let owner = signup(&auth, "owner@example.test").await;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let past = signup(&expired_auth, "past@example.test").await;
+    _ = call(
+        &auth,
+        request(
+            "/api-key/create",
+            Some(json!({"name":"Foreign Secret"})),
+            &cookies(&foreign),
+        ),
+        200,
+    )
+    .await;
+    let baseline = db.tables(&["users", "accounts", "api_keys"]).await?;
+    assert_eq!(db.execute("DELETE FROM sessions", &[]).await?, 3);
+    let jar = cookies(&owner);
+    let foreign_token = cookies(&foreign)
+        .split("; ")
+        .find(|p| p.starts_with("better-auth.session_token="))
+        .unwrap()
+        .to_owned();
+    let owner_cache = jar
+        .split("; ")
+        .find(|p| p.starts_with("better-auth.session_data="))
+        .unwrap();
+    let graft = format!("{foreign_token}; {owner_cache}");
+    for route in [
+        "/list-sessions",
+        "/api-key/list",
+        "/passkey/list-user-passkeys",
+        "/one-time-token/generate",
+    ] {
+        let retained = call(&auth, request(route, None, &jar), 200).await;
+        let value = body(&retained);
+        if route == "/api-key/list" {
+            assert_eq!(value["apiKeys"], json!([]));
+        } else if route == "/one-time-token/generate" {
+            let token = value["token"].as_str().unwrap();
+            assert!(!token.is_empty());
+            _ = call(
+                &auth,
+                request("/one-time-token/verify", Some(json!({"token":token})), ""),
+                400,
+            )
+            .await;
+        } else {
+            assert_eq!(value, json!([]));
+        }
+        let mut bypass = request(route, None, &jar);
+        bypass.set_query_pairs([("disableCookieCache", "true")]);
+        let result = call(
+            &auth,
+            bypass,
+            if route == "/api-key/list" { 200 } else { 401 },
+        )
+        .await;
+        if route == "/api-key/list" {
+            assert_eq!(body(&result)["apiKeys"], json!([]));
+        }
+        _ = call(&auth, request(route, None, &cookies(&past)), 401).await;
+        _ = call(&auth, request(route, None, &graft), 401).await;
+        assert_eq!(
+            db.tables(&["users", "accounts", "api_keys"]).await?,
+            baseline
+        );
+        assert_eq!(db.count("sessions").await?, 0);
+    }
     B::close(connection).await
 }
