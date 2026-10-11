@@ -15,7 +15,8 @@ backend_tests!(
     one_tap_callback_rejection_before_jwks,
     one_tap_client_id_array_authority,
     one_tap_enabled_two_factor_session,
-    one_tap_required_verification_delivery
+    one_tap_required_verification_delivery,
+    one_tap_returning_profile_and_browser_ownership
 );
 
 struct DenyList;
@@ -859,4 +860,83 @@ async fn one_tap_required_verification_delivery<B: Backend>(db: Db) -> TestResul
         B::close(connection).await?;
     }
     Ok(())
+}
+
+async fn one_tap_returning_profile_and_browser_ownership<B: Backend>(db: Db) -> TestResult {
+    fn runtime<B: Backend>(
+        connection: &B::Connection,
+        account: AccountConfig,
+        one_tap: OneTapConfig,
+        google: Option<OAuthProvider>,
+    ) -> AuthBuilder<B::Schema> {
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN).account(account);
+        let mut b = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(OneTapPlugin::with_config(one_tap));
+        if let Some(g) = google {
+            b = b.plugin(OAuthPlugin::new().add_provider("google", g));
+        }
+        b
+    }
+
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let remote = Tap::start().await;
+    let auth = runtime::<B>(
+        &connection,
+        AccountConfig::default(),
+        remote.config(Some(OneTapClientId::Single("tap-client".into())), false),
+        None,
+    )
+    .build()
+    .await?;
+    let first = tap(
+        &auth,
+        json!({"name":"Original Google Owner","picture":"https://images.example/original"}),
+        "",
+    )
+    .await;
+    assert_eq!(first.status, 200);
+    let original = body(&first)["user"].clone();
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let foreign_id = body(&foreign)["user"]["id"].as_str().unwrap().to_owned();
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    let returned=tap(&auth,json!({"email":"changed@example.test","name":"Provider Replacement","picture":"https://images.example/changed"}),&cookies(&foreign)).await;
+    assert_eq!(returned.status, 200);
+    assert_eq!(body(&returned)["user"], original);
+    assert_ne!(body(&returned)["user"]["id"], foreign_id);
+    let current = body(
+        &call(
+            &auth,
+            request("/get-session", None, &cookies(&returned)),
+            200,
+        )
+        .await,
+    );
+    assert_eq!(current["user"], original);
+    assert_eq!(current["session"]["token"], body(&returned)["token"]);
+    assert_eq!(db.table("users").await?, before[0]);
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM accounts WHERE provider_id='google'",
+            &[]
+        )
+        .await?,
+        1
+    );
+    let after = db.tables(&["users", "accounts", "sessions"]).await?;
+    for (before, now) in before.iter().zip(after.iter()) {
+        let before: Vec<Value> = serde_json::from_str(before)?;
+        let now: Vec<Value> = serde_json::from_str(now)?;
+        for row in before
+            .iter()
+            .filter(|r| r["id"] == foreign_id || r["user_id"] == foreign_id)
+        {
+            assert!(now.contains(row));
+        }
+    }
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+    B::close(connection).await
 }
