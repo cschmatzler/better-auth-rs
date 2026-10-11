@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 backend_tests!(
     email_otp_custom_codec_controls_reuse_and_failure_consumption,
-    email_otp_verification_override_owns_signup_transaction_and_direct_delivery
+    email_otp_verification_override_owns_signup_transaction_and_direct_delivery,
+    email_otp_real_signup_after_hook,
+    delegated_otp_issuance_retains_original_request_and_live_proof
 );
 postgres_tests!(
     email_otp_custom_codec_controls_reuse_and_failure_consumption,
@@ -336,4 +338,186 @@ async fn email_otp_verification_override_owns_signup_transaction_and_direct_deli
         B::close(connection).await?;
     }
     Ok(())
+}
+
+async fn email_otp_real_signup_after_hook<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let sender = Arc::new(VerificationDelivery::default());
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(EmailOtpPlugin::new(EmailOtpConfig {
+            send_verification_on_sign_up: true,
+            override_default_email_verification: false,
+            send_verification_otp: Some(sender.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let owner = signup(&auth, "signup-otp@example.test").await;
+    let id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(body(&owner)["user"]["emailVerified"], false);
+    let deliveries = sender.otp.lock().unwrap().clone();
+    assert_eq!(deliveries.len(), 1);
+    let delivery = &deliveries[0];
+    assert_eq!(delivery.otp_type, EmailOtpType::EmailVerification);
+    assert_eq!(delivery.email, "signup-otp@example.test");
+    assert_eq!(db.count("verifications").await?, 1);
+    assert_eq!(
+        db.text("SELECT identifier FROM verifications", &[])
+            .await?
+            .as_deref(),
+        Some("email-verification-otp-signup-otp@example.test")
+    );
+    assert_eq!(
+        db.text("SELECT value FROM verifications", &[])
+            .await?
+            .as_deref(),
+        Some(format!("{}:0", delivery.otp).as_str())
+    );
+    let before = db.tables(&["accounts", "sessions"]).await?;
+    let current = body(&call(&auth, request("/get-session", None, &cookies(&owner)), 200).await);
+    assert_eq!(current["user"]["id"], id);
+    assert_eq!(current["user"]["emailVerified"], false);
+    let input = request(
+        "/email-otp/verify-email",
+        Some(json!({"email":delivery.email,"otp":delivery.otp})),
+        "",
+    );
+    _ = call(&auth, input.clone(), 200).await;
+    let current = body(&call(&auth, request("/get-session", None, &cookies(&owner)), 200).await);
+    assert_eq!(current["user"]["id"], id);
+    assert_eq!(current["user"]["emailVerified"], true);
+    assert_eq!(db.count("verifications").await?, 0);
+    assert_eq!(db.tables(&["accounts", "sessions"]).await?, before);
+    let stable = db.tables(&["users", "accounts", "sessions"]).await?;
+    assert_eq!(body(&call(&auth, input, 400).await)["code"], "INVALID_OTP");
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, stable);
+    B::close(connection).await
+}
+
+async fn delegated_otp_issuance_retains_original_request_and_live_proof<B: Backend>(
+    db: Db,
+) -> TestResult {
+    struct Application {
+        raw: crate::storage::Raw,
+        generated: Mutex<Vec<AuthRequest>>,
+        sent: Mutex<Vec<(EmailOtpDelivery, AuthRequest)>>,
+    }
+    #[async_trait]
+    impl EmailOtpGenerator for Application {
+        async fn generate(
+            &self,
+            _: &str,
+            _: EmailOtpType,
+            c: &CallbackContext,
+        ) -> AuthResult<Option<String>> {
+            self.generated
+                .lock()
+                .unwrap()
+                .push(c.request.clone().unwrap());
+            Ok(Some("246810".into()))
+        }
+    }
+    #[async_trait]
+    impl SendEmailOtp for Application {
+        async fn send(&self, d: &EmailOtpDelivery, c: &CallbackContext) -> AuthResult<()> {
+            assert_eq!(
+                self.raw
+                    .count_where(
+                        "SELECT COUNT(*) FROM verifications WHERE value=$1",
+                        &[&format!("{}:0", d.otp)]
+                    )
+                    .await
+                    .map_err(|e| AuthError::internal(e.to_string()))?,
+                1
+            );
+            self.sent
+                .lock()
+                .unwrap()
+                .push((d.clone(), c.request.clone().unwrap()));
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let application = Arc::new(Application {
+        raw: db.raw.clone(),
+        generated: Mutex::new(Vec::new()),
+        sent: Mutex::new(Vec::new()),
+    });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(EmailOtpPlugin::new(EmailOtpConfig {
+            generate_otp: Some(application.clone()),
+            send_verification_otp: Some(application.clone()),
+            override_default_email_verification: true,
+            change_email_enabled: true,
+            verify_current_email: true,
+            ..Default::default()
+        }))
+        .plugin(alibi::plugins::EmailVerificationPlugin::new())
+        .build()
+        .await?;
+    let owner = signup(&auth, "delegated-owner@example.test").await;
+    for (path, input, recipient, kind) in [
+        (
+            "/send-verification-email",
+            json!({"email":"delegated-owner@example.test"}),
+            "delegated-owner@example.test",
+            EmailOtpType::EmailVerification,
+        ),
+        (
+            "/email-otp/request-email-change",
+            json!({"newEmail":"delegated-target@example.test","otp":"246810"}),
+            "delegated-target@example.test",
+            EmailOtpType::ChangeEmail,
+        ),
+        (
+            "/email-otp/request-password-reset",
+            json!({"email":"delegated-target@example.test"}),
+            "delegated-target@example.test",
+            EmailOtpType::ForgetPassword,
+        ),
+    ] {
+        let mut request = super::request(path, Some(input.clone()), &cookies(&owner)).with_url(
+            url::Url::parse(&format!("{ORIGIN}/api/auth{path}?probe=207"))?,
+        );
+        request.set_query_pairs([("probe", "207")]);
+        _ = request
+            .headers
+            .insert("x-callback-probe".into(), "issue207".into());
+        _ = call(&auth, request.clone(), 200).await;
+        let generated = application
+            .generated
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let (delivery, sent) = application.sent.lock().unwrap().last().unwrap().clone();
+        assert_eq!(delivery.email, recipient);
+        assert_eq!(delivery.otp_type, kind);
+        for actual in [generated, sent] {
+            assert_eq!(actual.url(), request.url());
+            assert_eq!(actual.method, HttpMethod::Post);
+            assert_eq!(actual.body, request.body);
+            assert_eq!(actual.headers["x-callback-probe"], "issue207");
+            assert_eq!(actual.query["probe"], "207");
+        }
+        if kind == EmailOtpType::ChangeEmail {
+            _ = call(
+                &auth,
+                super::request(
+                    "/email-otp/change-email",
+                    Some(json!({"newEmail":recipient,"otp":delivery.otp})),
+                    &cookies(&owner),
+                ),
+                200,
+            )
+            .await;
+        }
+    }
+    _=call(&auth,request("/email-otp/reset-password",Some(json!({"email":"delegated-target@example.test","otp":"246810","password":"new-delegated-password"})),""),200).await;
+    assert_eq!(db.count("verifications").await?, 0);
+    assert_eq!(db.count("sessions").await?, 1);
+    authenticated(&auth, &cookies(&owner), "delegated-target@example.test").await;
+    _=call(&auth,request("/sign-in/email",Some(json!({"email":"delegated-target@example.test","password":"new-delegated-password"})),""),200).await;
+    B::close(connection).await
 }
