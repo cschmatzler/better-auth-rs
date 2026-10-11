@@ -28,7 +28,8 @@ backend_tests!(
     cache_version_issuance_failure_preserves_anonymous_principal,
     browser_cache_ttl_requires_authenticated_preference,
     cache_raw_and_specific_max_age_keep_distinct_lifetimes,
-    verification_renews_original_cached_snapshot_and_publishes_it_to_later_hooks
+    verification_renews_original_cached_snapshot_and_publishes_it_to_later_hooks,
+    pending_factor_discards_completed_cache_authority_until_genuine_otp
 );
 postgres_tests!(
     every_strategy_serves_reads_from_the_cookie_and_rejects_tampering,
@@ -1081,6 +1082,198 @@ async fn verification_renews_original_cached_snapshot_and_publishes_it_to_later_
         1
     );
     assert_eq!(db.tables(&["accounts", "sessions"]).await?, before);
+    let after = db.tables(&["users", "accounts", "sessions"]).await?;
+    for (before, now) in baseline.iter().zip(after.iter()) {
+        let before: Vec<Value> = serde_json::from_str(before)?;
+        let now: Vec<Value> = serde_json::from_str(now)?;
+        assert!(before.iter().all(|x| now.contains(x)));
+    }
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn pending_factor_discards_completed_cache_authority_until_genuine_otp<B: Backend>(
+    db: Db,
+) -> TestResult {
+    fn fast_cached<B: Backend>(
+        connection: &B::Connection,
+        strategy: CookieCacheStrategy,
+        tweak: impl FnOnce(&mut AuthConfig),
+    ) -> AuthBuilder<B::Schema> {
+        let mut config = AuthConfig::new(SECRET)
+            .base_url(ORIGIN)
+            .session_cookie_cache(CookieCacheConfig {
+                enabled: true,
+                strategy,
+                ..Default::default()
+            });
+        tweak(&mut config);
+        AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+    }
+
+    use alibi::plugins::MultiSessionPlugin;
+    use alibi::plugins::two_factor::{SendTwoFactorOtp, TwoFactorConfig};
+    use alibi::wire::UserView;
+    use alibi::{
+        CacheVersionContext, CacheVersionSource, CookieCacheVersion, CookieCacheVersionResolver,
+    };
+    struct Delivery(Mutex<Option<String>>);
+    #[async_trait]
+    impl SendTwoFactorOtp for Delivery {
+        async fn send(&self, _: &UserView, otp: &str) -> AuthResult<()> {
+            *self.0.lock().unwrap() = Some(otp.into());
+            Ok(())
+        }
+    }
+    struct Version(Mutex<Vec<Value>>);
+    #[async_trait]
+    impl CookieCacheVersionResolver for Version {
+        async fn resolve(&self, c: &CacheVersionContext) -> AuthResult<String> {
+            if c.source() == CacheVersionSource::Created {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(json!({"user":c.user(),"session":c.session()}));
+            }
+            Ok("v1".into())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let version = Arc::new(Version(Mutex::new(Vec::new())));
+    let delivery = Arc::new(Delivery(Mutex::new(None)));
+    let publication = Arc::new(Mutex::new(Vec::new()));
+    let auth = fast_cached::<B>(&connection, CookieCacheStrategy::Compact, |c| {
+        c.session.cookie_cache.as_mut().unwrap().version =
+            Some(CookieCacheVersion::Resolver(version.clone()))
+    })
+    .plugin(TwoFactorPlugin::with_config(TwoFactorConfig {
+        send_otp: Some(delivery.clone()),
+        ..Default::default()
+    }))
+    .plugin(MultiSessionPlugin::new())
+    .plugin(Observer(publication.clone()))
+    .build()
+    .await?;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let baseline = db.tables(&["users", "accounts", "sessions"]).await?;
+    let owner = signup(&auth, "owner@example.test").await;
+    let id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+    let enabled = call(
+        &auth,
+        request(
+            "/two-factor/enable",
+            Some(json!({"password":PASSWORD,"method":"otp"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    _ = call(
+        &auth,
+        request("/sign-out", Some(json!({})), &cookies(&enabled)),
+        200,
+    )
+    .await;
+    version.0.lock().unwrap().clear();
+    publication.lock().unwrap().clear();
+    let pending = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(json!({"email":"owner@example.test","password":PASSWORD,"rememberMe":false})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&pending)["twoFactorRedirect"], true);
+    assert_eq!(body(&pending)["twoFactorMethods"], json!(["otp"]));
+    for raw in pending.headers.get_all("set-cookie").filter(|r| {
+        r.starts_with("better-auth.session_token=") || r.starts_with("better-auth.session_data=")
+    }) {
+        assert!(raw.contains("Max-Age=0"));
+    }
+    assert!(
+        !pending
+            .headers
+            .get_all("set-cookie")
+            .any(|r| r.contains("_multi-"))
+    );
+    assert!(publication.lock().unwrap().is_empty());
+    let transient = version.0.lock().unwrap().clone();
+    assert_eq!(transient.len(), 1);
+    assert_eq!(transient[0]["user"]["twoFactorEnabled"], true);
+    assert_eq!(transient[0]["session"]["userId"], id);
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM sessions WHERE user_id=$1", &[&id])
+            .await?,
+        0
+    );
+    let jar = cookies(&pending);
+    assert_eq!(
+        body(&call(&auth, request("/get-session", None, &jar), 200).await),
+        Value::Null
+    );
+    _ = call(
+        &auth,
+        request("/two-factor/send-otp", Some(json!({})), &jar),
+        200,
+    )
+    .await;
+    let otp = delivery.0.lock().unwrap().clone().unwrap();
+    let verified = call(
+        &auth,
+        request("/two-factor/verify-otp", Some(json!({"code":otp})), &jar),
+        200,
+    )
+    .await;
+    let value = body(&verified);
+    assert_eq!(value["user"]["id"], id);
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM sessions WHERE user_id=$1", &[&id])
+            .await?,
+        1
+    );
+    assert_eq!(
+        db.text("SELECT token FROM sessions WHERE user_id=$1", &[&id])
+            .await?
+            .as_deref(),
+        value["token"].as_str()
+    );
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM verifications WHERE value=$1", &[&id])
+            .await?,
+        0
+    );
+    assert!(
+        verified
+            .headers
+            .get_all("set-cookie")
+            .any(|r| r.contains("_multi-") && !r.contains("Max-Age=0"))
+    );
+    for raw in verified
+        .headers
+        .get_all("set-cookie")
+        .filter(|r| !r.contains("_multi-") && !r.contains("Max-Age=0"))
+    {
+        assert!(!raw.contains("Max-Age=") && !raw.contains("Expires="));
+    }
+    let seen = publication.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0]["token"], value["token"]);
+    let active = body(
+        &call(
+            &auth,
+            request("/get-session", None, &cookies(&verified)),
+            200,
+        )
+        .await,
+    );
+    assert_eq!(active["session"]["token"], value["token"]);
     let after = db.tables(&["users", "accounts", "sessions"]).await?;
     for (before, now) in baseline.iter().zip(after.iter()) {
         let before: Vec<Value> = serde_json::from_str(before)?;
