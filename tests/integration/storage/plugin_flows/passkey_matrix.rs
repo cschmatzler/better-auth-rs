@@ -12,7 +12,10 @@ use serde_cbor_2::Value as Cbor;
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 
-backend_tests!(passkey_ceremony_matrix);
+backend_tests!(
+    passkey_ceremony_matrix,
+    passkey_concurrent_real_ceremonies_single_owner
+);
 
 pub(super) const USER_PRESENT: u8 = 0x01;
 pub(super) const USER_VERIFIED: u8 = 0x04;
@@ -288,5 +291,105 @@ async fn passkey_ceremony_matrix<B: Backend>(db: Db) -> TestResult {
         .await,
     );
     trace.assert("passkey/ceremony-matrix");
+    B::close(connection).await
+}
+
+async fn passkey_concurrent_real_ceremonies_single_owner<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(PasskeyPlugin::new().origins(vec![ORIGIN.into()]))
+        .build()
+        .await?;
+    let owner = signup(&auth, "owner@example.test").await;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+    let baseline = db.tables(&["users", "accounts", "sessions"]).await?;
+    let jar = cookies(&owner);
+    let key = Authenticator::new(109, "raced-genuine-key");
+    let options = call(
+        &auth,
+        request("/passkey/generate-register-options", None, &jar),
+        200,
+    )
+    .await;
+    let client =
+        json!({"type":"webauthn.create","challenge":body(&options)["challenge"],"origin":ORIGIN});
+    let signed = key.registration(
+        &client,
+        &key.attestation("localhost", USER_PRESENT | USER_VERIFIED, 6),
+        false,
+    );
+    let submit = request(
+        "/passkey/verify-registration",
+        Some(json!({"response":signed,"name":"One Physical Key"})),
+        &format!("{jar}; {}", cookies(&options)),
+    );
+    let (left, right) = tokio::join!(
+        auth.handle_request(submit.clone()),
+        auth.handle_request(submit.clone())
+    );
+    let mut results = [left?, right?];
+    results.sort_by_key(|r| r.status);
+    assert_eq!(results.each_ref().map(|r| r.status), [200, 400]);
+    assert_eq!(body(&results[1])["code"], "CHALLENGE_NOT_FOUND");
+    let rejected = call(&auth, submit, 400).await;
+    assert_eq!(body(&rejected)["code"], "CHALLENGE_NOT_FOUND");
+    assert_eq!(db.count("passkeys").await?, 1);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        baseline
+    );
+    _ = call(&auth, request("/sign-out", Some(json!({})), &jar), 200).await;
+    let options = call(
+        &auth,
+        request("/passkey/generate-authenticate-options", None, ""),
+        200,
+    )
+    .await;
+    let signed = key.assertion(
+        &json!({"type":"webauthn.get","challenge":body(&options)["challenge"],"origin":ORIGIN}),
+        "localhost",
+        USER_PRESENT | USER_VERIFIED,
+        2,
+    );
+    let submit = request(
+        "/passkey/verify-authentication",
+        Some(json!({"response":signed})),
+        &cookies(&options),
+    );
+    let (left, right) = tokio::join!(
+        auth.handle_request(submit.clone()),
+        auth.handle_request(submit.clone())
+    );
+    let mut results = [left?, right?];
+    results.sort_by_key(|r| r.status);
+    assert_eq!(results[0].status, 200);
+    assert_eq!(results[1].status, 400);
+    assert_eq!(body(&results[1])["code"], "CHALLENGE_NOT_FOUND");
+    assert_eq!(body(&results[0])["user"]["id"], id);
+    authenticated(&auth, &cookies(&results[0]), "owner@example.test").await;
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM sessions WHERE user_id=$1", &[&id])
+            .await?,
+        1
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM passkeys WHERE user_id=$1 AND counter=2",
+            &[&id]
+        )
+        .await?,
+        1
+    );
+    let after = db
+        .tables(&["users", "accounts", "sessions", "passkeys", "verifications"])
+        .await?;
+    _ = call(&auth, submit, 400).await;
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "passkeys", "verifications"])
+            .await?,
+        after
+    );
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
 }
