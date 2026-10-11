@@ -17,7 +17,8 @@ backend_tests!(
     device_empty_application_codes_complete_real_grant,
     device_fractional_durations_preserve_persisted_milliseconds,
     revoked_compact_browser_claims_and_completes_only_its_device_grant,
-    device_poller_session_metadata
+    device_poller_session_metadata,
+    device_overlapping_reviews_retain_first_claim_authority
 );
 
 type Events = Arc<Mutex<Vec<Value>>>;
@@ -1167,4 +1168,167 @@ async fn device_poller_session_metadata<B: Backend>(db: Db) -> TestResult {
         B::close(connection).await?;
     }
     Ok(())
+}
+
+async fn device_overlapping_reviews_retain_first_claim_authority<B: Backend>(db: Db) -> TestResult {
+    use alibi::{
+        CacheVersionContext, CacheVersionSource, CookieCacheConfig, CookieCacheStrategy,
+        CookieCacheVersion, CookieCacheVersionResolver,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Gate {
+        armed: AtomicBool,
+        ids: Mutex<Vec<String>>,
+        entered: [tokio::sync::Notify; 2],
+        release: [tokio::sync::Notify; 2],
+    }
+    #[async_trait::async_trait]
+    impl CookieCacheVersionResolver for Gate {
+        async fn resolve(&self, c: &CacheVersionContext) -> AuthResult<String> {
+            if self.armed.load(Ordering::SeqCst) && c.source() == CacheVersionSource::Cached {
+                let index = self
+                    .ids
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .position(|id| id == &c.user().id)
+                    .unwrap();
+                self.entered[index].notify_one();
+                self.release[index].notified().await;
+            }
+            Ok("v1".into())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let gate = Arc::new(Gate {
+        armed: AtomicBool::new(false),
+        ids: Mutex::new(Vec::new()),
+        entered: Default::default(),
+        release: Default::default(),
+    });
+    let config = AuthConfig::new(SECRET)
+        .base_url(ORIGIN)
+        .session_cookie_cache(CookieCacheConfig {
+            enabled: true,
+            strategy: CookieCacheStrategy::Compact,
+            version: Some(CookieCacheVersion::Resolver(gate.clone())),
+            ..Default::default()
+        });
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(DeviceAuthorizationPlugin::new().interval(chrono::Duration::zero()))
+        .build()
+        .await?;
+    let first = signup(&auth, "first@example.test").await;
+    let second = signup(&auth, "second@example.test").await;
+    let first_id = body(&first)["user"]["id"].as_str().unwrap().to_owned();
+    let second_id = body(&second)["user"]["id"].as_str().unwrap().to_owned();
+    *gate.ids.lock().unwrap() = vec![first_id.clone(), second_id];
+    let baseline = db.tables(&["users", "accounts", "sessions"]).await?;
+    let issued = body(
+        &call(
+            &auth,
+            request(
+                "/device/code",
+                Some(json!({"client_id":"claim-client","scope":"openid private-scope"})),
+                "",
+            ),
+            200,
+        )
+        .await,
+    );
+    let code = issued["device_code"].as_str().unwrap();
+    let user_code = issued["user_code"].as_str().unwrap();
+    let initial = db.table("device_code").await?;
+    let review = |cookie: &str| {
+        let mut r = request("/device", None, cookie);
+        r.set_query_pairs([("user_code", user_code)]);
+        r
+    };
+    gate.armed.store(true, Ordering::SeqCst);
+    let mut a = Box::pin(auth.handle_request(review(&cookies(&first))));
+    let mut b = Box::pin(auth.handle_request(review(&cookies(&second))));
+    tokio::time::timeout(std::time::Duration::from_secs(10),async{tokio::select!{biased;_=gate.entered[0].notified()=>{},r=&mut a=>panic!("first review escaped before its gate: {r:?}")};tokio::select!{biased;_=gate.entered[1].notified()=>{},r=&mut b=>panic!("second review escaped before its gate: {r:?}")};}).await?;
+    assert_eq!(db.table("device_code").await?, initial);
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        baseline
+    );
+    gate.release[0].notify_one();
+    let winner = tokio::time::timeout(std::time::Duration::from_secs(10), &mut a).await??;
+    assert_eq!(winner.status, 200);
+    assert_eq!(
+        body(&winner),
+        json!({"user_code":user_code,"status":"pending","client_id":"claim-client","scope":"openid private-scope"})
+    );
+    let claimed = db.table("device_code").await?;
+    assert_eq!(
+        db.text(
+            "SELECT user_id FROM device_code WHERE device_code=$1",
+            &[code]
+        )
+        .await?
+        .as_deref(),
+        Some(first_id.as_str())
+    );
+    gate.release[1].notify_one();
+    let loser = tokio::time::timeout(std::time::Duration::from_secs(10), &mut b).await??;
+    assert_eq!(loser.status, 200);
+    assert_eq!(
+        body(&loser),
+        json!({"user_code":user_code,"status":"pending"})
+    );
+    assert_eq!(db.table("device_code").await?, claimed);
+    gate.armed.store(false, Ordering::SeqCst);
+    for decision in ["approve", "deny"] {
+        _ = call(
+            &auth,
+            request(
+                &format!("/device/{decision}"),
+                Some(json!({"userCode":user_code})),
+                &cookies(&second),
+            ),
+            403,
+        )
+        .await;
+        assert_eq!(db.table("device_code").await?, claimed);
+    }
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions"]).await?,
+        baseline
+    );
+    _ = call(
+        &auth,
+        request(
+            "/device/approve",
+            Some(json!({"userCode":user_code})),
+            &cookies(&first),
+        ),
+        200,
+    )
+    .await;
+    let poll = request(
+        "/device/token",
+        Some(
+            json!({"grant_type":"urn:ietf:params:oauth:grant-type:device_code","device_code":code,"client_id":"claim-client"}),
+        ),
+        "",
+    );
+    let done = call(&auth, poll.clone(), 200).await;
+    let token = body(&done)["access_token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        db.text("SELECT user_id FROM sessions WHERE token=$1", &[&token])
+            .await?
+            .as_deref(),
+        Some(first_id.as_str())
+    );
+    assert_eq!(rows(&db, code).await?, 0);
+    let after = db.tables(&["users", "accounts", "sessions"]).await?;
+    _ = call(&auth, poll, 400).await;
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, after);
+    authenticated(&auth, &cookies(&second), "second@example.test").await;
+    B::close(connection).await
 }
