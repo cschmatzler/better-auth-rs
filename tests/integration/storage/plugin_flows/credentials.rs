@@ -12,7 +12,8 @@ backend_tests!(
     duplicate_canonical_credentials_keep_first_physical_row_authoritative,
     cookie_emission_failure_preserves_endpoint_commit_stage,
     username_unicode_identity_admission,
-    username_readonly_registration_admission
+    username_readonly_registration_admission,
+    application_id_policy_owns_signup_principals_and_verification
 );
 postgres_tests!(
     username_signup_lookup_and_denials_share_normalized_identity,
@@ -1052,4 +1053,144 @@ async fn username_readonly_registration_admission<B: Backend>(db: Db) -> TestRes
     assert_eq!(body(&owner)["user"]["username"], Value::Null);
     authenticated(&auth, &cookies(&owner), "readonly-owner@example.test").await;
     B::close(connection).await
+}
+
+async fn application_id_policy_owns_signup_principals_and_verification<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::config::DatabaseIdStrategy;
+    use alibi::plugins::PasswordManagementPlugin;
+    use alibi::plugins::password_management::SendResetPassword;
+    use alibi::{AuthError, AuthResult};
+    struct Inbox(Mutex<Option<String>>);
+    #[async_trait::async_trait]
+    impl SendResetPassword for Inbox {
+        async fn send(&self, _: &Value, _: &str, token: &str) -> AuthResult<()> {
+            *self.0.lock().unwrap() = Some(token.into());
+            Ok(())
+        }
+    }
+    for mode in ["uuid", "custom", "none", "throws"] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let setup = super::auth_probe::fast_builder::<B>(&connection)
+            .build()
+            .await?;
+        let foreign = signup(&setup, "foreign@example.test").await;
+        let baseline = db
+            .tables(&["users", "accounts", "sessions", "verifications"])
+            .await?;
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = calls.clone();
+        let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        config.advanced.database.generate_id = Some(if mode == "uuid" {
+            DatabaseIdStrategy::Uuid
+        } else {
+            DatabaseIdStrategy::Custom(Arc::new(
+                move |model: &str, size: Option<usize>| -> AuthResult<Option<String>> {
+                    assert!(size.is_none());
+                    let mut calls = log.lock().unwrap();
+                    calls.push(model.into());
+                    match mode {
+                        "none" => Ok(None),
+                        "throws" => Err(AuthError::internal("configured ID refusal")),
+                        _ => Ok(Some(format!("{model}_application_{}", calls.len()))),
+                    }
+                },
+            ))
+        });
+        let inbox = Arc::new(Inbox(Mutex::new(None)));
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(PasswordManagementPlugin::new().send_reset_password(inbox.clone()))
+            .build()
+            .await?;
+        let response=call(&auth,request("/sign-up/email",Some(json!({"email":"new@example.test","password":PASSWORD,"name":"Generated Owner"})),""),if matches!(mode,"none"|"throws"){422}else{200}).await;
+        if matches!(mode, "none" | "throws") {
+            assert!(response.headers.get_all("set-cookie").next().is_none());
+            assert_eq!(
+                db.tables(&["users", "accounts", "sessions", "verifications"])
+                    .await?,
+                baseline
+            );
+            assert_eq!(*calls.lock().unwrap(), ["user"]);
+        } else {
+            let id = body(&response)["user"]["id"].as_str().unwrap().to_owned();
+            let current = body(
+                &call(
+                    &auth,
+                    request("/get-session", None, &cookies(&response)),
+                    200,
+                )
+                .await,
+            );
+            assert_eq!(current["user"]["id"], id);
+            assert_eq!(current["session"]["userId"], id);
+            _ = call(
+                &auth,
+                request(
+                    "/request-password-reset",
+                    Some(json!({"email":"new@example.test","redirectTo":"/reset"})),
+                    "",
+                ),
+                200,
+            )
+            .await;
+            let token = inbox.0.lock().unwrap().clone().unwrap();
+            let proof = auth
+                .context()
+                .verifications()
+                .find(&format!("reset-password:{token}"))
+                .await?
+                .unwrap();
+            assert_eq!(proof.value()?, id);
+            let mut ids = Vec::new();
+            for (table, key) in [
+                ("users", "id"),
+                ("accounts", "user_id"),
+                ("sessions", "user_id"),
+            ] {
+                ids.push(
+                    db.text(&format!("SELECT id FROM {table} WHERE {key}=$1"), &[&id])
+                        .await?
+                        .unwrap(),
+                );
+            }
+            ids.push(proof.id().unwrap().to_owned());
+            if mode == "uuid" {
+                for id in ids {
+                    let id = uuid::Uuid::parse_str(&id)?;
+                    assert_eq!(id.get_version_num(), 4);
+                }
+            } else {
+                assert_eq!(
+                    *calls.lock().unwrap(),
+                    ["user", "account", "session", "verification"]
+                );
+                assert_eq!(
+                    ids,
+                    [
+                        "user_application_1",
+                        "account_application_2",
+                        "session_application_3",
+                        "verification_application_4"
+                    ]
+                );
+            }
+            let after = db
+                .tables(&["users", "accounts", "sessions", "verifications"])
+                .await?;
+            for (before, now) in baseline.iter().zip(after.iter()) {
+                let before: Vec<Value> = serde_json::from_str(before)?;
+                let now: Vec<Value> = serde_json::from_str(now)?;
+                assert!(before.iter().all(|r| now.contains(r)));
+            }
+        }
+        authenticated(&setup, &cookies(&foreign), "foreign@example.test").await;
+        B::close(connection).await?;
+    }
+    Ok(())
 }
