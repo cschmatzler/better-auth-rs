@@ -11,7 +11,8 @@ use alibi::{AccountConfig, AuthResult};
 backend_tests!(
     one_tap_token_admission_matrix,
     one_tap_identity_outcomes,
-    one_tap_account_cookie_and_remember_state
+    one_tap_account_cookie_and_remember_state,
+    one_tap_disabled_signup_existing_account
 );
 
 struct DenyList;
@@ -484,5 +485,98 @@ async fn one_tap_account_cookie_and_remember_state<B: Backend>(db: Db) -> TestRe
                 && !header.contains("Max-Age=0"))
     );
     trace.assert("social/one-tap-cookies");
+    B::close(connection).await
+}
+
+async fn one_tap_disabled_signup_existing_account<B: Backend>(db: Db) -> TestResult {
+    fn runtime<B: Backend>(
+        connection: &B::Connection,
+        account: AccountConfig,
+        one_tap: OneTapConfig,
+        google: Option<OAuthProvider>,
+    ) -> AuthBuilder<B::Schema> {
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN).account(account);
+        let mut b = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(OneTapPlugin::with_config(one_tap));
+        if let Some(g) = google {
+            b = b.plugin(OAuthPlugin::new().add_provider("google", g));
+        }
+        b
+    }
+
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let remote = Tap::start().await;
+    let enabled = runtime::<B>(
+        &connection,
+        AccountConfig::default(),
+        remote.config(Some(OneTapClientId::Single("tap-client".into())), false),
+        None,
+    )
+    .build()
+    .await?;
+    let closed = runtime::<B>(
+        &connection,
+        AccountConfig::default(),
+        remote.config(Some(OneTapClientId::Single("tap-client".into())), true),
+        None,
+    )
+    .build()
+    .await?;
+    let mut google = OAuthProvider::google("tap-client", "secret");
+    google.disable_sign_up = true;
+    let provider_closed = runtime::<B>(
+        &connection,
+        AccountConfig::default(),
+        remote.config(None, false),
+        Some(google),
+    )
+    .build()
+    .await?;
+    let foreign = signup(&enabled, "foreign@example.test").await;
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    for auth in [&closed, &provider_closed] {
+        let denied = tap(auth, json!({}), "").await;
+        assert_eq!(denied.status, 401);
+        assert_eq!(body(&denied)["message"], "signup disabled");
+        assert!(denied.headers.get_all("set-cookie").next().is_none());
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+    }
+    let registered = tap(&enabled, json!({}), "").await;
+    assert_eq!(registered.status, 200);
+    let principal = body(&registered)["user"].clone();
+    let established = db.table("users").await?;
+    let account_id = db
+        .text("SELECT id FROM accounts WHERE provider_id='google'", &[])
+        .await?
+        .unwrap();
+    let mut sessions = db.count("sessions").await?;
+    for auth in [&closed, &provider_closed] {
+        let done = tap(auth, json!({}), "").await;
+        assert_eq!(done.status, 200);
+        assert_eq!(body(&done)["user"], principal);
+        assert_eq!(db.table("users").await?, established);
+        assert_eq!(
+            db.text("SELECT id FROM accounts WHERE provider_id='google'", &[])
+                .await?
+                .as_deref(),
+            Some(account_id.as_str())
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM accounts WHERE provider_id='google'",
+                &[]
+            )
+            .await?,
+            1
+        );
+        sessions += 1;
+        assert_eq!(db.count("sessions").await?, sessions);
+        authenticated(auth, &cookies(&done), "tap@example.test").await;
+    }
+    authenticated(&enabled, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
 }
