@@ -19,7 +19,8 @@ backend_tests!(
     revoked_compact_browser_claims_and_completes_only_its_device_grant,
     device_poller_session_metadata,
     device_overlapping_reviews_retain_first_claim_authority,
-    device_custom_user_codes_prefer_exact_lookup
+    device_custom_user_codes_prefer_exact_lookup,
+    device_user_code_collision_retries_without_replacing_grant
 );
 
 type Events = Arc<Mutex<Vec<Value>>>;
@@ -1430,5 +1431,136 @@ async fn device_custom_user_codes_prefer_exact_lookup<B: Backend>(db: Db) -> Tes
         .as_deref(),
         body(&owner)["user"]["id"].as_str()
     );
+    B::close(connection).await
+}
+
+async fn device_user_code_collision_retries_without_replacing_grant<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let devices = Arc::new(Mutex::new(VecDeque::from([
+        "original-device",
+        "colliding-device",
+        "new-device",
+        "exhausted-one",
+        "exhausted-two",
+        "exhausted-three",
+    ])));
+    let users = Arc::new(Mutex::new(VecDeque::from([
+        "ORIGINAL", "ORIGINAL", "NEWCODE", "ORIGINAL", "ORIGINAL", "ORIGINAL",
+    ])));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (d, u, c) = (devices.clone(), users.clone(), calls.clone());
+    let plugin = DeviceAuthorizationPlugin::new()
+        .interval(chrono::Duration::zero())
+        .generate_device_code_async_with(move || {
+            let d = d.clone();
+            async move { Ok(d.lock().unwrap().pop_front().unwrap().into()) }
+        })
+        .generate_user_code_async_with(move || {
+            let u = u.clone();
+            async move { Ok(u.lock().unwrap().pop_front().unwrap().into()) }
+        })
+        .on_device_auth_request(move |_, _| {
+            let c = c.clone();
+            async move {
+                _ = c.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(plugin)
+        .build()
+        .await?;
+    let first = signup(&auth, "first@example.test").await;
+    let second = signup(&auth, "second@example.test").await;
+    let original = body(
+        &call(
+            &auth,
+            request(
+                "/device/code",
+                Some(json!({"client_id":"collision-client","scope":"original-private"})),
+                "",
+            ),
+            200,
+        )
+        .await,
+    );
+    let initial = db.table("device_code").await?;
+    let new = body(
+        &call(
+            &auth,
+            request(
+                "/device/code",
+                Some(json!({"client_id":"collision-client","scope":"new-private"})),
+                "",
+            ),
+            200,
+        )
+        .await,
+    );
+    assert_eq!(new["device_code"], "new-device");
+    assert_eq!(new["user_code"], "NEWCODE");
+    assert_eq!(devices.lock().unwrap().len(), 3);
+    assert_eq!(users.lock().unwrap().len(), 3);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let present: Vec<Value> = serde_json::from_str(&db.table("device_code").await?)?;
+    let original_rows: Vec<Value> = serde_json::from_str(&initial)?;
+    assert_eq!(present.len(), 2);
+    assert!(original_rows.iter().all(|r| present.contains(r)));
+    let before = db.table("device_code").await?;
+    _ = call(
+        &auth,
+        request(
+            "/device/code",
+            Some(json!({"client_id":"collision-client"})),
+            "",
+        ),
+        500,
+    )
+    .await;
+    assert!(devices.lock().unwrap().is_empty());
+    assert!(users.lock().unwrap().is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(db.table("device_code").await?, before);
+    for (grant, owner, scope) in [
+        (&original, &first, "original-private"),
+        (&new, &second, "new-private"),
+    ] {
+        let code = grant["device_code"].as_str().unwrap();
+        let uc = grant["user_code"].as_str().unwrap();
+        let jar = cookies(owner);
+        let mut review = request("/device", None, &jar);
+        review.set_query_pairs([("user_code", uc)]);
+        _ = call(&auth, review, 200).await;
+        _ = call(
+            &auth,
+            request("/device/approve", Some(json!({"userCode":uc})), &jar),
+            200,
+        )
+        .await;
+        let poll = request(
+            "/device/token",
+            Some(
+                json!({"grant_type":"urn:ietf:params:oauth:grant-type:device_code","device_code":code,"client_id":"collision-client"}),
+            ),
+            "",
+        );
+        let done = call(&auth, poll.clone(), 200).await;
+        assert_eq!(body(&done)["scope"], scope);
+        assert_eq!(
+            db.text(
+                "SELECT user_id FROM sessions WHERE token=$1",
+                &[body(&done)["access_token"].as_str().unwrap()]
+            )
+            .await?
+            .as_deref(),
+            body(owner)["user"]["id"].as_str()
+        );
+        assert_eq!(rows(&db, code).await?, 0);
+        _ = call(&auth, poll, 400).await;
+    }
     B::close(connection).await
 }
