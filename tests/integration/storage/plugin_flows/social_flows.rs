@@ -18,6 +18,7 @@ backend_tests!(
     id_token_sign_in_outcomes,
     callback_protocol_outcomes,
     sign_in_policies,
+    oauth_verification_cache_recovery
 );
 
 #[derive(Clone)]
@@ -587,5 +588,143 @@ async fn sign_in_policies<B: Backend>(db: Db) -> TestResult {
         &callback(&implicit, &[("code", "grant"), ("state", &state)], &cookies).await,
     );
     trace.assert("social/sign-in-policies");
+    B::close(connection).await
+}
+
+async fn oauth_verification_cache_recovery<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{CacheAdapter, MemoryCacheAdapter};
+    use alibi::verification::VerificationIdentifierStrategy;
+    use alibi::{AuthError, AuthResult};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Cache {
+        memory: MemoryCacheAdapter,
+        fail_set: AtomicBool,
+        fail_get: AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl CacheAdapter for Cache {
+        async fn set(&self, k: &str, v: &str, t: chrono::Duration) -> AuthResult<()> {
+            if self.fail_set.load(Ordering::SeqCst) {
+                return Err(AuthError::internal("configured cache outage"));
+            }
+            self.memory.set(k, v, t).await
+        }
+        async fn get(&self, k: &str) -> AuthResult<Option<String>> {
+            if self.fail_get.load(Ordering::SeqCst) {
+                return Err(AuthError::internal("configured cache outage"));
+            }
+            self.memory.get(k).await
+        }
+        async fn get_and_delete(&self, k: &str) -> AuthResult<Option<String>> {
+            self.memory.get_and_delete(k).await
+        }
+        async fn delete(&self, k: &str) -> AuthResult<()> {
+            self.memory.delete(k).await
+        }
+        async fn exists(&self, k: &str) -> AuthResult<bool> {
+            self.memory.exists(k).await
+        }
+        async fn expire(&self, k: &str, t: chrono::Duration) -> AuthResult<()> {
+            self.memory.expire(k, t).await
+        }
+        async fn clear(&self) -> AuthResult<()> {
+            self.memory.clear().await
+        }
+    }
+
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let social = Social::start().await;
+    let cache = Arc::new(Cache {
+        memory: MemoryCacheAdapter::new(),
+        fail_get: AtomicBool::new(false),
+        fail_set: AtomicBool::new(false),
+    });
+    let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    config.account.store_state_strategy = alibi::OAuthStateStrategy::Database;
+    config.verification.store_identifier.default = VerificationIdentifierStrategy::Hashed;
+    config.verification.secondary_storage = Some(cache.clone());
+    config.verification.store_in_database = false;
+    let auth = social
+        .auth_configured::<B>(
+            &connection,
+            config,
+            |_| {},
+            |b| b.plugin(super::auth_probe::fast_password()),
+            |s| s,
+        )
+        .await?;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "verifications"])
+        .await?;
+    let (state, jar) = authorize(
+        &auth,
+        "/sign-in/social",
+        json!({"provider":"google","callbackURL":"/completed","newUserCallbackURL":"/new-owner"}),
+        "",
+    )
+    .await;
+    let proof = auth
+        .context()
+        .verifications()
+        .find(&format!("auth-state:{state}"))
+        .await?
+        .unwrap();
+    let stored = proof.identifier()?.to_owned();
+    let key = format!("verification:{stored}");
+    let raw = cache.memory.get(&key).await?.unwrap();
+    assert_eq!(db.count("verifications").await?, 0);
+    cache.fail_get.store(true, Ordering::SeqCst);
+    let failed = callback(&auth, &[("code", "genuine-grant"), ("state", &state)], &jar).await;
+    assert_eq!(failed.status, 302);
+    assert!(
+        failed
+            .headers
+            .get("location")
+            .unwrap()
+            .contains("error=internal_server_error")
+    );
+    assert!(failed.headers.get_all("set-cookie").next().is_none());
+    assert!(social.provider.requests.lock().unwrap().is_empty());
+    assert_eq!(cache.memory.get(&key).await?.as_deref(), Some(raw.as_str()));
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "verifications"])
+            .await?,
+        before
+    );
+    cache.fail_get.store(false, Ordering::SeqCst);
+    let done = callback(&auth, &[("code", "genuine-grant"), ("state", &state)], &jar).await;
+    assert_eq!(done.status, 302);
+    assert_eq!(
+        done.headers.get("location").map(String::as_str),
+        Some("/new-owner")
+    );
+    assert_eq!(social.provider.requests.lock().unwrap().len(), 1);
+    authenticated(&auth, &cookies(&done), "social@example.com").await;
+    assert!(cache.memory.get(&key).await?.is_none());
+    let after = db
+        .tables(&["users", "accounts", "sessions", "verifications"])
+        .await?;
+    let replay = callback(&auth, &[("code", "genuine-grant"), ("state", &state)], &jar).await;
+    assert!(
+        replay
+            .headers
+            .get("location")
+            .unwrap()
+            .contains("error=state_mismatch")
+    );
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "verifications"])
+            .await?,
+        after
+    );
+    assert_eq!(social.provider.requests.lock().unwrap().len(), 1);
+    for (before, now) in before.iter().zip(after.iter()) {
+        let before: Vec<Value> = serde_json::from_str(before)?;
+        let now: Vec<Value> = serde_json::from_str(now)?;
+        assert!(before.iter().all(|r| now.contains(r)));
+    }
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
 }
