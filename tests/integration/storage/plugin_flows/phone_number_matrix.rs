@@ -20,7 +20,8 @@ backend_tests!(
     phone_reset_callback_rejection_precedes_configured_session_revocation,
     phone_missing_otp_sender_precedes_application_validation,
     phone_external_verifier_cannot_authorize_local_password_reset,
-    phone_verifier_rejection_preserves_local_proof_until_successful_retry
+    phone_verifier_rejection_preserves_local_proof_until_successful_retry,
+    phone_background_notification_lifecycle
 );
 
 #[derive(Default)]
@@ -1087,6 +1088,220 @@ async fn phone_verifier_rejection_preserves_local_proof_until_successful_retry<B
         assert_eq!(db.count("sessions").await?, 2);
         authenticated(&auth, &cookies(&owner), "retry-phone@example.test").await;
         B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn phone_background_notification_lifecycle<B: Backend>(db: Db) -> TestResult {
+    use alibi::{BackgroundTaskCompletion, BackgroundTaskHandler};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Notify;
+    #[derive(Default)]
+    struct Sender {
+        armed: AtomicBool,
+        deliveries: Mutex<Vec<(PhoneOtpDelivery, String, Option<String>)>>,
+        received: Notify,
+        entered: Notify,
+        release: Notify,
+        finished: Notify,
+    }
+    #[async_trait]
+    impl SendPhoneOtp for Sender {
+        async fn send(&self, d: &PhoneOtpDelivery, c: &CallbackContext) -> AuthResult<()> {
+            let r = c.request.as_ref().unwrap();
+            self.deliveries.lock().unwrap().push((
+                d.clone(),
+                r.path.clone(),
+                r.headers.get("x-delivery-marker").cloned(),
+            ));
+            self.received.notify_one();
+            if self.armed.load(Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+                assert_eq!(
+                    r.headers.get("x-delivery-marker").map(String::as_str),
+                    Some("owned-context")
+                );
+                self.finished.notify_one();
+                return Err(AuthError::internal("application gateway unavailable"));
+            }
+            Ok(())
+        }
+    }
+    struct Observer(bool);
+    impl BackgroundTaskHandler for Observer {
+        fn handle(&self, task: BackgroundTaskCompletion) -> AuthResult<()> {
+            drop(task);
+            if self.0 {
+                Err(AuthError::internal("application observer refused"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    for observer_rejects in [false, true] {
+        for route in [
+            "/phone-number/send-otp",
+            "/sign-in/phone-number",
+            "/phone-number/request-password-reset",
+        ] {
+            let db = db.fresh().await?;
+            let (connection, _) = db.migrated::<B>(SECRET).await?;
+            let sender = Arc::new(Sender::default());
+            let config = AuthConfig::new(SECRET)
+                .base_url(ORIGIN)
+                .background_tasks(Arc::new(Observer(observer_rejects)));
+            let auth = AuthBuilder::new(config.clone())
+                .store(B::store(Arc::new(config), &connection))
+                .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+                .plugin(super::auth_probe::fast_password())
+                .plugin(alibi::plugins::SessionManagementPlugin::new())
+                .plugin(PhoneNumberPlugin::new(PhoneNumberConfig {
+                    send_otp: Some(sender.clone()),
+                    send_password_reset_otp: Some(sender.clone()),
+                    require_verification: true,
+                    ..Default::default()
+                }))
+                .build()
+                .await?;
+            let phone = "+15554443333";
+            let signed = call(&auth,request("/sign-up/email",Some(json!({"email":"background-phone@example.test","name":"Phone owner","password":PASSWORD,"phoneNumber":phone})),""),200).await;
+            let foreign = signup(&auth, "background-foreign@example.test").await;
+            if route == "/phone-number/request-password-reset" {
+                let _ = call(
+                    &auth,
+                    request(
+                        "/phone-number/send-otp",
+                        Some(json!({"phoneNumber":phone})),
+                        "",
+                    ),
+                    200,
+                )
+                .await;
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    sender.received.notified(),
+                )
+                .await?;
+                let code = sender
+                    .deliveries
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .0
+                    .code
+                    .clone();
+                let _ = call(
+                    &auth,
+                    request(
+                        "/phone-number/verify",
+                        Some(json!({"phoneNumber":phone,"code":code,"disableSession":true})),
+                        "",
+                    ),
+                    200,
+                )
+                .await;
+            }
+            sender.deliveries.lock().unwrap().clear();
+            sender.armed.store(true, Ordering::SeqCst);
+            let before = db.tables(&["users", "accounts", "sessions"]).await?;
+            let mut input = request(
+                route,
+                Some(json!({"phoneNumber":phone,"password":PASSWORD})),
+                &cookies(&signed),
+            );
+            _ = input
+                .headers
+                .insert("x-delivery-marker".into(), "owned-context".into());
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                Box::pin(auth.handle_request(input)),
+            )
+            .await??;
+            assert_eq!(
+                result.status,
+                if route == "/sign-in/phone-number" {
+                    401
+                } else {
+                    200
+                }
+            );
+            assert!(result.headers.get_all("set-cookie").next().is_none());
+            if route == "/sign-in/phone-number" {
+                assert_eq!(body(&result)["code"], "PHONE_NUMBER_NOT_VERIFIED");
+            } else {
+                assert_eq!(
+                    body(&result),
+                    if route == "/phone-number/send-otp" {
+                        json!({"message":"code sent"})
+                    } else {
+                        json!({"status":true})
+                    }
+                );
+            }
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                sender.entered.notified(),
+            )
+            .await?;
+            let (delivery, path, marker) =
+                sender.deliveries.lock().unwrap().last().unwrap().clone();
+            assert_eq!(path, route);
+            assert_eq!(marker.as_deref(), Some("owned-context"));
+            assert_eq!(delivery.phone_number, phone);
+            let identifier = if route == "/phone-number/request-password-reset" {
+                format!("{phone}-request-password-reset")
+            } else {
+                phone.to_owned()
+            };
+            let proof = db.tables(&["verifications"]).await?;
+            assert_eq!(
+                db.text(
+                    "SELECT value FROM verifications WHERE identifier=$1",
+                    &[&identifier]
+                )
+                .await?
+                .unwrap(),
+                if route == "/sign-in/phone-number" {
+                    delivery.code.clone()
+                } else {
+                    format!("{}:0", delivery.code)
+                }
+            );
+            assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+            sender.release.notify_one();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                sender.finished.notified(),
+            )
+            .await?;
+            assert_eq!(db.tables(&["verifications"]).await?, proof);
+            let (path, input) = if route == "/phone-number/request-password-reset" {
+                (
+                    "/phone-number/reset-password",
+                    json!({"phoneNumber":phone,"otp":delivery.code,"newPassword":"changed-phone-password-123"}),
+                )
+            } else {
+                (
+                    "/phone-number/verify",
+                    json!({"phoneNumber":phone,"code":delivery.code,"disableSession":true}),
+                )
+            };
+            let _ = call(&auth, request(path, Some(input.clone()), ""), 200).await;
+            assert!(
+                db.text(
+                    "SELECT value FROM verifications WHERE identifier=$1",
+                    &[&identifier]
+                )
+                .await?
+                .is_none()
+            );
+            let _ = call(&auth, request(path, Some(input), ""), 400).await;
+            assert_eq!(sender.deliveries.lock().unwrap().len(), 1);
+            authenticated(&auth, &cookies(&foreign), "background-foreign@example.test").await;
+            B::close(connection).await?;
+        }
     }
     Ok(())
 }
