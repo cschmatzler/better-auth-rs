@@ -22,7 +22,8 @@ backend_tests!(
     static_org_update_requires_update_action_and_preserves_key_identity,
     static_org_delete_requires_delete_action_and_revokes_only_selected_key,
     disabled_custom_key_expiration_retains_default_lifetime_through_rename,
-    banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_authority
+    banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_authority,
+    api_key_org_loader_failure_denial
 );
 
 fn raw(path: &str, text: &str, cookie: &str) -> AuthRequest {
@@ -1893,5 +1894,157 @@ async fn banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_autho
     assert!(!orphan.headers.contains_key("set-cookie"));
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     authenticated(&auth, &cookies(&admin), "admin@example.test").await;
+    B::close(connection).await
+}
+
+async fn api_key_org_loader_failure_denial<B: Backend>(db: Db) -> TestResult {
+    use alibi::plugins::organization::{
+        DynamicAccessControlConfig, default_organization_statements,
+    };
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let keys = ApiKeyPlugin::with_config(ApiKeyConfig::default()).configuration(ApiKeyConfig {
+        config_id: "organization".into(),
+        references: ApiKeyReferences::Organization,
+        defer_updates: false,
+        ..Default::default()
+    });
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(OrganizationPlugin::with_config(OrganizationConfig {
+            access_control: Some(default_organization_statements()),
+            dynamic_access_control: DynamicAccessControlConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .plugin(keys)
+        .build()
+        .await?;
+    let owner = signup(&auth, "key-role-owner@example.test").await;
+    let foreign = signup(&auth, "key-role-foreign@example.test").await;
+    let org = body(
+        &call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Selected","slug":"selected-key-role"})),
+                &cookies(&owner),
+            ),
+            200,
+        )
+        .await,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let foreign_org = body(
+        &call(
+            &auth,
+            request(
+                "/organization/create",
+                Some(json!({"name":"Foreign","slug":"foreign-key-role"})),
+                &cookies(&foreign),
+            ),
+            200,
+        )
+        .await,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let issued=body(&call(&auth,request("/api-key/create",Some(json!({"configId":"organization","organizationId":org,"name":"Selected role key"})),&cookies(&owner)),200).await);
+    let foreign_key=body(&call(&auth,request("/api-key/create",Some(json!({"configId":"organization","organizationId":foreign_org,"name":"Foreign role key"})),&cookies(&foreign)),200).await);
+    let id = issued["id"].as_str().unwrap();
+    let mut get = request("/api-key/get", None, &cookies(&owner));
+    get.query.extend([
+        ("configId".into(), "organization".into()),
+        ("id".into(), id.into()),
+    ]);
+    let _ = call(&auth, get.clone(), 200).await;
+    let role = auth
+        .store()
+        .create_organization_role(alibi::types::CreateOrganizationRole {
+            organization_id: org.clone(),
+            role: "legacy".into(),
+            permission: Default::default(),
+        })
+        .await?;
+    for document in ["[\"create\"]", "null", "{\"team\":\"create\"}", "{bad"] {
+        _ = db
+            .execute(
+                "UPDATE organization_role SET permission=$1 WHERE id=$2",
+                &[document, &role.id],
+            )
+            .await?;
+        let before = db
+            .tables(&[
+                "api_keys",
+                "users",
+                "accounts",
+                "sessions",
+                "organization",
+                "member",
+                "organization_role",
+            ])
+            .await?;
+        let mut list = request("/api-key/list", None, &cookies(&owner));
+        list.query.extend([
+            ("configId".into(), "organization".into()),
+            ("organizationId".into(), org.clone()),
+        ]);
+        for input in [
+            get.clone(),
+            list,
+            request(
+                "/api-key/update",
+                Some(json!({"configId":"organization","keyId":id,"name":"Forbidden change"})),
+                &cookies(&owner),
+            ),
+            request(
+                "/api-key/delete",
+                Some(json!({"configId":"organization","keyId":id})),
+                &cookies(&owner),
+            ),
+        ] {
+            let denied = call(&auth, input, 403).await;
+            assert_eq!(body(&denied)["code"], "INSUFFICIENT_API_KEY_PERMISSIONS");
+            assert!(!String::from_utf8_lossy(&denied.body).contains("Invalid permissions"));
+            assert!(denied.headers.get_all("set-cookie").next().is_none());
+            assert_eq!(
+                db.tables(&[
+                    "api_keys",
+                    "users",
+                    "accounts",
+                    "sessions",
+                    "organization",
+                    "member",
+                    "organization_role"
+                ])
+                .await?,
+                before
+            );
+        }
+        let mut valid = request("/api-key/get", None, &cookies(&foreign));
+        valid.query.extend([
+            ("configId".into(), "organization".into()),
+            ("id".into(), foreign_key["id"].as_str().unwrap().into()),
+        ]);
+        let result = call(&auth, valid, 200).await;
+        assert_eq!(body(&result)["id"], foreign_key["id"]);
+        assert_eq!(
+            db.tables(&[
+                "api_keys",
+                "users",
+                "accounts",
+                "sessions",
+                "organization",
+                "member",
+                "organization_role"
+            ])
+            .await?,
+            before
+        );
+    }
+    authenticated(&auth, &cookies(&foreign), "key-role-foreign@example.test").await;
     B::close(connection).await
 }
