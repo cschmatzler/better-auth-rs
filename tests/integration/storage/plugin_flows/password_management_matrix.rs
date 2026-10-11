@@ -18,7 +18,9 @@ backend_tests!(
     invalid_stored_reset_proofs_consume_before_crypto_or_callback,
     concurrent_reset_proof_is_consumed_before_hashing_and_callback,
     zero_password_options_enforce_default_bounds_and_reset_expiry,
-    reset_body_proof_wins_over_conflicting_live_query_proof
+    reset_body_proof_wins_over_conflicting_live_query_proof,
+    verify_password_uses_initialized_callback_and_utf16_maximum,
+    reset_delivery_failures_retain_genuine_redeemable_proof_and_principals
 );
 
 #[derive(Default)]
@@ -1279,5 +1281,295 @@ async fn reset_body_proof_wins_over_conflicting_live_query_proof<B: Backend>(db:
         200,
     )
     .await;
+    Ok(())
+}
+
+async fn verify_password_uses_initialized_callback_and_utf16_maximum<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::PasswordHasher;
+    struct Crypto {
+        mode: Mutex<u8>,
+        seen: Mutex<Vec<(String, String)>>,
+    }
+    #[async_trait]
+    impl PasswordHasher for Crypto {
+        async fn hash(&self, p: &str) -> AuthResult<String> {
+            FastHasher.hash(p).await
+        }
+        async fn verify(&self, h: &str, p: &str) -> AuthResult<bool> {
+            self.seen.lock().unwrap().push((h.into(), p.into()));
+            let mode = *self.mode.lock().unwrap();
+            match mode {
+                1 => Ok(false),
+                2 => Err(AuthError::internal("verification outage")),
+                3 => Err(AuthError::Api {
+                    status: 403,
+                    code: Some("CRYPTO_REJECTED".into()),
+                    message: "Configured verifier rejected".into(),
+                }),
+                _ => FastHasher.verify(h, p).await,
+            }
+        }
+    }
+    struct Fallback;
+    #[async_trait]
+    impl PasswordHasher for Fallback {
+        async fn hash(&self, _: &str) -> AuthResult<String> {
+            panic!("initialized email/password crypto must own hashing")
+        }
+        async fn verify(&self, _: &str, _: &str) -> AuthResult<bool> {
+            panic!("initialized email/password crypto must own verification")
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let crypto = Arc::new(Crypto {
+        mode: Mutex::new(0),
+        seen: Mutex::new(Vec::new()),
+    });
+    let config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(
+            EmailPasswordPlugin::new()
+                .password_max_length(20)
+                .password_hasher(crypto.clone()),
+        )
+        .plugin(SessionManagementPlugin::new())
+        .plugin(PasswordManagementPlugin::with_config(
+            PasswordManagementConfig {
+                password_hasher: Some(Arc::new(Fallback)),
+                ..Default::default()
+            },
+        ))
+        .build()
+        .await?;
+    let password = "😀".repeat(10);
+    let owner=call(&auth,request("/sign-up/email",Some(json!({"email":"initialized-verify@example.test","password":password,"name":"Owner"})),""),200).await;
+    let id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+    let hash = db
+        .text("SELECT password FROM accounts WHERE user_id=$1", &[&id])
+        .await?
+        .unwrap();
+    let before = db
+        .tables(&["users", "accounts", "sessions", "verifications"])
+        .await?;
+    for mode in [0, 1, 2, 3] {
+        *crypto.mode.lock().unwrap() = mode;
+        crypto.seen.lock().unwrap().clear();
+        let result = call(
+            &auth,
+            request(
+                "/verify-password",
+                Some(json!({"password":password})),
+                &cookies(&owner),
+            ),
+            match mode {
+                0 => 200,
+                1 => 400,
+                2 => 500,
+                _ => 403,
+            },
+        )
+        .await;
+        match mode {
+            0 => assert_eq!(body(&result), json!({"status":true})),
+            1 => assert_eq!(body(&result)["message"], "Invalid password"),
+            2 => assert!(result.body.is_empty()),
+            _ => assert_eq!(
+                body(&result),
+                json!({"code":"CRYPTO_REJECTED","message":"Configured verifier rejected"})
+            ),
+        }
+        assert_eq!(
+            *crypto.seen.lock().unwrap(),
+            [(hash.clone(), password.clone())]
+        );
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+    }
+    for removed in [false, true] {
+        if removed {
+            _ = db
+                .execute("DELETE FROM accounts WHERE user_id=$1", &[&id])
+                .await?;
+        }
+        crypto.seen.lock().unwrap().clear();
+        let denied = call(
+            &auth,
+            request(
+                "/verify-password",
+                Some(json!({"password":format!("{password}a")})),
+                &cookies(&owner),
+            ),
+            400,
+        )
+        .await;
+        assert_eq!(body(&denied)["message"], "Password too long");
+        assert!(crypto.seen.lock().unwrap().is_empty());
+        if removed {
+            let missing = call(
+                &auth,
+                request(
+                    "/verify-password",
+                    Some(json!({"password":password})),
+                    &cookies(&owner),
+                ),
+                400,
+            )
+            .await;
+            assert_eq!(body(&missing)["message"], "Invalid password");
+            assert!(crypto.seen.lock().unwrap().is_empty());
+        }
+    }
+    authenticated(&auth, &cookies(&owner), "initialized-verify@example.test").await;
+    B::close(connection).await
+}
+
+async fn reset_delivery_failures_retain_genuine_redeemable_proof_and_principals<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::{AwaitedNotificationErrorPolicy, BackgroundTaskCompletion, BackgroundTaskHandler};
+    struct Observer;
+    impl BackgroundTaskHandler for Observer {
+        fn handle(&self, c: BackgroundTaskCompletion) -> AuthResult<()> {
+            drop(c);
+            Err(AuthError::internal("observer refusal"))
+        }
+    }
+    struct Delivery {
+        mode: &'static str,
+        seen: Mutex<Vec<(String, String)>>,
+        done: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl SendResetPassword for Delivery {
+        async fn send(&self, _: &Value, url: &str, token: &str) -> AuthResult<()> {
+            self.seen.lock().unwrap().push((url.into(), token.into()));
+            self.done.notify_one();
+            match self.mode {
+                "api" => Err(AuthError::forbidden("delivery denied")),
+                "internal" => Err(AuthError::internal("delivery failed")),
+                _ => Ok(()),
+            }
+        }
+    }
+    for (mode, background) in [
+        ("ok", false),
+        ("api", false),
+        ("internal", false),
+        ("internal", true),
+    ] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let delivery = Arc::new(Delivery {
+            mode,
+            seen: Mutex::new(Vec::new()),
+            done: tokio::sync::Notify::new(),
+        });
+        let mut config = AuthConfig::new(SECRET)
+            .base_url(ORIGIN)
+            .awaited_notification_errors(AwaitedNotificationErrorPolicy::LogAndContinue);
+        if background {
+            config.background_tasks = Some(Arc::new(Observer));
+        }
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(
+                PasswordManagementPlugin::new()
+                    .send_reset_password(delivery.clone())
+                    .password_hasher(Arc::new(FastHasher)),
+            )
+            .build()
+            .await?;
+        let owner = signup(&auth, "owner@example.test").await;
+        let foreign = signup(&auth, "foreign@example.test").await;
+        let before = db.tables(&["users", "accounts", "sessions"]).await?;
+        let start = chrono::Utc::now();
+        let sent = call(
+            &auth,
+            request(
+                "/request-password-reset",
+                Some(json!({"email":"owner@example.test","redirectTo":"/reset"})),
+                "",
+            ),
+            200,
+        )
+        .await;
+        assert!(sent.headers.get_all("set-cookie").next().is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(10), delivery.done.notified()).await?;
+        let receipt = delivery.seen.lock().unwrap().clone();
+        assert_eq!(receipt.len(), 1);
+        let (url, token) = receipt.first().unwrap();
+        assert!(url.contains(token));
+        let proof = auth
+            .context()
+            .verifications()
+            .find(&format!("reset-password:{token}"))
+            .await?
+            .unwrap();
+        assert_eq!(proof.value()?, body(&owner)["user"]["id"].as_str().unwrap());
+        assert!(proof.expires_at()? >= start + chrono::Duration::seconds(3599));
+        assert!(proof.expires_at()? <= chrono::Utc::now() + chrono::Duration::seconds(3600));
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+        let proof_before = db.table("verifications").await?;
+        _ = call(
+            &auth,
+            request(
+                "/request-password-reset",
+                Some(json!({"email":"missing@example.test","redirectTo":"/reset"})),
+                "",
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(delivery.seen.lock().unwrap().len(), 1);
+        assert_eq!(db.table("verifications").await?, proof_before);
+        let reset = call(
+            &auth,
+            request(
+                "/reset-password",
+                Some(json!({"token":token,"newPassword":"recovered-password-123"})),
+                "",
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(body(&reset), json!({"status":true}));
+        assert_eq!(db.count("verifications").await?, 0);
+        let after = db.tables(&["users", "accounts", "sessions"]).await?;
+        _ = call(
+            &auth,
+            request(
+                "/reset-password",
+                Some(json!({"token":token,"newPassword":"never-installed-password"})),
+                "",
+            ),
+            400,
+        )
+        .await;
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, after);
+        let signed = call(
+            &auth,
+            request(
+                "/sign-in/email",
+                Some(json!({"email":"owner@example.test","password":"recovered-password-123"})),
+                "",
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(body(&signed)["user"]["id"], body(&owner)["user"]["id"]);
+        authenticated(&auth, &cookies(&owner), "owner@example.test").await;
+        authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+        B::close(connection).await?;
+    }
     Ok(())
 }

@@ -13,7 +13,8 @@ backend_tests!(
     token_grants_follow_the_provider_policy,
     profile_requests_without_a_dedicated_handler,
     refresh_grants_follow_the_provider_policy,
-    cookie_state_strategy_covers_linking_and_unknown_providers
+    cookie_state_strategy_covers_linking_and_unknown_providers,
+    oauth_dynamic_origin_state_publication
 );
 
 fn policy(provider: &mut OAuthProvider) -> &mut alibi::plugins::oauth::OAuthAuthorizationPolicy {
@@ -699,4 +700,122 @@ async fn cookie_state_strategy_covers_linking_and_unknown_providers<B: Backend>(
         1
     );
     B::close(connection).await
+}
+
+async fn oauth_dynamic_origin_state_publication<B: Backend>(db: Db) -> TestResult {
+    use alibi::config::{BaseUrlProtocol, DynamicBaseUrl};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest as _, Sha256};
+    for (host, forwarded, protocol, fallback, expected) in [
+        (
+            "exact.example",
+            false,
+            BaseUrlProtocol::Https,
+            None,
+            Some("https://exact.example"),
+        ),
+        (
+            "tenant.apps.example",
+            false,
+            BaseUrlProtocol::Http,
+            None,
+            Some("http://tenant.apps.example"),
+        ),
+        (
+            "internal.invalid",
+            true,
+            BaseUrlProtocol::Auto,
+            None,
+            Some("https://exact.example"),
+        ),
+        (
+            "outside.invalid",
+            false,
+            BaseUrlProtocol::Auto,
+            Some("https://fallback.example"),
+            Some("https://fallback.example"),
+        ),
+        ("outside.invalid", false, BaseUrlProtocol::Auto, None, None),
+    ] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let social = Social::start().await;
+        let mut config =
+            AuthConfig::new(SECRET)
+                .base_url(ORIGIN)
+                .dynamic_base_url(DynamicBaseUrl {
+                    allowed_hosts: vec!["exact.example".into(), "*.apps.example".into()],
+                    protocol: Some(protocol),
+                    fallback: fallback.map(str::to_owned),
+                });
+        config.account.store_state_strategy = OAuthStateStrategy::Database;
+        config.advanced.trust_forwarded_host = forwarded;
+        let auth = social
+            .auth_configured::<B>(
+                &connection,
+                config,
+                |_| {},
+                |b| b.plugin(super::auth_probe::fast_password()),
+                |s| s,
+            )
+            .await?;
+        let original = auth.context().config.base_url.clone();
+        let mut input = request(
+            "/sign-in/social",
+            Some(json!({"provider":"google","callbackURL":"/after-dynamic"})),
+            "",
+        );
+        input = input.with_url(url::Url::parse(&format!(
+            "http://{host}/api/auth/sign-in/social"
+        ))?);
+        _ = input.headers.insert(
+            "origin".into(),
+            expected.unwrap_or("http://outside.invalid").into(),
+        );
+        _ = input.headers.insert("host".into(), host.into());
+        if forwarded {
+            input.headers.extend([
+                ("x-forwarded-host".into(), "exact.example".into()),
+                ("x-forwarded-proto".into(), "https".into()),
+            ]);
+        }
+        let response = call(&auth, input, if expected.is_some() { 200 } else { 500 }).await;
+        assert_eq!(auth.context().config.base_url, original);
+        assert!(social.provider.requests.lock().unwrap().is_empty());
+        assert_eq!(db.count("users").await?, 0);
+        assert_eq!(db.count("sessions").await?, 0);
+        if let Some(origin) = expected {
+            let authorization = url::Url::parse(body(&response)["url"].as_str().unwrap())?;
+            let query = authorization
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(
+                query["redirect_uri"],
+                format!("{origin}/api/auth/callback/google")
+            );
+            assert_eq!(db.count("verifications").await?, 1);
+            let stored = auth
+                .context()
+                .verifications()
+                .find(&format!("auth-state:{}", query["state"]))
+                .await?
+                .unwrap();
+            let payload: Value = serde_json::from_str(stored.value()?)?;
+            assert_eq!(payload["oauthState"], query["state"]);
+            assert_eq!(payload["callbackURL"], "/after-dynamic");
+            assert_eq!(
+                URL_SAFE_NO_PAD.encode(Sha256::digest(
+                    payload["codeVerifier"].as_str().unwrap().as_bytes()
+                )),
+                query["code_challenge"]
+            );
+            assert!(response.headers.get_all("set-cookie").next().is_some());
+        } else {
+            assert_eq!(db.count("verifications").await?, 0);
+            assert!(response.headers.get_all("set-cookie").next().is_none());
+        }
+        B::close(connection).await?;
+    }
+    Ok(())
 }
