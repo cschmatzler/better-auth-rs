@@ -830,3 +830,35 @@ async fn csrf_infers_null_origins_skips_forms_when_origin_checks_are_off_and_nam
     _ = form.headers.remove("origin");
     assert_eq!(auth.handle_request(form).await.unwrap().status, 200);
 }
+
+#[tokio::test]
+async fn configured_error_url_keeps_fragment_and_render_precedence()
+-> Result<(), Box<dyn std::error::Error>> {
+    for render in [false, true] {
+        let mut c = config();
+        c.api_error_url = Some("/problem?keep=a%2Bb#error-panel".into());
+        c.render_error_page = render;
+        let auth = AuthBuilder::without_database(c).build().await?;
+        for description in [None, Some("detail + & café")] {
+            let mut input = get("/api/auth/error");
+            let mut query = vec![("error", "BAD_CODE")];
+            if let Some(d) = description {
+                query.push(("error_description", d));
+            }
+            input.set_query_pairs(query);
+            let response = auth.handle_request(input).await?;
+            assert_eq!(response.status, 302);
+            assert_eq!(
+                location(&response),
+                if description.is_none() {
+                    "/problem?keep=a%2Bb&error=BAD_CODE#error-panel"
+                } else {
+                    "/problem?keep=a%2Bb&error=BAD_CODE&error_description=detail+%2B+%26+caf%C3%A9#error-panel"
+                }
+            );
+            assert!(response.body.is_empty());
+            assert!(!response.headers.contains_key("set-cookie"));
+        }
+    }
+    Ok(())
+}

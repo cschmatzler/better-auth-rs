@@ -18,6 +18,7 @@ backend_tests!(
     anonymous_transfer_failure_preserves_committed_login,
     anonymous_database_hook_errors_preserve_stage_commit,
     anonymous_issuance_ignores_tampered_browser_preference,
+    anonymous_transfer_retains_cached_old_projection_and_new_completed_owner,
     anonymous_passwordless_completion_paths_transfer_actual_owner
 );
 
@@ -787,6 +788,109 @@ async fn anonymous_issuance_ignores_tampered_browser_preference<B: Backend>(db: 
     }
     assert_eq!(db.table("accounts").await?, baseline[1]);
     authenticated(&auth, &cookies(&owner), "owner@example.test").await;
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+    B::close(connection).await
+}
+
+async fn anonymous_transfer_retains_cached_old_projection_and_new_completed_owner<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::plugins::MultiSessionPlugin;
+    use alibi::{CookieCacheConfig, CookieCacheStrategy};
+    struct Capture(Mutex<Vec<Value>>);
+    #[async_trait::async_trait]
+    impl LinkAnonymousAccount for Capture {
+        async fn link(&self, l: &AnonymousLink, _: &AuthRequest) -> AuthResult<()> {
+            self.0.lock().unwrap().push(json!({"oldUser":l.anonymous_user,"oldSession":l.anonymous_session,"newUser":l.new_user,"newSession":l.new_session}));
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let config = AuthConfig::new(SECRET)
+        .base_url(ORIGIN)
+        .session_cookie_cache(CookieCacheConfig {
+            enabled: true,
+            strategy: CookieCacheStrategy::Compact,
+            ..Default::default()
+        });
+    let linker = Arc::new(Capture(Mutex::new(Vec::new())));
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(AnonymousPlugin::with_config(AnonymousConfig {
+            on_link_account: Some(linker.clone()),
+            ..Default::default()
+        }))
+        .plugin(MultiSessionPlugin::new())
+        .build()
+        .await?;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let baseline = db.tables(&["users", "accounts", "sessions"]).await?;
+    let anon = call(
+        &auth,
+        request("/sign-in/anonymous", Some(json!({})), ""),
+        200,
+    )
+    .await;
+    let jar = cookies(&anon);
+    let original = body(&call(&auth, request("/get-session", None, &jar), 200).await);
+    let old_id = original["user"]["id"].as_str().unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE users SET name='Physical Changed Anonymous' WHERE id=$1",
+            &[old_id]
+        )
+        .await?,
+        1
+    );
+    let completed=call(&auth,request("/sign-up/email",Some(json!({"email":"upgrade@example.test","name":"Completed Real Owner","password":PASSWORD})),&jar),200).await;
+    let new = body(&completed);
+    let receipts = linker.0.lock().unwrap().clone();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["oldUser"], original["user"]);
+    assert_eq!(receipts[0]["oldSession"], original["session"]);
+    assert_eq!(receipts[0]["newUser"], new["user"]);
+    assert_eq!(receipts[0]["newSession"]["token"], new["token"]);
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM users WHERE id=$1", &[old_id])
+            .await?,
+        0
+    );
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM sessions WHERE user_id=$1", &[old_id])
+            .await?,
+        0
+    );
+    let id = new["user"]["id"].as_str().unwrap();
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM sessions WHERE user_id=$1", &[id])
+            .await?,
+        1
+    );
+    assert!(
+        completed
+            .headers
+            .get_all("set-cookie")
+            .any(|x| x.contains("_multi-") && !x.contains("Max-Age=0"))
+    );
+    let read = body(
+        &call(
+            &auth,
+            request("/get-session", None, &cookies(&completed)),
+            200,
+        )
+        .await,
+    );
+    assert_eq!(read["user"], new["user"]);
+    assert_eq!(read["session"]["token"], new["token"]);
+    let after = db.tables(&["users", "accounts", "sessions"]).await?;
+    for (before, now) in baseline.iter().zip(after.iter()) {
+        let before: Vec<Value> = serde_json::from_str(before)?;
+        let now: Vec<Value> = serde_json::from_str(now)?;
+        assert!(before.iter().all(|x| now.contains(x)));
+    }
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
 }
