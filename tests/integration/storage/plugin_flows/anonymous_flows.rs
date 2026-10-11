@@ -789,3 +789,182 @@ async fn anonymous_issuance_ignores_tampered_browser_preference<B: Backend>(db: 
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
 }
+
+#[tokio::test]
+#[cfg(feature = "seaorm")]
+async fn anonymous_new_owner_callback_retains_hidden_application_fields() -> TestResult {
+    use alibi::AuthSession;
+    #[expect(
+        unreachable_pub,
+        reason = "SeaORM derives require public model and relation types within the application schema"
+    )]
+    mod application_user {
+        use alibi::seaorm::sea_orm::{self, entity::prelude::*};
+        use chrono::{DateTime, Utc};
+        #[derive(
+            Clone, Debug, PartialEq, serde::Serialize, alibi::seaorm::AuthEntity, DeriveEntityModel,
+        )]
+        #[sea_orm(table_name = "users")]
+        #[auth(role = "user", secondary_storage)]
+        #[serde(rename_all = "camelCase")]
+        pub struct Model {
+            #[sea_orm(primary_key, auto_increment = false)]
+            pub id: String,
+            pub name: Option<String>,
+            pub email: Option<String>,
+            pub email_verified: bool,
+            pub image: Option<String>,
+            pub username: Option<String>,
+            pub display_username: Option<String>,
+            pub two_factor_enabled: Option<bool>,
+            pub role: Option<String>,
+            pub banned: Option<bool>,
+            pub ban_reason: Option<String>,
+            pub ban_expires: Option<DateTime<Utc>>,
+            #[sea_orm(column_type = "JsonBinary")]
+            pub metadata: alibi::seaorm::JsonMetadata,
+            pub is_anonymous: Option<bool>,
+            pub phone_number: Option<String>,
+            pub phone_number_verified: Option<bool>,
+            pub last_login_method: Option<String>,
+            pub created_at: DateTime<Utc>,
+            pub updated_at: DateTime<Utc>,
+            #[sea_orm(column_name = "cargo_label")]
+            pub cargo_label: Option<String>,
+            #[sea_orm(column_name = "cargo_hidden")]
+            pub cargo_hidden: Option<String>,
+        }
+        #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+        pub enum Relation {}
+        impl ActiveModelBehavior for ActiveModel {}
+    }
+    type Bundled = <crate::storage::SeaOrm as Backend>::Schema;
+    struct ApplicationSchema;
+    impl AuthSchema for ApplicationSchema {
+        type User = application_user::Model;
+        type Session = <Bundled as AuthSchema>::Session;
+        type Account = <Bundled as AuthSchema>::Account;
+        type Verification = <Bundled as AuthSchema>::Verification;
+    }
+    struct Hook(crate::storage::Raw);
+    #[async_trait::async_trait]
+    impl<H: alibi::store::HookBackend> DatabaseHooks<ApplicationSchema, H> for Hook {
+        async fn after_create_session(
+            &self,
+            s: &<ApplicationSchema as AuthSchema>::Session,
+            c: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<()> {
+            if c.request
+                .as_ref()
+                .is_some_and(|r| r.path.ends_with("/sign-up/email"))
+            {
+                _=self.0.execute("UPDATE users SET name='Stored Hook Name',cargo_label='Application Stored',cargo_hidden='Stored Secret' WHERE id=$1",&[s.user_id().as_ref()]).await.map_err(|e|alibi::AuthError::internal(e.to_string()))?;
+            }
+            Ok(())
+        }
+    }
+    struct Capture(Mutex<Vec<Value>>);
+    #[async_trait::async_trait]
+    impl LinkAnonymousAccount for Capture {
+        async fn link(&self, a: &AnonymousLink, _: &AuthRequest) -> AuthResult<()> {
+            self.0.lock().unwrap().push(
+                json!({"oldUser":a.anonymous_user,"newUser":a.new_user,"newSession":a.new_session}),
+            );
+            Ok(())
+        }
+    }
+    let db = Db::sqlite().await?;
+    let (connection, _) = db.migrated::<crate::storage::SeaOrm>(SECRET).await?;
+    _ = db
+        .execute("ALTER TABLE users ADD COLUMN cargo_label TEXT", &[])
+        .await?;
+    _ = db
+        .execute("ALTER TABLE users ADD COLUMN cargo_hidden TEXT", &[])
+        .await?;
+    let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    use alibi::field_policy::FieldConfig;
+    _ = config.user.additional_fields.insert(
+        "cargoLabel".into(),
+        FieldConfig::new(json!({"type":"string"}))
+            .field_name("cargo_label")
+            .default_value(json!("Application Original")),
+    );
+    _ = config.user.additional_fields.insert(
+        "cargoHidden".into(),
+        FieldConfig::new(json!({"type":"string"}))
+            .field_name("cargo_hidden")
+            .default_value(json!("Application Secret"))
+            .hidden(),
+    );
+    let capture = Arc::new(Capture(Mutex::new(Vec::new())));
+    let store = alibi::seaorm::SeaOrmStore::<ApplicationSchema>::new(
+        Arc::new(config.clone()),
+        connection.clone(),
+    )
+    .hook(Hook(db.raw.clone()));
+    let auth = AuthBuilder::new(config)
+        .store(store)
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(alibi::plugins::SessionManagementPlugin::new())
+        .plugin(AnonymousPlugin::with_config(AnonymousConfig {
+            on_link_account: Some(capture.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let foreign = signup(&auth, "hidden-foreign@example.test").await;
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    let anonymous = call(
+        &auth,
+        request("/sign-in/anonymous", Some(json!({})), ""),
+        200,
+    )
+    .await;
+    let old_id = body(&anonymous)["user"]["id"].as_str().unwrap().to_owned();
+    let done=call(&auth,request("/sign-up/email",Some(json!({"email":"hidden-owner@example.test","name":"Original New Owner","password":PASSWORD})),&cookies(&anonymous)),200).await;
+    let public = body(&done);
+    assert_eq!(public["user"]["name"], "Original New Owner");
+    assert_eq!(public["user"]["cargoLabel"], "Application Original");
+    assert!(public["user"].get("cargoHidden").is_none());
+    let receipts = capture.0.lock().unwrap().clone();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["oldUser"]["id"], old_id);
+    assert_eq!(receipts[0]["newUser"]["id"], public["user"]["id"]);
+    assert_eq!(receipts[0]["newUser"]["name"], "Original New Owner");
+    assert_eq!(receipts[0]["newUser"]["cargoLabel"], "Application Original");
+    assert_eq!(receipts[0]["newUser"]["cargoHidden"], "Application Secret");
+    assert_eq!(receipts[0]["newSession"]["token"], public["token"]);
+    let id = public["user"]["id"].as_str().unwrap();
+    assert_eq!(
+        db.text("SELECT name FROM users WHERE id=$1", &[id])
+            .await?
+            .as_deref(),
+        Some("Stored Hook Name")
+    );
+    assert_eq!(
+        db.text("SELECT cargo_hidden FROM users WHERE id=$1", &[id])
+            .await?
+            .as_deref(),
+        Some("Stored Secret")
+    );
+    let current = body(&call(&auth, request("/get-session", None, &cookies(&done)), 200).await);
+    assert_eq!(current["user"]["name"], "Stored Hook Name");
+    assert_eq!(current["user"]["cargoLabel"], "Application Stored");
+    assert!(current["user"].get("cargoHidden").is_none());
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM users WHERE id=$1", &[&old_id])
+            .await?,
+        0
+    );
+    let after = db.tables(&["users", "accounts", "sessions"]).await?;
+    for (prior, current) in before.into_iter().zip(after) {
+        let prior: Vec<Value> = serde_json::from_str(&prior)?;
+        let current: Vec<Value> = serde_json::from_str(&current)?;
+        for row in prior {
+            assert!(current.contains(&row));
+        }
+    }
+    authenticated(&auth, &cookies(&foreign), "hidden-foreign@example.test").await;
+    <crate::storage::SeaOrm as Backend>::close(connection).await
+}
