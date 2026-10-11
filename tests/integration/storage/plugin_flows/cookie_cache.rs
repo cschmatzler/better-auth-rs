@@ -24,6 +24,10 @@ backend_tests!(
     update_user_refreshes_the_cache_and_invalid_sessions_clear_every_cookie_family,
     pending_factor_challenge_clears_cache_cookies_including_incoming_chunks,
     published_snapshot_exposes_public_views_to_response_hooks,
+    scoped_cache_chunks_obey_wire_capacity_and_retirement,
+    cache_version_issuance_failure_preserves_anonymous_principal,
+    browser_cache_ttl_requires_authenticated_preference,
+    cache_raw_and_specific_max_age_keep_distinct_lifetimes,
     verification_renews_original_cached_snapshot_and_publishes_it_to_later_hooks
 );
 postgres_tests!(
@@ -483,6 +487,440 @@ async fn published_snapshot_exposes_public_views_to_response_hooks<B: Backend>(
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0]["email"], "observer@example.test");
     assert_eq!(seen[0]["token"], body(&issued)["token"]);
+    Ok(())
+}
+
+async fn scoped_cache_chunks_obey_wire_capacity_and_retirement<B: Backend>(db: Db) -> TestResult {
+    use alibi::config::SameSite;
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let mut config = AuthConfig::new(SECRET)
+        .base_url(ORIGIN)
+        .session_cookie_cache(CookieCacheConfig {
+            enabled: true,
+            strategy: CookieCacheStrategy::Compact,
+            max_age: 300.0,
+            ..Default::default()
+        });
+    _ = config.advanced.cookies.insert(
+        "session_data".into(),
+        CookieOverride {
+            name: None,
+            attributes: CookieAttributes {
+                path: Some("/api/auth".into()),
+                domain: Some("cache.example.test".into()),
+                secure: Some(true),
+                http_only: Some(false),
+                same_site: Some(SameSite::Strict),
+                expires: Some("2027-01-01T00:00:00Z".parse()?),
+                partitioned: Some(true),
+                ..Default::default()
+            },
+        },
+    );
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .build()
+        .await?;
+    let name = "x".repeat(6000);
+    let issued = call(
+        &auth,
+        request(
+            "/sign-up/email",
+            Some(json!({"email":"wire-chunks@example.test","password":PASSWORD,"name":name})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    let parts = issued
+        .headers
+        .get_all("set-cookie")
+        .filter(|v| v.starts_with("better-auth.session_data."))
+        .collect::<Vec<_>>();
+    assert!(parts.len() > 1);
+    assert!(
+        !issued
+            .headers
+            .get_all("set-cookie")
+            .any(|v| v.starts_with("better-auth.session_data="))
+    );
+    let attrs = "; Max-Age=300; Domain=cache.example.test; Path=/api/auth; Expires=Fri, 01 Jan 2027 00:00:00 GMT; Secure; SameSite=Strict; Partitioned";
+    let capacity = 4050 - ("better-auth.session_data.99=".len() + attrs.len());
+    let values = parts
+        .iter()
+        .map(|v| v.split(';').next().unwrap().split_once('=').unwrap().1)
+        .collect::<Vec<_>>();
+    let total = values.iter().map(|v| v.len()).sum::<usize>();
+    for (index, part) in parts.iter().enumerate() {
+        assert!(part.len() <= 4050);
+        assert_eq!(
+            part.split_once(';').unwrap().1,
+            attrs.strip_prefix(';').unwrap()
+        );
+        assert!(part.starts_with(&format!("better-auth.session_data.{index}=")));
+        assert_eq!(values[index].len(), capacity.min(total - index * capacity));
+    }
+    let jar = cookies(&issued);
+    let read = call(&auth, request("/get-session", None, &jar), 200).await;
+    assert_eq!(body(&read)["user"]["name"], name);
+    let token = body(&issued)["token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM sessions WHERE token=$1", &[&token])
+            .await?,
+        1
+    );
+    let logout = call(&auth, request("/sign-out", Some(json!({})), &jar), 200).await;
+    let retired = logout
+        .headers
+        .get_all("set-cookie")
+        .filter(|v| v.starts_with("better-auth.session_data."))
+        .collect::<Vec<_>>();
+    assert_eq!(retired.len(), parts.len());
+    for part in &parts {
+        let n = part.split('=').next().unwrap();
+        let raw = retired
+            .iter()
+            .find(|v| v.starts_with(&format!("{n}=")))
+            .unwrap();
+        assert_eq!(
+            raw.as_str(),
+            format!("{n}={}", attrs.replace("Max-Age=300", "Max-Age=0"))
+        );
+    }
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM sessions WHERE token=$1", &[&token])
+            .await?,
+        0
+    );
+    assert_eq!(db.count("users").await?, 1);
+    B::close(connection).await
+}
+
+async fn cache_version_issuance_failure_preserves_anonymous_principal<B: Backend>(
+    db: Db,
+) -> TestResult {
+    use alibi::plugins::AnonymousPlugin;
+    use alibi::plugins::anonymous::{AnonymousConfig, AnonymousLink, LinkAnonymousAccount};
+    use alibi::{
+        AuthError, CacheVersionContext, CacheVersionSource, CookieCacheVersion,
+        CookieCacheVersionResolver,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    struct Version {
+        armed: AtomicBool,
+        api: bool,
+    }
+    #[async_trait]
+    impl CookieCacheVersionResolver for Version {
+        async fn resolve(&self, c: &CacheVersionContext) -> AuthResult<String> {
+            if self.armed.load(Ordering::SeqCst)
+                && c.source() == CacheVersionSource::Created
+                && c.user().is_anonymous != Some(true)
+            {
+                if self.api {
+                    return Err(AuthError::Api {
+                        status: 500,
+                        code: Some("APPLICATION_CACHE_DENIED".into()),
+                        message: "Configured cache version rejected issuance".into(),
+                    });
+                }
+                return Err(AuthError::internal("application publication outage"));
+            }
+            Ok("v1".into())
+        }
+    }
+    struct Link(AtomicUsize);
+    #[async_trait]
+    impl LinkAnonymousAccount for Link {
+        async fn link(&self, _: &AnonymousLink, _: &AuthRequest) -> AuthResult<()> {
+            _ = self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    for api in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let version = Arc::new(Version {
+            armed: AtomicBool::new(false),
+            api,
+        });
+        let link = Arc::new(Link(AtomicUsize::new(0)));
+        let config = AuthConfig::new(SECRET)
+            .base_url(ORIGIN)
+            .session_cookie_cache(CookieCacheConfig {
+                enabled: true,
+                version: Some(CookieCacheVersion::Resolver(version.clone())),
+                ..Default::default()
+            });
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(AnonymousPlugin::with_config(AnonymousConfig {
+                on_link_account: Some(link.clone()),
+                ..Default::default()
+            }))
+            .build()
+            .await?;
+        let anonymous = call(
+            &auth,
+            request("/sign-in/anonymous", Some(json!({})), ""),
+            200,
+        )
+        .await;
+        let jar = cookies(&anonymous);
+        let before = db
+            .tables(&["users", "accounts", "sessions", "verifications"])
+            .await?;
+        version.armed.store(true, Ordering::SeqCst);
+        let rejected=call(&auth,request("/sign-up/email",Some(json!({"email":"cache-denied-replacement@example.test","password":PASSWORD,"name":"Replacement"})),&jar),500).await;
+        if api {
+            assert_eq!(
+                body(&rejected),
+                json!({"code":"APPLICATION_CACHE_DENIED","message":"Configured cache version rejected issuance"})
+            );
+        } else {
+            assert!(rejected.body.is_empty());
+        }
+        assert_eq!(
+            rejected
+                .headers
+                .get_all("set-cookie")
+                .any(|v| v.starts_with("better-auth.session_token=")),
+            api
+        );
+        assert!(
+            !rejected
+                .headers
+                .get_all("set-cookie")
+                .any(|v| v.starts_with("better-auth.session_data="))
+        );
+        assert_eq!(link.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT COUNT(*) FROM users WHERE email=$1",
+                &["cache-denied-replacement@example.test"]
+            )
+            .await?,
+            0
+        );
+        let old = call(&auth, request("/get-session", None, &jar), 200).await;
+        assert_eq!(body(&old)["user"]["id"], body(&anonymous)["user"]["id"]);
+        let update = cookies(&rejected);
+        let actual_jar = if update.is_empty() {
+            jar.clone()
+        } else {
+            merged(&jar, &update)
+        };
+        let actual = call(&auth, request("/get-session", None, &actual_jar), 200).await;
+        if api {
+            assert_eq!(body(&actual), Value::Null);
+        } else {
+            assert_eq!(body(&actual)["user"]["id"], body(&anonymous)["user"]["id"]);
+        }
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn browser_cache_ttl_requires_authenticated_preference<B: Backend>(db: Db) -> TestResult {
+    use base64::{
+        Engine,
+        engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    };
+    use hkdf::hmac::{Hmac, KeyInit, Mac};
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let config = AuthConfig::new(SECRET)
+        .base_url(ORIGIN)
+        .session_cookie_cache(CookieCacheConfig {
+            enabled: true,
+            max_age: 300.0,
+            ..Default::default()
+        });
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .build()
+        .await?;
+    _ = signup(&auth, "browser-ttl@example.test").await;
+    let signed = call(
+        &auth,
+        request(
+            "/sign-in/email",
+            Some(
+                json!({"email":"browser-ttl@example.test","password":PASSWORD,"rememberMe":false}),
+            ),
+            "",
+        ),
+        200,
+    )
+    .await;
+    for raw in signed.headers.get_all("set-cookie") {
+        assert!(!raw.contains("Max-Age="));
+        assert!(!raw.contains("Expires="));
+    }
+    let jar = cookies(&signed);
+    let encoded = jar
+        .split("; ")
+        .find_map(|v| v.strip_prefix("better-auth.session_data="))
+        .unwrap();
+    let envelope: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?;
+    let ttl = envelope["expiresAt"].as_f64().unwrap()
+        - envelope["session"]["updatedAt"].as_f64().unwrap();
+    assert!((60_000.0..=60_010.0).contains(&ttl));
+    let preference = jar
+        .split("; ")
+        .find_map(|v| v.strip_prefix("better-auth.dont_remember="))
+        .unwrap();
+    let encoded_pair = format!("v={preference}");
+    let decoded = url::form_urlencoded::parse(encoded_pair.as_bytes())
+        .next()
+        .unwrap()
+        .1
+        .into_owned();
+    let (payload, signature) = decoded.rsplit_once('.').unwrap();
+    assert_eq!(payload, "true");
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(SECRET.as_bytes())?;
+    mac.update(b"true");
+    mac.verify_slice(&STANDARD.decode(signature)?)?;
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    let token = jar
+        .split("; ")
+        .find(|v| v.starts_with("better-auth.session_token="))
+        .unwrap();
+    let invalid = call(
+        &auth,
+        request(
+            "/get-session",
+            None,
+            &format!("{token}; better-auth.dont_remember=true.invalid"),
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&invalid)["user"]["id"], body(&signed)["user"]["id"]);
+    let renewed = cookies(&invalid);
+    let encoded = renewed
+        .split("; ")
+        .find_map(|v| v.strip_prefix("better-auth.session_data="))
+        .unwrap();
+    let envelope: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?;
+    let ttl = envelope["expiresAt"].as_f64().unwrap()
+        - envelope["session"]["updatedAt"].as_f64().unwrap();
+    assert!((300_000.0..=300_010.0).contains(&ttl));
+    assert_eq!(db.tables(&["users", "accounts"]).await?, before[..2]);
+    let before_sessions: Vec<Value> = serde_json::from_str(&before[2])?;
+    let after_sessions: Vec<Value> = serde_json::from_str(&db.table("sessions").await?)?;
+    assert_eq!(before_sessions.len(), after_sessions.len());
+    for mut old in before_sessions {
+        let mut current = after_sessions
+            .iter()
+            .find(|s| s["id"] == old["id"])
+            .unwrap()
+            .clone();
+        if old["token"] == body(&signed)["token"] {
+            let old_expiry: chrono::DateTime<chrono::Utc> =
+                old["expires_at"].as_str().unwrap().parse()?;
+            let renewed_expiry: chrono::DateTime<chrono::Utc> =
+                current["expires_at"].as_str().unwrap().parse()?;
+            assert!(renewed_expiry > old_expiry + chrono::Duration::days(5));
+            for key in ["expires_at", "updated_at"] {
+                _ = old.as_object_mut().unwrap().remove(key);
+                _ = current.as_object_mut().unwrap().remove(key);
+            }
+        }
+        assert_eq!(current, old);
+    }
+    B::close(connection).await
+}
+
+async fn cache_raw_and_specific_max_age_keep_distinct_lifetimes<B: Backend>(db: Db) -> TestResult {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    for (raw, specific, expected, header) in [
+        (0.0, None, 300_000.0, Some(300)),
+        (f64::NAN, None, 300_000.0, Some(300)),
+        (0.5, None, 500.0, Some(0)),
+        (300.0, Some(0.0), 60_000.0, Some(0)),
+        (300.0, Some(f64::NAN), 60_000.0, None),
+        (300.0, Some(0.5), 500.0, Some(0)),
+        (300.0, Some(17.0), 17_000.0, Some(17)),
+        (300.0, Some(-1.0), -1000.0, None),
+    ] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let mut config = AuthConfig::new(SECRET)
+            .base_url(ORIGIN)
+            .session_cookie_cache(CookieCacheConfig {
+                enabled: true,
+                max_age: raw,
+                ..Default::default()
+            });
+        config.advanced.default_cookie_attributes.max_age = Some(99.0);
+        if let Some(age) = specific {
+            _ = config.advanced.cookies.insert(
+                "session_data".into(),
+                CookieOverride {
+                    name: None,
+                    attributes: CookieAttributes {
+                        max_age: Some(age),
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .build()
+            .await?;
+        let issued = signup(&auth, "age-policy@example.test").await;
+        let data = issued
+            .headers
+            .get_all("set-cookie")
+            .find(|v| v.starts_with("better-auth.session_data="))
+            .unwrap();
+        let value = data.split(';').next().unwrap().split_once('=').unwrap().1;
+        let envelope: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(value)?)?;
+        let ttl = envelope["expiresAt"].as_f64().unwrap()
+            - envelope["session"]["updatedAt"].as_f64().unwrap();
+        assert!(
+            (expected..=expected + 10.0).contains(&ttl),
+            "{raw:?}/{specific:?}: {ttl}"
+        );
+        let max_age = data
+            .split("; ")
+            .find_map(|v| v.strip_prefix("Max-Age="))
+            .map(|v| v.parse::<i64>().unwrap());
+        assert_eq!(max_age, header);
+        let token = issued
+            .headers
+            .get_all("set-cookie")
+            .find(|v| v.starts_with("better-auth.session_token="))
+            .unwrap();
+        assert!(token.contains("; Max-Age=604800;"));
+        assert_eq!(db.count("users").await?, 1);
+        assert_eq!(db.count("accounts").await?, 1);
+        assert_eq!(db.count("sessions").await?, 1);
+        B::close(connection).await?;
+    }
     Ok(())
 }
 
