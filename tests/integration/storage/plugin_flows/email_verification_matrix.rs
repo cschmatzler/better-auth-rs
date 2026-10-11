@@ -17,7 +17,8 @@ backend_tests!(
     send_verification_email_matrix,
     verified_guest_replay_skips_hooks_and_session_issuance,
     verification_after_hook_rejection_commits_user_without_issuing_session,
-    verification_delivery_keeps_original_bodies_and_headers_for_all_entry_points
+    verification_delivery_keeps_original_bodies_and_headers_for_all_entry_points,
+    email_verification_request_metadata
 );
 
 #[derive(Default)]
@@ -586,5 +587,89 @@ async fn verification_delivery_keeps_original_bodies_and_headers_for_all_entry_p
         );
     }
     assert!(alibi::hooks::current_request_hook_context().is_none());
+    Ok(())
+}
+
+async fn email_verification_request_metadata<B: Backend>(db: Db) -> TestResult {
+    for disabled in [false, true] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        config.advanced.ip_address.trusted_proxies = vec!["10.0.0.0/8".into()];
+        config.advanced.ip_address.disable_ip_tracking = disabled;
+        let inbox = Arc::new(Inbox::default());
+        let (verification, management) = plugins(&inbox, Duration::hours(1), true);
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(verification)
+            .plugin(management)
+            .build()
+            .await?;
+        let foreign = signup(&auth, "foreign@example.test").await;
+        let foreign_before = db.tables(&["users", "accounts", "sessions"]).await?;
+        let owner = signup(&auth, "owner@example.test").await;
+        let (_, token) = inbox.take();
+        _ = call(
+            &auth,
+            request("/sign-out", Some(json!({})), &cookies(&owner)),
+            200,
+        )
+        .await;
+        let before = db.tables(&["users", "accounts", "sessions"]).await?;
+        let invalid = format!("{}.invalid-signature", token.rsplit_once('.').unwrap().0);
+        let with_meta = |token: &str| {
+            let mut r = verify(token, None, "");
+            r.headers.extend([
+                (
+                    "x-forwarded-for".into(),
+                    "203.0.113.99, 198.51.100.223, 10.2.3.4".into(),
+                ),
+                ("user-agent".into(), "verification-browser".into()),
+            ]);
+            r
+        };
+        let forged = call(&auth, with_meta(&invalid), 401).await;
+        assert!(forged.headers.get_all("set-cookie").next().is_none());
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, before);
+        let verified = call(&auth, with_meta(&token), 200).await;
+        let current = body(
+            &call(
+                &auth,
+                request("/get-session", None, &cookies(&verified)),
+                200,
+            )
+            .await,
+        );
+        assert_eq!(current["user"]["id"], body(&owner)["user"]["id"]);
+        assert_eq!(current["user"]["emailVerified"], true);
+        let session = current["session"]["token"].as_str().unwrap();
+        assert_eq!(
+            db.text("SELECT ip_address FROM sessions WHERE token=$1", &[session])
+                .await?
+                .as_deref(),
+            Some(if disabled { "" } else { "198.51.100.223" })
+        );
+        assert_eq!(
+            db.text("SELECT user_agent FROM sessions WHERE token=$1", &[session])
+                .await?
+                .as_deref(),
+            Some("verification-browser")
+        );
+        let after = db.tables(&["users", "accounts", "sessions"]).await?;
+        for (before, now) in foreign_before.iter().zip(after.iter()) {
+            let before: Vec<Value> = serde_json::from_str(before)?;
+            let now: Vec<Value> = serde_json::from_str(now)?;
+            assert!(before.iter().all(|r| now.contains(r)));
+        }
+        let old_sessions: Vec<Value> = serde_json::from_str(before.last().unwrap())?;
+        let new_sessions: Vec<Value> = serde_json::from_str(after.last().unwrap())?;
+        assert_eq!(new_sessions.len(), old_sessions.len() + 1);
+        assert!(old_sessions.iter().all(|r| new_sessions.contains(r)));
+        authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+        B::close(connection).await?;
+    }
     Ok(())
 }
