@@ -15,7 +15,8 @@ backend_tests!(
     device_decision_and_issuance_edges,
     device_missing_owner_preserves_approved_grant_for_recovery,
     device_empty_application_codes_complete_real_grant,
-    device_fractional_durations_preserve_persisted_milliseconds
+    device_fractional_durations_preserve_persisted_milliseconds,
+    device_issuance_retains_prebound_owner_authority
 );
 
 type Events = Arc<Mutex<Vec<Value>>>;
@@ -908,5 +909,116 @@ async fn device_fractional_durations_preserve_persisted_milliseconds<B: Backend>
         }
         assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, stable);
     }
+    B::close(connection).await
+}
+
+async fn device_issuance_retains_prebound_owner_authority<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(DeviceAuthorizationPlugin::new().interval(chrono::Duration::zero()))
+        .build()
+        .await?;
+    let owner = signup(&auth, "owner@example.test").await;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let owner_id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+    let foreign_id = body(&foreign)["user"]["id"].as_str().unwrap().to_owned();
+    let baseline = db.tables(&["users", "accounts", "sessions"]).await?;
+    for prebound in [owner_id.as_str(), "unknown-prebound-owner", ""] {
+        let issued = body(
+            &call(
+                &auth,
+                request(
+                    "/device/code",
+                    Some(
+                        json!({"client_id":"prebound-client","scope":"private","user_id":prebound}),
+                    ),
+                    "",
+                ),
+                200,
+            )
+            .await,
+        );
+        let code = issued["device_code"].as_str().unwrap();
+        let uc = issued["user_code"].as_str().unwrap();
+        assert_eq!(
+            db.text(
+                "SELECT user_id FROM device_code WHERE device_code=$1",
+                &[code]
+            )
+            .await?
+            .as_deref(),
+            (!prebound.is_empty()).then_some(prebound)
+        );
+        let original = db.table("device_code").await?;
+        let mut review = request("/device", None, &cookies(&foreign));
+        review.set_query_pairs([("user_code", uc)]);
+        let viewed = call(&auth, review, 200).await;
+        if prebound.is_empty() {
+            assert_eq!(body(&viewed)["client_id"], "prebound-client");
+            assert_eq!(
+                db.text(
+                    "SELECT user_id FROM device_code WHERE device_code=$1",
+                    &[code]
+                )
+                .await?
+                .as_deref(),
+                Some(foreign_id.as_str())
+            );
+        } else {
+            assert_eq!(body(&viewed), json!({"user_code":uc,"status":"pending"}));
+            assert_eq!(db.table("device_code").await?, original);
+            for decision in ["approve", "deny"] {
+                _ = call(
+                    &auth,
+                    request(
+                        &format!("/device/{decision}"),
+                        Some(json!({"userCode":uc})),
+                        &cookies(&foreign),
+                    ),
+                    403,
+                )
+                .await;
+                assert_eq!(db.table("device_code").await?, original);
+            }
+        }
+        if prebound == owner_id {
+            _ = call(
+                &auth,
+                request(
+                    "/device/approve",
+                    Some(json!({"userCode":uc})),
+                    &cookies(&owner),
+                ),
+                200,
+            )
+            .await;
+            let poll = request(
+                "/device/token",
+                Some(
+                    json!({"grant_type":"urn:ietf:params:oauth:grant-type:device_code","device_code":code,"client_id":"prebound-client"}),
+                ),
+                "",
+            );
+            let done = call(&auth, poll.clone(), 200).await;
+            assert_eq!(
+                db.text(
+                    "SELECT user_id FROM sessions WHERE token=$1",
+                    &[body(&done)["access_token"].as_str().unwrap()]
+                )
+                .await?
+                .as_deref(),
+                Some(owner_id.as_str())
+            );
+            assert_eq!(rows(&db, code).await?, 0);
+            _ = call(&auth, poll, 400).await;
+        }
+    }
+    let after = db.tables(&["users", "accounts", "sessions"]).await?;
+    for (before, now) in baseline.iter().zip(after.iter()) {
+        let before: Vec<Value> = serde_json::from_str(before)?;
+        let now: Vec<Value> = serde_json::from_str(now)?;
+        assert!(before.iter().all(|r| now.contains(r)));
+    }
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
 }
