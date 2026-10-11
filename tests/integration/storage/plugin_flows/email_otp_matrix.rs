@@ -12,7 +12,8 @@ backend_tests!(
     email_otp_issuance_and_request_validation,
     email_otp_change_email_policy,
     email_otp_hooks_and_reset_edges,
-    email_otp_configured_quota_blocks_delivery_and_resets_at_configured_window
+    email_otp_configured_quota_blocks_delivery_and_resets_at_configured_window,
+    verification_otp_creation_veto
 );
 
 #[derive(Default)]
@@ -417,5 +418,105 @@ async fn email_otp_configured_quota_blocks_delivery_and_resets_at_configured_win
     assert_eq!(outbox.0.lock().unwrap().len(), 3);
     assert_eq!(db.count("verifications").await?, 3);
     assert_eq!(db.count("sessions").await?, 0);
+    B::close(connection).await
+}
+
+async fn verification_otp_creation_veto<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{
+        CacheAdapter, DatabaseHookContext, DatabaseHooks, HookControl, MemoryCacheAdapter,
+    };
+    use alibi::verification::{
+        VerificationCreation, VerificationIdentifierStrategy, VerificationSnapshot,
+    };
+
+    #[derive(Clone)]
+    struct Hook(Arc<Mutex<Vec<Value>>>);
+    #[async_trait::async_trait]
+    impl<S: AuthSchema, H: alibi::store::HookBackend> DatabaseHooks<S, H> for Hook {
+        async fn before_create_verification_record(
+            &self,
+            c: &mut VerificationCreation,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<HookControl> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(json!({"stage":"before","value":c.value,"identifier":c.identifier}));
+            Ok(HookControl::Cancel)
+        }
+        async fn after_create_verification_record(
+            &self,
+            _: &VerificationSnapshot,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<()> {
+            panic!("vetoed creation must not run after hook")
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let cache = Arc::new(MemoryCacheAdapter::new());
+    let hook = Hook(Arc::new(Mutex::new(Vec::new())));
+    let mailbox = Arc::new(Mailbox::default());
+    let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    config.verification.secondary_storage = Some(cache.clone());
+    config.verification.store_in_database = false;
+    config.verification.store_identifier.default = VerificationIdentifierStrategy::Hashed;
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::hook(
+            B::store(Arc::new(config), &connection),
+            hook.clone(),
+        ))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(plugin(&mailbox, EmailOtpConfig::default()))
+        .build()
+        .await?;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let before = db
+        .tables(&["users", "accounts", "sessions", "verifications"])
+        .await?;
+    _ = call(
+        &auth,
+        request(
+            "/email-otp/send-verification-otp",
+            Some(json!({"email":"veto@example.test","type":"sign-in"})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(mailbox.0.lock().unwrap().len(), 1);
+    let delivered = mailbox.take();
+    let events = hook.0.lock().unwrap().clone();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["value"], format!("{}:0", delivered.otp));
+    let key = format!("verification:{}", events[0]["identifier"].as_str().unwrap());
+    assert!(cache.get(&key).await?.is_none());
+    assert_eq!(
+        db.tables(&["users", "accounts", "sessions", "verifications"])
+            .await?,
+        before
+    );
+    for _ in 0..2 {
+        let denied = call(
+            &auth,
+            request(
+                "/sign-in/email-otp",
+                Some(json!({"email":"veto@example.test","otp":delivered.otp})),
+                "",
+            ),
+            400,
+        )
+        .await;
+        assert_eq!(body(&denied)["code"], "INVALID_OTP");
+        assert!(denied.headers.get_all("set-cookie").next().is_none());
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions", "verifications"])
+                .await?,
+            before
+        );
+    }
+    assert_eq!(hook.0.lock().unwrap().len(), 1);
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
 }
