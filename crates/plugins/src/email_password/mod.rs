@@ -381,7 +381,7 @@ pub(crate) async fn sign_up_core<S: alibi_core::AuthSchema>(
                 .hash_password(config.password_hasher.as_ref(), &body.password)
                 .await?;
             signup::notify_existing(ctx.user_view(&user), request, config, ctx).await?;
-            return signup::synthetic_response(body, config, ctx);
+            return signup::synthetic_response(body, &additional_fields, config, ctx);
         }
         // TS returns 422 UNPROCESSABLE_ENTITY for duplicate email
         return Err(AuthError::UnprocessableEntity(
@@ -397,6 +397,7 @@ pub(crate) async fn sign_up_core<S: alibi_core::AuthSchema>(
         .with_email(&body.email)
         .with_name(&body.name);
     create_user.image = body.image.clone();
+    let duplicate_fields = additional_fields.clone();
     create_user.additional_fields = additional_fields;
     create_user.email_verified = Some(false);
     super::authentication_helpers::apply_creation_input_defaults(ctx, &mut create_user);
@@ -465,6 +466,7 @@ pub(crate) async fn sign_up_core<S: alibi_core::AuthSchema>(
                 Err(error) if error.status_code() == 403 && !auto_sign_in => {
                     return signup::synthetic_response(
                         &duplicate_body,
+                        &duplicate_fields,
                         &duplicate_config,
                         &signup_context,
                     );
