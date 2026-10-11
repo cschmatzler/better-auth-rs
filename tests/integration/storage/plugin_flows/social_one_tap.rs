@@ -11,7 +11,8 @@ use alibi::{AccountConfig, AuthResult};
 backend_tests!(
     one_tap_token_admission_matrix,
     one_tap_identity_outcomes,
-    one_tap_account_cookie_and_remember_state
+    one_tap_account_cookie_and_remember_state,
+    one_tap_signed_credentials_persist_and_forward_by_account_policy
 );
 
 struct DenyList;
@@ -484,5 +485,124 @@ async fn one_tap_account_cookie_and_remember_state<B: Backend>(db: Db) -> TestRe
                 && !header.contains("Max-Age=0"))
     );
     trace.assert("social/one-tap-cookies");
+    B::close(connection).await
+}
+
+async fn one_tap_signed_credentials_persist_and_forward_by_account_policy<B: Backend>(
+    db: Db,
+) -> TestResult {
+    fn runtime<B: Backend>(
+        connection: &B::Connection,
+        account: AccountConfig,
+        one_tap: OneTapConfig,
+        google: Option<OAuthProvider>,
+    ) -> AuthBuilder<B::Schema> {
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN).account(account);
+        let mut b = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(OneTapPlugin::with_config(one_tap));
+        if let Some(g) = google {
+            b = b.plugin(OAuthPlugin::new().add_provider("google", g));
+        }
+        b
+    }
+
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let remote = Tap::start().await;
+    let account = AccountConfig {
+        encrypt_oauth_tokens: true,
+        store_account_cookie: true,
+        ..Default::default()
+    };
+    let auth = runtime::<B>(
+        &connection,
+        account.clone(),
+        remote.config(Some(OneTapClientId::Single("tap-client".into())), false),
+        None,
+    )
+    .build()
+    .await?;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let before = db.tables(&["users", "accounts", "sessions"]).await?;
+    let old = token(json!({"nonce":"original-credential"}));
+    let new = token(json!({"nonce":"replacement-credential","name":"Unadopted Profile"}));
+    assert_ne!(old, new);
+    let created = call(
+        &auth,
+        request("/one-tap/callback", Some(json!({"idToken":old})), ""),
+        200,
+    )
+    .await;
+    let id = body(&created)["user"]["id"].as_str().unwrap().to_owned();
+    let account_id = db
+        .text("SELECT id FROM accounts WHERE provider_id='google'", &[])
+        .await?
+        .unwrap();
+    assert_eq!(
+        db.text("SELECT id_token FROM accounts WHERE id=$1", &[&account_id])
+            .await?
+            .as_deref(),
+        Some(old.as_str())
+    );
+    assert_eq!(
+        db.text("SELECT scope FROM accounts WHERE id=$1", &[&account_id])
+            .await?
+            .as_deref(),
+        Some("openid,profile,email")
+    );
+    for update in [false, true] {
+        let mut policy = account.clone();
+        policy.update_account_on_sign_in = update;
+        let runtime = runtime::<B>(
+            &connection,
+            policy,
+            remote.config(Some(OneTapClientId::Single("tap-client".into())), false),
+            None,
+        )
+        .build()
+        .await?;
+        let prior = db.table("accounts").await?;
+        let returned = call(
+            &runtime,
+            request("/one-tap/callback", Some(json!({"idToken":new})), ""),
+            200,
+        )
+        .await;
+        let expected = if update { new.as_str() } else { old.as_str() };
+        assert_eq!(
+            db.text("SELECT id_token FROM accounts WHERE id=$1", &[&account_id])
+                .await?
+                .as_deref(),
+            Some(expected)
+        );
+        if !update {
+            assert_eq!(db.table("accounts").await?, prior);
+        }
+        let value = cookies(&returned)
+            .split("; ")
+            .find_map(|p| {
+                p.strip_prefix("better-auth.account_data=")
+                    .map(str::to_owned)
+            })
+            .unwrap();
+        let decoded = alibi::utils::jwe::decode(SECRET, "better-auth-account", &value)?;
+        assert_eq!(decoded["id"], account_id);
+        assert_eq!(decoded["userId"], id);
+        assert_eq!(decoded["providerId"], "google");
+        assert_eq!(decoded["idToken"], expected);
+        assert_eq!(decoded["scope"], "openid,profile,email");
+        assert_eq!(body(&returned)["user"]["id"], id);
+        authenticated(&runtime, &cookies(&returned), "tap@example.test").await;
+    }
+    let after = db.tables(&["users", "accounts", "sessions"]).await?;
+    for (before, now) in before.iter().zip(after.iter()) {
+        let before: Vec<Value> = serde_json::from_str(before)?;
+        let now: Vec<Value> = serde_json::from_str(now)?;
+        assert!(before.iter().all(|r| now.contains(r)));
+    }
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
 }
