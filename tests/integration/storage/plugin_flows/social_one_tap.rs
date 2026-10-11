@@ -13,7 +13,8 @@ backend_tests!(
     one_tap_identity_outcomes,
     one_tap_account_cookie_and_remember_state,
     one_tap_callback_rejection_before_jwks,
-    one_tap_client_id_array_authority
+    one_tap_client_id_array_authority,
+    one_tap_enabled_two_factor_session
 );
 
 struct DenyList;
@@ -645,5 +646,94 @@ async fn one_tap_client_id_array_authority<B: Backend>(db: Db) -> TestResult {
     assert_eq!(db.count("users").await?, 1);
     assert_eq!(db.count("accounts").await?, 1);
     assert_eq!(db.count("sessions").await?, 2);
+    B::close(connection).await
+}
+
+async fn one_tap_enabled_two_factor_session<B: Backend>(db: Db) -> TestResult {
+    fn runtime<B: Backend>(
+        connection: &B::Connection,
+        account: AccountConfig,
+        one_tap: OneTapConfig,
+        google: Option<OAuthProvider>,
+    ) -> AuthBuilder<B::Schema> {
+        let config = AuthConfig::new(SECRET).base_url(ORIGIN).account(account);
+        let mut b = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(OneTapPlugin::with_config(one_tap));
+        if let Some(g) = google {
+            b = b.plugin(OAuthPlugin::new().add_provider("google", g));
+        }
+        b
+    }
+
+    use alibi::plugins::TwoFactorPlugin;
+    use alibi::plugins::two_factor::TwoFactorConfig;
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let remote = Tap::start().await;
+    let mut account = AccountConfig::default();
+    account.account_linking.require_local_email_verified = false;
+    let auth = runtime::<B>(
+        &connection,
+        account,
+        remote.config(Some(OneTapClientId::Single("tap-client".into())), false),
+        None,
+    )
+    .plugin(TwoFactorPlugin::with_config(TwoFactorConfig {
+        skip_verification_on_enable: true,
+        ..Default::default()
+    }))
+    .build()
+    .await?;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let baseline = db.tables(&["users", "accounts", "sessions"]).await?;
+    let owner = signup(&auth, "tap@example.test").await;
+    let linked = tap(&auth, json!({}), &cookies(&owner)).await;
+    assert_eq!(linked.status, 200);
+    assert_eq!(body(&linked)["user"]["id"], body(&owner)["user"]["id"]);
+    let enabled = call(
+        &auth,
+        request(
+            "/two-factor/enable",
+            Some(json!({"password":PASSWORD})),
+            &cookies(&linked),
+        ),
+        200,
+    )
+    .await;
+    let factor = body(&enabled);
+    assert!(!factor["totpURI"].as_str().unwrap().is_empty());
+    assert_eq!(db.count("two_factor").await?, 1);
+    _ = call(
+        &auth,
+        request("/sign-out", Some(json!({})), &cookies(&enabled)),
+        200,
+    )
+    .await;
+    let sessions_before = db.count("sessions").await?;
+    let done = tap(&auth, json!({}), "").await;
+    assert_eq!(done.status, 200);
+    assert_eq!(body(&done)["user"]["id"], body(&owner)["user"]["id"]);
+    assert_eq!(body(&done)["user"]["twoFactorEnabled"], true);
+    assert!(body(&done).get("twoFactorRedirect").is_none());
+    assert!(
+        !done
+            .headers
+            .get_all("set-cookie")
+            .any(|r| r.starts_with("better-auth.two_factor="))
+    );
+    assert_eq!(db.count("verifications").await?, 0);
+    assert_eq!(db.count("sessions").await?, sessions_before + 1);
+    let current = body(&call(&auth, request("/get-session", None, &cookies(&done)), 200).await);
+    assert_eq!(current["session"]["token"], body(&done)["token"]);
+    let after = db.tables(&["users", "accounts", "sessions"]).await?;
+    for (before, now) in baseline.iter().zip(after.iter()) {
+        let before: Vec<Value> = serde_json::from_str(before)?;
+        let now: Vec<Value> = serde_json::from_str(now)?;
+        assert!(before.iter().all(|r| now.contains(r)));
+    }
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
 }
