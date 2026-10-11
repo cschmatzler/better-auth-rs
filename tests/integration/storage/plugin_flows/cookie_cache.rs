@@ -23,7 +23,8 @@ backend_tests!(
     managed_jwt_signer_issues_and_verifies_cache_tokens,
     update_user_refreshes_the_cache_and_invalid_sessions_clear_every_cookie_family,
     pending_factor_challenge_clears_cache_cookies_including_incoming_chunks,
-    published_snapshot_exposes_public_views_to_response_hooks
+    published_snapshot_exposes_public_views_to_response_hooks,
+    factor_ordinary_cache_survives_revocation_while_disable_requires_physical_browser
 );
 postgres_tests!(
     every_strategy_serves_reads_from_the_cookie_and_rejects_tampering,
@@ -483,4 +484,162 @@ async fn published_snapshot_exposes_public_views_to_response_hooks<B: Backend>(
     assert_eq!(seen[0]["email"], "observer@example.test");
     assert_eq!(seen[0]["token"], body(&issued)["token"]);
     Ok(())
+}
+
+async fn factor_ordinary_cache_survives_revocation_while_disable_requires_physical_browser<
+    B: Backend,
+>(
+    db: Db,
+) -> TestResult {
+    fn fast_cached<B: Backend>(
+        connection: &B::Connection,
+        strategy: CookieCacheStrategy,
+        tweak: impl FnOnce(&mut AuthConfig),
+    ) -> AuthBuilder<B::Schema> {
+        let mut config = AuthConfig::new(SECRET)
+            .base_url(ORIGIN)
+            .session_cookie_cache(CookieCacheConfig {
+                enabled: true,
+                strategy,
+                ..Default::default()
+            });
+        tweak(&mut config);
+        AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+    }
+
+    use alibi::plugins::two_factor::{SendTwoFactorOtp, TwoFactorConfig};
+    use alibi::wire::UserView;
+    struct Delivery(Mutex<Option<String>>);
+    #[async_trait]
+    impl SendTwoFactorOtp for Delivery {
+        async fn send(&self, _: &UserView, otp: &str) -> AuthResult<()> {
+            *self.0.lock().unwrap() = Some(otp.into());
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let delivery = Arc::new(Delivery(Mutex::new(None)));
+    let auth = fast_cached::<B>(&connection, CookieCacheStrategy::Compact, |_| {})
+        .plugin(TwoFactorPlugin::with_config(TwoFactorConfig {
+            send_otp: Some(delivery.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let baseline = db.tables(&["users", "accounts", "sessions"]).await?;
+    let owner = signup(&auth, "owner@example.test").await;
+    let id = body(&owner)["user"]["id"].as_str().unwrap().to_owned();
+    let old = body(&owner)["token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        db.execute("DELETE FROM sessions WHERE token=$1", &[&old])
+            .await?,
+        1
+    );
+    let enabled = call(
+        &auth,
+        request(
+            "/two-factor/enable",
+            Some(json!({"password":PASSWORD,"method":"otp"})),
+            &cookies(&owner),
+        ),
+        200,
+    )
+    .await;
+    let jar = cookies(&enabled);
+    let current = body(&call(&auth, request("/get-session", None, &jar), 200).await);
+    let replacement = current["session"]["token"].as_str().unwrap();
+    assert_ne!(replacement, old);
+    assert_eq!(current["user"]["twoFactorEnabled"], true);
+    assert_eq!(
+        db.execute("DELETE FROM sessions WHERE token=$1", &[replacement])
+            .await?,
+        1
+    );
+    _ = call(
+        &auth,
+        request("/two-factor/send-otp", Some(json!({})), &jar),
+        200,
+    )
+    .await;
+    let otp = delivery.0.lock().unwrap().clone().unwrap();
+    let verified = call(
+        &auth,
+        request("/two-factor/verify-otp", Some(json!({"code":otp})), &jar),
+        200,
+    )
+    .await;
+    assert_eq!(body(&verified)["token"], replacement);
+    assert_eq!(body(&verified)["user"]["id"], id);
+    assert_eq!(
+        db.count_where("SELECT COUNT(*) FROM sessions WHERE user_id=$1", &[&id])
+            .await?,
+        0
+    );
+    let after = db
+        .tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "two_factor",
+            "verifications",
+        ])
+        .await?;
+    _ = call(
+        &auth,
+        request(
+            "/two-factor/disable",
+            Some(json!({"password":PASSWORD})),
+            &jar,
+        ),
+        401,
+    )
+    .await;
+    assert_eq!(
+        db.tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "two_factor",
+            "verifications"
+        ])
+        .await?,
+        after
+    );
+    assert_eq!(
+        db.count_where(
+            "SELECT COUNT(*) FROM users WHERE id=$1 AND two_factor_enabled=true",
+            &[&id]
+        )
+        .await?,
+        1
+    );
+    _ = call(
+        &auth,
+        request("/two-factor/verify-otp", Some(json!({"code":otp})), &jar),
+        400,
+    )
+    .await;
+    assert_eq!(
+        db.tables(&[
+            "users",
+            "accounts",
+            "sessions",
+            "two_factor",
+            "verifications"
+        ])
+        .await?,
+        after
+    );
+    for (before, now) in baseline.iter().zip(after.iter()) {
+        let before: Vec<Value> = serde_json::from_str(before)?;
+        let now: Vec<Value> = serde_json::from_str(now)?;
+        assert!(before.iter().all(|x| now.contains(x)));
+    }
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
+    B::close(connection).await
 }
