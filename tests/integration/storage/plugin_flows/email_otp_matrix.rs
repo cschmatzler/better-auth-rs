@@ -14,7 +14,8 @@ backend_tests!(
     email_otp_hooks_and_reset_edges,
     email_otp_configured_quota_blocks_delivery_and_resets_at_configured_window,
     disabled_email_change_preserves_live_proofs_for_enabled_instance,
-    after_email_change_rejection_retains_verified_owner_and_consumed_proof
+    after_email_change_rejection_retains_verified_owner_and_consumed_proof,
+    verification_otp_transformed_owner
 );
 
 #[derive(Default)]
@@ -663,6 +664,135 @@ async fn after_email_change_rejection_retains_verified_owner_and_consumed_proof<
         )
         .await;
         assert_eq!(db.tables(&["accounts", "sessions"]).await?, protected);
+        B::close(connection).await?;
+    }
+    Ok(())
+}
+
+async fn verification_otp_transformed_owner<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{CacheAdapter, MemoryCacheAdapter};
+    use alibi::verification::{VerificationIdentifierHasher, VerificationIdentifierStrategy};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest as _, Sha256};
+    struct Transform;
+    #[async_trait::async_trait]
+    impl VerificationIdentifierHasher for Transform {
+        async fn hash(&self, s: &str) -> AuthResult<String> {
+            Ok(format!("application:{s}"))
+        }
+    }
+    for (custom, physical) in [(false, false), (false, true), (true, false), (true, true)] {
+        let db = db.fresh().await?;
+        let (connection, _) = db.migrated::<B>(SECRET).await?;
+        let cache = Arc::new(MemoryCacheAdapter::new());
+        let mailbox = Arc::new(Mailbox::default());
+        let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+        config.verification.store_identifier.default = if custom {
+            VerificationIdentifierStrategy::Custom(Arc::new(Transform))
+        } else {
+            VerificationIdentifierStrategy::Hashed
+        };
+        config.verification.secondary_storage = Some(cache.clone());
+        config.verification.store_in_database = physical;
+        let auth = AuthBuilder::new(config.clone())
+            .store(B::store(Arc::new(config), &connection))
+            .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+            .plugin(super::auth_probe::fast_password())
+            .plugin(SessionManagementPlugin::new())
+            .plugin(plugin(&mailbox, EmailOtpConfig::default()))
+            .build()
+            .await?;
+        let foreign = signup(&auth, "foreign@example.test").await;
+        let baseline = db.tables(&["users", "accounts", "sessions"]).await?;
+        let email = "new@example.test";
+        let logical = format!("sign-in-otp-{email}");
+        let stored = if custom {
+            format!("application:{logical}")
+        } else {
+            URL_SAFE_NO_PAD.encode(Sha256::digest(logical.as_bytes()))
+        };
+        let key = format!("verification:{stored}");
+        _ = call(
+            &auth,
+            request(
+                "/email-otp/send-verification-otp",
+                Some(json!({"email":email,"type":"sign-in"})),
+                "",
+            ),
+            200,
+        )
+        .await;
+        let delivered = mailbox.take();
+        assert_eq!(delivered.email, email);
+        let initial: Value = serde_json::from_str(&cache.get(&key).await?.unwrap())?;
+        assert_eq!(initial["identifier"], stored);
+        assert_eq!(initial["value"], format!("{}:0", delivered.otp));
+        assert_eq!(db.count("verifications").await?, i64::from(physical));
+        for (route, target) in [
+            ("/sign-in/email-otp", "foreign-mailbox@example.test"),
+            ("/email-otp/verify-email", email),
+        ] {
+            let denied = call(
+                &auth,
+                request(route, Some(json!({"email":target,"otp":delivered.otp})), ""),
+                400,
+            )
+            .await;
+            assert_eq!(body(&denied)["code"], "INVALID_OTP");
+            assert_eq!(
+                serde_json::from_str::<Value>(&cache.get(&key).await?.unwrap())?,
+                initial
+            );
+        }
+        let wrong = call(
+            &auth,
+            request(
+                "/sign-in/email-otp",
+                Some(json!({"email":email,"otp":"wrong"})),
+                "",
+            ),
+            400,
+        )
+        .await;
+        assert_eq!(body(&wrong)["code"], "INVALID_OTP");
+        let retry: Value = serde_json::from_str(&cache.get(&key).await?.unwrap())?;
+        assert_eq!(retry["value"], format!("{}:1", delivered.otp));
+        assert_eq!(retry["expiresAt"], initial["expiresAt"]);
+        let done = call(
+            &auth,
+            request(
+                "/sign-in/email-otp",
+                Some(json!({"email":email,"otp":delivered.otp,"name":"Actual Proof Owner"})),
+                "",
+            ),
+            200,
+        )
+        .await;
+        assert_eq!(body(&done)["user"]["emailVerified"], true);
+        let current = body(&call(&auth, request("/get-session", None, &cookies(&done)), 200).await);
+        assert_eq!(current["user"]["id"], body(&done)["user"]["id"]);
+        assert_eq!(current["session"]["token"], body(&done)["token"]);
+        assert!(cache.get(&key).await?.is_none());
+        assert_eq!(db.count("verifications").await?, 0);
+        let after = db.tables(&["users", "accounts", "sessions"]).await?;
+        let replay = call(
+            &auth,
+            request(
+                "/sign-in/email-otp",
+                Some(json!({"email":email,"otp":delivered.otp})),
+                "",
+            ),
+            400,
+        )
+        .await;
+        assert_eq!(body(&replay)["code"], "INVALID_OTP");
+        assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, after);
+        for (before, now) in baseline.iter().zip(after.iter()) {
+            let before: Vec<Value> = serde_json::from_str(before)?;
+            let now: Vec<Value> = serde_json::from_str(now)?;
+            assert!(before.iter().all(|r| now.contains(r)));
+        }
+        authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
         B::close(connection).await?;
     }
     Ok(())
