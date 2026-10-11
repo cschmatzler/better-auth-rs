@@ -8,6 +8,14 @@ import { hashPassword, verifyPassword } from "better-auth/crypto";
 import { emailOTP, phoneNumber, username } from "better-auth/plugins";
 
 export function createSignupPolicyFixture(database: Database, shared: BetterAuthOptions) {
+  for (const column of [
+    "synthetic_tier",
+    "synthetic_secret",
+    "synthetic_locale",
+    "synthetic_note",
+  ]) {
+    database.run(`ALTER TABLE "user" ADD COLUMN ${column} TEXT`);
+  }
   const events: Record<string, unknown>[] = [];
   let mode = "normal";
   let releaseExisting: (() => void) | undefined;
@@ -20,6 +28,10 @@ export function createSignupPolicyFixture(database: Database, shared: BetterAuth
     "signup-no-auto",
     "signup-required",
     "signup-custom",
+    "signup-synthetic-fields",
+    "signup-synthetic-fields-custom",
+    "signup-synthetic-id",
+    "signup-synthetic-id-custom",
     "signup-policy",
     "signup-zero-policy",
     "signup-username",
@@ -45,6 +57,10 @@ export function createSignupPolicyFixture(database: Database, shared: BetterAuth
     const autoSignIn = ![
       "signup-no-auto",
       "signup-custom",
+      "signup-synthetic-fields",
+      "signup-synthetic-fields-custom",
+      "signup-synthetic-id",
+      "signup-synthetic-id-custom",
       "signup-username",
       "signup-background",
     ].includes(name);
@@ -52,6 +68,43 @@ export function createSignupPolicyFixture(database: Database, shared: BetterAuth
       ...shared,
       database,
       basePath,
+      ...(name.startsWith("signup-synthetic-fields")
+        ? {
+            user: {
+              ...shared.user,
+              additionalFields: {
+                syntheticTier: {
+                  type: "string" as const,
+                  fieldName: "synthetic_tier",
+                  validator: {
+                    input: {
+                      "~standard": {
+                        version: 1 as const,
+                        vendor: "synthetic-fixture",
+                        validate(value: unknown) {
+                          return typeof value === "string"
+                            ? { value: `parsed:${value.trim().toLowerCase()}` }
+                            : { issues: [{ message: "tier must be a string" }] };
+                        },
+                      },
+                    },
+                  },
+                },
+                syntheticSecret: {
+                  type: "string" as const,
+                  fieldName: "synthetic_secret",
+                  returned: false,
+                },
+                syntheticLocale: {
+                  type: "string" as const,
+                  fieldName: "synthetic_locale",
+                  defaultValue: "en",
+                },
+                syntheticNote: { type: "string" as const, fieldName: "synthetic_note" },
+              },
+            },
+          }
+        : {}),
       databaseHooks: {
         user: {
           create: {
@@ -195,6 +248,17 @@ export function createSignupPolicyFixture(database: Database, shared: BetterAuth
       ],
       advanced: {
         ...shared.advanced,
+        ...(name.startsWith("signup-synthetic-id")
+          ? {
+              database: {
+                generateId({ model, size }) {
+                  events.push({ stage: "id-generation", model, size: size ?? null });
+                  if (mode === "id-error") throw new Error("application ID failed");
+                  return "synthetic_application_1";
+                },
+              },
+            }
+          : {}),
         ...(name === "signup-background"
           ? {
               backgroundTasks: {
@@ -268,6 +332,9 @@ export function createSignupPolicyFixture(database: Database, shared: BetterAuth
           },
         },
         async onExistingUserSignUp({ user }, request) {
+          if (name.startsWith("signup-synthetic-fields")) {
+            return;
+          }
           events.push({
             stage: "existing-user",
             user,
@@ -300,7 +367,11 @@ export function createSignupPolicyFixture(database: Database, shared: BetterAuth
 
           events.push({ stage: "existing-complete" });
         },
-        ...(name === "signup-custom"
+        ...([
+          "signup-custom",
+          "signup-synthetic-id-custom",
+          "signup-synthetic-fields-custom",
+        ].includes(name)
           ? {
               customSyntheticUser({ coreFields, additionalFields, id }) {
                 events.push({ stage: "synthetic-user", coreFields, additionalFields, id });
@@ -316,6 +387,18 @@ export function createSignupPolicyFixture(database: Database, shared: BetterAuth
                   });
                 }
 
+                if (name === "signup-synthetic-id-custom") return { ...coreFields, id };
+                if (name === "signup-synthetic-fields-custom") {
+                  return {
+                    ...coreFields,
+                    id,
+                    ...(typeof additionalFields.syntheticTier === "string"
+                      ? { syntheticTier: `custom:${additionalFields.syntheticTier}` }
+                      : {}),
+                    syntheticSecret: "custom-private",
+                    unknownApplication: "must-not-escape",
+                  };
+                }
                 return {
                   ...coreFields,
                   id,
@@ -379,6 +462,15 @@ export function createSignupPolicyFixture(database: Database, shared: BetterAuth
     profiles,
     async handle(request: Request): Promise<Response | undefined> {
       const url = new URL(request.url);
+      if (url.pathname === "/__test/signup-policy/synthetic-fields") {
+        return Response.json({
+          users: database
+            .query(
+              'SELECT id, synthetic_tier AS syntheticTier, synthetic_secret AS syntheticSecret, synthetic_locale AS syntheticLocale, synthetic_note AS syntheticNote FROM "user" ORDER BY "createdAt", id',
+            )
+            .all(),
+        });
+      }
 
       if (url.pathname === "/__test/signup-policy/state") {
         const profile = profiles.get(url.searchParams.get("profile") ?? "signup-standard");
