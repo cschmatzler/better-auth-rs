@@ -3,8 +3,7 @@ use crate::TestSchema;
 use alibi::integrations::axum::AxumIntegration;
 use alibi::middleware::RateLimitConfig;
 use alibi::plugins::api_key::{
-    ApiKeyConfig, ApiKeyErrorCode, ApiKeyGenerationOptions, ApiKeyGenerator,
-    ApiKeyVerificationError, RateLimitDefaults, VerifyApiKey,
+    ApiKeyConfig, ApiKeyGenerationOptions, ApiKeyGenerator, RateLimitDefaults,
 };
 use alibi::plugins::{ApiKeyPlugin, EmailPasswordPlugin, SessionManagementPlugin};
 use alibi::seaorm::sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
@@ -390,35 +389,29 @@ pub(crate) async fn router(base: &AuthConfig, database: DatabaseConnection) -> A
             move |Query(query): Query<Profile>, Json(input): Json<Verify>| {
                 let profiles = profiles.clone();
                 async move {
-                    let (auth, plugin) = profiles.get(&query.profile).unwrap();
-                    match plugin
-                        .verify_api_key(
-                            &VerifyApiKey {
-                                key: &input.key,
-                                config_id: None,
-                                permissions: input.permissions.as_ref(),
-                            },
-                            auth.context(),
-                        )
-                        .await
-                    {
-                        Ok(key) => {
-                            Json(json!({"valid":true,"error":null,"key":key})).into_response()
-                        }
-                        Err(error) => {
-                            let body = match error {
-                                ApiKeyVerificationError::Validation(error) => serde_json::to_value(error).unwrap(),
-                                ApiKeyVerificationError::Internal(AuthError::Api {code,message,..}) => {
-                                    let mut body=json!({"message":message});
-                                    if let Some(code)=code {body["code"]=json!(code);}
-                                    body
-                                },
-                                ApiKeyVerificationError::Internal(AuthError::Upstream {code,message,..}) => json!({"code":code,"message":message}),
-                                ApiKeyVerificationError::Internal(_) | ApiKeyVerificationError::ExplicitValidator(_) => json!({"code":ApiKeyErrorCode::InvalidApiKey,"message":{"code":ApiKeyErrorCode::InvalidApiKey,"message":ApiKeyErrorCode::InvalidApiKey.message()}}),
-                            };
-                            Json(json!({"valid":false,"error":body,"key":null})).into_response()
+                    let (auth, _) = profiles.get(&query.profile).unwrap();
+                    let endpoint = ApiKeyPlugin::verify_endpoint(
+                        &alibi::plugins::api_key::ApiKeyVerificationInput {
+                            key: input.key,
+                            config_id: None,
+                            permissions: input
+                                .permissions
+                                .map(serde_json::from_value)
+                                .transpose()
+                                .unwrap(),
                         },
-                    }
+                    )
+                    .unwrap();
+                    let response =
+                        Box::pin(auth.dispatch_endpoint(
+                            endpoint,
+                            alibi::endpoint::EndpointOptions::default(),
+                        ))
+                        .await
+                        .unwrap();
+                    let result = response.decode().unwrap();
+                    Json(json!({"valid":result.valid,"error":result.error,"key":result.key}))
+                        .into_response()
                 }
             },
         ),
