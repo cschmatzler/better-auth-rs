@@ -31,7 +31,8 @@ backend_tests!(
     two_factor_trust_syntax_before_cleanup,
     two_factor_trust_lookup_cleanup_policy,
     two_factor_trust_ignored_components,
-    two_factor_factor_cookie_wire_aliases
+    two_factor_factor_cookie_wire_aliases,
+    two_factor_factory_headers_do_not_retime_actual_proofs
 );
 
 #[derive(Default)]
@@ -2879,4 +2880,153 @@ async fn two_factor_factor_cookie_wire_aliases<B: Backend>(db: Db) -> TestResult
         B::close(connection).await?;
     }
     Ok(())
+}
+
+async fn two_factor_factory_headers_do_not_retime_actual_proofs<B: Backend>(db: Db) -> TestResult {
+    use alibi::SameSite;
+    use alibi::{AuthVerification, CookieAttributes, CookieOverride};
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let outbox = Arc::new(Outbox::default());
+    let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    let explicit = chrono::Utc::now() + chrono::Duration::days(1);
+    for (name, age) in [("two_factor", 121.9), ("trust_device", 321.9)] {
+        _ = config.advanced.cookies.insert(
+            name.into(),
+            CookieOverride {
+                attributes: CookieAttributes {
+                    max_age: Some(age),
+                    path: Some("/api/auth".into()),
+                    domain: Some("localhost".into()),
+                    secure: Some(true),
+                    http_only: Some(true),
+                    same_site: Some(SameSite::Strict),
+                    partitioned: Some(true),
+                    expires: Some(explicit),
+                },
+                ..Default::default()
+            },
+        );
+    }
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::store(Arc::new(config), &connection))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(alibi::plugins::SessionManagementPlugin::new())
+        .plugin(TwoFactorPlugin::with_config(TwoFactorConfig {
+            skip_verification_on_enable: true,
+            send_otp: Some(outbox.clone()),
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let signed = signup(&auth, "factory-proof@example.test").await;
+    let foreign = signup(&auth, "factory-foreign@example.test").await;
+    let id = body(&signed)["user"]["id"].as_str().unwrap().to_owned();
+    let _ = call(
+        &auth,
+        request(
+            "/two-factor/enable",
+            Some(json!({"password":PASSWORD,"method":"otp"})),
+            &cookies(&signed),
+        ),
+        200,
+    )
+    .await;
+    let from = chrono::Utc::now().timestamp_millis();
+    let pending = sign_in(&auth, "factory-proof@example.test", json!({}), "").await;
+    let to = chrono::Utc::now().timestamp_millis();
+    let header = pending
+        .headers
+        .get_all("set-cookie")
+        .find(|h| h.contains(".two_factor="))
+        .unwrap();
+    assert!(header.contains("Max-Age=121;"));
+    assert!(header.contains(&format!(
+        "Expires={}",
+        explicit.format("%a, %d %b %Y %H:%M:%S GMT")
+    )));
+    for attribute in [
+        "Path=/api/auth",
+        "Domain=localhost",
+        "Secure",
+        "HttpOnly",
+        "SameSite=Strict",
+        "Partitioned",
+        "Expires=",
+    ] {
+        assert!(header.contains(attribute), "{header}");
+    }
+    let key = db.text("SELECT identifier FROM verifications WHERE value=$1 AND identifier LIKE '2fa-%' AND identifier NOT LIKE '2fa-attempts-%'",&[&id]).await?.unwrap();
+    let proof = auth
+        .store()
+        .get_latest_verification_by_identifier(&key)
+        .await?
+        .unwrap();
+    let attempts = auth
+        .store()
+        .get_latest_verification_by_identifier(&format!("2fa-attempts-{key}"))
+        .await?
+        .unwrap();
+    assert!((from + 600_000..=to + 600_000).contains(&proof.expires_at().timestamp_millis()));
+    assert_eq!(attempts.expires_at(), proof.expires_at());
+    let _ = call(
+        &auth,
+        request("/two-factor/send-otp", Some(json!({})), &cookies(&pending)),
+        200,
+    )
+    .await;
+    let code = outbox.0.lock().unwrap().last().unwrap().clone();
+    let from = chrono::Utc::now().timestamp_millis();
+    let done = call(
+        &auth,
+        request(
+            "/two-factor/verify-otp",
+            Some(json!({"code":code,"trustDevice":true})),
+            &cookies(&pending),
+        ),
+        200,
+    )
+    .await;
+    let to = chrono::Utc::now().timestamp_millis();
+    let header = done
+        .headers
+        .get_all("set-cookie")
+        .find(|h| h.contains(".trust_device="))
+        .unwrap();
+    assert!(header.contains("Max-Age=321;"));
+    assert!(header.contains(&format!(
+        "Expires={}",
+        explicit.format("%a, %d %b %Y %H:%M:%S GMT")
+    )));
+    for attribute in [
+        "Path=/api/auth",
+        "Domain=localhost",
+        "Secure",
+        "HttpOnly",
+        "SameSite=Strict",
+        "Partitioned",
+        "Expires=",
+    ] {
+        assert!(header.contains(attribute), "{header}");
+    }
+    let key = db.text("SELECT identifier FROM verifications WHERE identifier LIKE 'trust-device-%' AND value=$1",&[&id]).await?.unwrap();
+    let trust = auth
+        .store()
+        .get_latest_verification_by_identifier(&key)
+        .await?
+        .unwrap();
+    assert!(
+        (from + 2_592_000_000..=to + 2_592_000_000)
+            .contains(&trust.expires_at().timestamp_millis())
+    );
+    assert!(
+        auth.store()
+            .get_latest_verification_by_identifier(proof.identifier())
+            .await?
+            .is_none()
+    );
+    authenticated(&auth, &cookies(&done), "factory-proof@example.test").await;
+    authenticated(&auth, &cookies(&foreign), "factory-foreign@example.test").await;
+    assert_eq!(body(&done)["user"]["id"], id);
+    B::close(connection).await
 }
