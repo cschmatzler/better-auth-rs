@@ -22,7 +22,8 @@ backend_tests!(
     static_org_update_requires_update_action_and_preserves_key_identity,
     static_org_delete_requires_delete_action_and_revokes_only_selected_key,
     disabled_custom_key_expiration_retains_default_lifetime_through_rename,
-    banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_authority
+    banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_authority,
+    api_key_permission_date_projection
 );
 
 fn raw(path: &str, text: &str, cookie: &str) -> AuthRequest {
@@ -1893,5 +1894,147 @@ async fn banned_api_key_owner_can_verify_but_cannot_use_synthetic_deletion_autho
     assert!(!orphan.headers.contains_key("set-cookie"));
     authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     authenticated(&auth, &cookies(&admin), "admin@example.test").await;
+    B::close(connection).await
+}
+
+async fn api_key_permission_date_projection<B: Backend>(db: Db) -> TestResult {
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let auth = super::auth_probe::fast_builder::<B>(&connection)
+        .plugin(ApiKeyPlugin::with_config(ApiKeyConfig {
+            defer_updates: false,
+            rate_limit: RateLimitDefaults {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .build()
+        .await?;
+    let owner = signup(&auth, "permission-date-owner@example.test").await;
+    let foreign = signup(&auth, "permission-date-foreign@example.test").await;
+    let issued = serde_json::to_value(Box::pin(auth.dispatch_endpoint(
+                ApiKeyPlugin::create_endpoint(&serde_json::from_value(json!({"userId":body(&owner)["user"]["id"],"remaining":30,"permissions":{"vault":["read"]}}))?)?,
+                EndpointOptions::default(),
+            )).await?.decode()?)?;
+    let _ = call(
+        &auth,
+        request(
+            "/api-key/create",
+            Some(json!({"name":"Foreign document"})),
+            &cookies(&foreign),
+        ),
+        200,
+    )
+    .await;
+    let id = issued["id"].as_str().unwrap();
+    let secret = issued["key"].as_str().unwrap();
+    let principals = db.tables(&["users", "accounts", "sessions"]).await?;
+    let physical: Vec<Value> = serde_json::from_str(&db.table("api_keys").await?)?;
+    let hash = db
+        .text("SELECT key FROM api_keys WHERE id=$1", &[id])
+        .await?;
+    for (action, canonical) in [
+        ("2025-02-30T03:04:05Z", Some("2025-03-02T03:04:05.000Z")),
+        ("2025-01-02T24:00:00Z", Some("2025-01-03T00:00:00.000Z")),
+        (
+            "2025-01-02T03:04:05.1234567890123456789Z",
+            Some("2025-01-02T03:04:05.123Z"),
+        ),
+        ("9999-12-31T24:00:00Z", Some("+010000-01-01T00:00:00.000Z")),
+        ("0000-01-01T00:00:00Z", Some("0000-01-01T00:00:00.000Z")),
+        ("2025-13-02T03:04:05Z", None),
+        ("2025-01-02T24:00:00.0001Z", None),
+    ] {
+        let document = json!({"vault":[action],"literal":{action:"retained"}}).to_string();
+        _ = db
+            .execute(
+                "UPDATE api_keys SET permissions=$1 WHERE id=$2",
+                &[&document, id],
+            )
+            .await?;
+        let before = db.table("api_keys").await?;
+        let prior = db
+            .count_where(
+                "SELECT CAST(remaining AS INTEGER) FROM api_keys WHERE id=$1",
+                &[id],
+            )
+            .await?;
+        let checked = Box::pin(auth.dispatch_endpoint(
+            ApiKeyPlugin::verify_endpoint(&ApiKeyVerificationInput {
+                key: secret.into(),
+                config_id: Some("default".into()),
+                permissions: Some(serde_json::from_value(json!({"vault":[action]}))?),
+            })?,
+            EndpointOptions::default(),
+        ))
+        .await?
+        .decode()?;
+        assert_eq!(checked.valid, canonical.is_none());
+        if canonical.is_some() {
+            assert!(checked.key.is_none());
+            assert_eq!(
+                serde_json::to_value(checked.error)?["code"],
+                "KEY_NOT_FOUND"
+            );
+            assert_eq!(db.table("api_keys").await?, before);
+        }
+        assert_eq!(
+            db.count_where(
+                "SELECT CAST(remaining AS INTEGER) FROM api_keys WHERE id=$1",
+                &[id]
+            )
+            .await?,
+            prior - i64::from(canonical.is_none())
+        );
+        let unfiltered = Box::pin(auth.dispatch_endpoint(
+            ApiKeyPlugin::verify_endpoint(&ApiKeyVerificationInput {
+                key: secret.into(),
+                config_id: Some("default".into()),
+                permissions: None,
+            })?,
+            EndpointOptions::default(),
+        ))
+        .await?
+        .decode()?;
+        assert!(unfiltered.valid);
+        assert!(unfiltered.error.is_none());
+        assert_eq!(
+            unfiltered.key.unwrap().permissions,
+            Some(json!({"vault":[canonical.unwrap_or(action)],"literal":{action:"retained"}}))
+        );
+        assert_eq!(
+            db.count_where(
+                "SELECT CAST(remaining AS INTEGER) FROM api_keys WHERE id=$1",
+                &[id]
+            )
+            .await?,
+            prior - i64::from(canonical.is_none()) - 1
+        );
+        assert_eq!(
+            db.text("SELECT permissions FROM api_keys WHERE id=$1", &[id])
+                .await?
+                .as_deref(),
+            Some(document.as_str())
+        );
+        assert_eq!(
+            db.text("SELECT key FROM api_keys WHERE id=$1", &[id])
+                .await?,
+            hash
+        );
+        let after: Vec<Value> = serde_json::from_str(&db.table("api_keys").await?)?;
+        for row in physical.iter().filter(|r| r["id"] != id) {
+            assert!(after.contains(row));
+        }
+        assert_eq!(
+            db.tables(&["users", "accounts", "sessions"]).await?,
+            principals
+        );
+    }
+    authenticated(
+        &auth,
+        &cookies(&foreign),
+        "permission-date-foreign@example.test",
+    )
+    .await;
     B::close(connection).await
 }
