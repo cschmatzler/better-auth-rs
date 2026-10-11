@@ -12,7 +12,8 @@ backend_tests!(
     email_otp_issuance_and_request_validation,
     email_otp_change_email_policy,
     email_otp_hooks_and_reset_edges,
-    email_otp_configured_quota_blocks_delivery_and_resets_at_configured_window
+    email_otp_configured_quota_blocks_delivery_and_resets_at_configured_window,
+    verification_otp_creation_retry
 );
 
 #[derive(Default)]
@@ -417,5 +418,134 @@ async fn email_otp_configured_quota_blocks_delivery_and_resets_at_configured_win
     assert_eq!(outbox.0.lock().unwrap().len(), 3);
     assert_eq!(db.count("verifications").await?, 3);
     assert_eq!(db.count("sessions").await?, 0);
+    B::close(connection).await
+}
+
+async fn verification_otp_creation_retry<B: Backend>(db: Db) -> TestResult {
+    use alibi::store::{DatabaseHookContext, DatabaseHooks, HookControl};
+    use alibi::verification::{
+        VerificationCreation, VerificationIdentifierStrategy, VerificationSnapshot,
+    };
+
+    #[derive(Clone)]
+    struct Hook {
+        events: Arc<Mutex<Vec<Value>>>,
+        mailbox: Arc<Mailbox>,
+    }
+    #[async_trait::async_trait]
+    impl<S: AuthSchema, H: alibi::store::HookBackend> DatabaseHooks<S, H> for Hook {
+        async fn before_create_verification_record(
+            &self,
+            c: &mut VerificationCreation,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<HookControl> {
+            assert!(self.mailbox.0.lock().unwrap().is_empty());
+            let mut events = self.events.lock().unwrap();
+            events.push(json!({"stage":"before","identifier":c.identifier,"value":c.value,"expiresAt":c.expires_at}));
+            if events.len() == 1 {
+                Err(AuthError::internal("first creation rejected"))
+            } else {
+                Ok(HookControl::Continue)
+            }
+        }
+        async fn after_create_verification_record(
+            &self,
+            c: &VerificationSnapshot,
+            _: &DatabaseHookContext<'_, H>,
+        ) -> AuthResult<()> {
+            assert!(self.mailbox.0.lock().unwrap().is_empty());
+            self.events
+                .lock()
+                .unwrap()
+                .push(json!({"stage":"after","identifier":c.identifier()?,"value":c.value()?}));
+            Ok(())
+        }
+    }
+    let (connection, _) = db.migrated::<B>(SECRET).await?;
+    let mailbox = Arc::new(Mailbox::default());
+    let hook = Hook {
+        events: Arc::new(Mutex::new(Vec::new())),
+        mailbox: mailbox.clone(),
+    };
+    let mut config = AuthConfig::new(SECRET).base_url(ORIGIN);
+    config.verification.store_identifier.default = VerificationIdentifierStrategy::Hashed;
+    let auth = AuthBuilder::new(config.clone())
+        .store(B::hook(
+            B::store(Arc::new(config), &connection),
+            hook.clone(),
+        ))
+        .rate_limit(alibi::middleware::RateLimitConfig::new().enabled(false))
+        .plugin(super::auth_probe::fast_password())
+        .plugin(SessionManagementPlugin::new())
+        .plugin(plugin(&mailbox, EmailOtpConfig::default()))
+        .build()
+        .await?;
+    let foreign = signup(&auth, "foreign@example.test").await;
+    let baseline = db.tables(&["users", "accounts", "sessions"]).await?;
+    let email = "retry@example.test";
+    _ = call(
+        &auth,
+        request(
+            "/email-otp/send-verification-otp",
+            Some(json!({"email":email,"type":"sign-in"})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(mailbox.0.lock().unwrap().len(), 1);
+    let delivery = mailbox.take();
+    let events = hook.events.lock().unwrap().clone();
+    assert_eq!(events.len(), 3);
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| e["stage"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["before", "before", "after"]
+    );
+    assert_eq!(events[0]["value"], events[1]["value"]);
+    assert_eq!(events[1]["value"], format!("{}:0", delivery.otp));
+    assert_eq!(events[0]["identifier"], events[1]["identifier"]);
+    assert!(events[1]["expiresAt"].as_str().unwrap() >= events[0]["expiresAt"].as_str().unwrap());
+    assert_eq!(db.count("verifications").await?, 1);
+    let proof = auth
+        .context()
+        .verifications()
+        .find(&format!("sign-in-otp-{email}"))
+        .await?
+        .unwrap();
+    assert_eq!(proof.value()?, format!("{}:0", delivery.otp));
+    let done = call(
+        &auth,
+        request(
+            "/sign-in/email-otp",
+            Some(json!({"email":email,"otp":delivery.otp})),
+            "",
+        ),
+        200,
+    )
+    .await;
+    assert_eq!(body(&done)["user"]["emailVerified"], true);
+    authenticated(&auth, &cookies(&done), email).await;
+    assert_eq!(db.count("verifications").await?, 0);
+    let after = db.tables(&["users", "accounts", "sessions"]).await?;
+    _ = call(
+        &auth,
+        request(
+            "/sign-in/email-otp",
+            Some(json!({"email":email,"otp":delivery.otp})),
+            "",
+        ),
+        400,
+    )
+    .await;
+    assert_eq!(db.tables(&["users", "accounts", "sessions"]).await?, after);
+    for (before, now) in baseline.iter().zip(after.iter()) {
+        let before: Vec<Value> = serde_json::from_str(before)?;
+        let now: Vec<Value> = serde_json::from_str(now)?;
+        assert!(before.iter().all(|r| now.contains(r)));
+    }
+    authenticated(&auth, &cookies(&foreign), "foreign@example.test").await;
     B::close(connection).await
 }
