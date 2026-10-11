@@ -144,6 +144,49 @@ async fn handle(auth: &Alibi<AppSchema>, request: AuthRequest) -> AuthResult<Aut
     Box::pin(auth.handle_request(request)).await
 }
 
+#[tokio::test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "Assertions check the public schema; Result propagates fixture setup errors"
+)]
+async fn social_openapi_request_fields_match_the_reference() -> AuthResult<()> {
+    let config =
+        AuthConfig::new("native-social-open-api-secret-at-least-32").base_path("/identity");
+    let database = Database::connect("sqlite::memory:")
+        .await
+        .map_err(|e| alibi::AuthError::internal(e.to_string()))?;
+    let auth = AuthBuilder::<AppSchema>::new(config.clone())
+        .store(SeaOrmStore::<AppSchema>::new(config, database))
+        .plugin(alibi::plugins::OAuthPlugin::new())
+        .plugin(OpenApiPlugin::new())
+        .build()
+        .await?;
+    let response = handle(
+        &auth,
+        AuthRequest::new(HttpMethod::Get, "/identity/open-api/generate-schema"),
+    )
+    .await?;
+    assert_eq!(response.status, 200);
+    let document: Value = serde_json::from_slice(&response.body)?;
+    for route in ["/sign-in/social", "/link-social"] {
+        let operation = &document["paths"][route]["post"];
+        let properties =
+            &operation["requestBody"]["content"]["application/json"]["schema"]["properties"];
+        assert_eq!(properties["additionalParams"]["type"], "object");
+        assert_eq!(
+            properties["additionalParams"]["additionalProperties"]["type"],
+            "string"
+        );
+        assert!(properties.get("provider").is_some());
+        assert!(properties.get("callbackURL").is_some());
+        assert!(
+            properties.get("authorizationParams").is_none(),
+            "{route}: {properties}"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
