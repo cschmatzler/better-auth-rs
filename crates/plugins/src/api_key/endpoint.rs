@@ -295,7 +295,7 @@ impl ApiKeyPlugin {
                             let (_, code, message) = error.error_payload();
                             serde_json::json!({"valid":false,"error":{"code":code,"message":message},"key":null})
                         } else {
-                            serde_json::json!({"valid":false,"error":{"code":"INVALID_API_KEY","message":{"code":"INVALID_API_KEY","message":"Invalid API Key"}},"key":null})
+                            serde_json::json!({"valid":false,"error":{"code":"INVALID_API_KEY","message":{"code":"INVALID_API_KEY","message":super::ApiKeyErrorCode::InvalidApiKey.message()}},"key":null})
                         }
                     }
                 };
